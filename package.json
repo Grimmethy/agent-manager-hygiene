@@ -1,0 +1,16 @@
+{
+  "name": "agent-manager-hygiene",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Programming-hygiene task sources (observability, performance, function-length, architecture, unused-export) for the agent-manager pipeline. Loaded out-of-tree via AGENT_MANAGER_REGISTER_PATH.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "dependencies": {
+    "agent-manager": "file:../agent-manager"
+  },
+  "scripts": {
+    "test": "node --test src/*.test.js"
+  }
+}
