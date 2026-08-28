@@ -109,3 +109,20 @@ test('arch_discovery / arch_import declare reviewGuidance; the review/fix consum
     assert.equal(registry.getRegisteredSource(name).reviewGuidance, undefined, `${name} must not set reviewGuidance`);
   }
 });
+
+// Stage A3 (2026-08-28): sources declare how their completed tasks count toward
+// system-report.js's junk/filtering/benefit accounting via reportClass, read off the
+// registry there instead of a hardcoded source check. The arch generators are a flat
+// 'benefit'; the two _review sources decide filtering vs benefit from the verdict text.
+test('reportClass: arch generators are benefit; observability/performance review split filtering vs benefit on verdict text', () => {
+  const registry = loadPluginFresh();
+  assert.equal(registry.getRegisteredSource('arch_discovery').reportClass, 'benefit');
+  assert.equal(registry.getRegisteredSource('arch_import').reportClass, 'benefit');
+  for (const name of ['observability_review', 'performance_review']) {
+    const fn = registry.getRegisteredSource(name).reportClass;
+    assert.equal(typeof fn, 'function', `${name}.reportClass must be a (task) => bucket function`);
+    assert.equal(fn({ implementResponse: 'This is a false positive.' }), 'filtering');
+    assert.equal(fn({ implementResponse: 'Confirmed genuine issue.' }), 'benefit');
+    assert.equal(fn({ implementResponse: 'nothing conclusive' }), 'unclear');
+  }
+});

@@ -334,6 +334,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     emptyApproval: true,
     directToMain: true, // low-risk additive candidate-doc append -- commit straight to main, no throwaway branch
     reviewGuidance: ARCH_DISCOVERY_REVIEW_GUIDANCE,
+    reportClass: 'benefit', // a surfaced, human-reviewed architecture candidate is a real outcome (system-report.js)
   });
   updateTaskSource('arch_discovery', { buildPlanPrompt: archDiscoveryPlanPrompt, buildImplementPrompt: archDiscoveryImplementPrompt });
 
@@ -348,6 +349,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     emptyApproval: true,
     directToMain: true, // see arch_discovery
     reviewGuidance: ARCH_IMPORT_REVIEW_GUIDANCE,
+    reportClass: 'benefit', // see arch_discovery
   });
   updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });
 }

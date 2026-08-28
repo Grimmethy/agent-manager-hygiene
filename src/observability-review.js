@@ -259,6 +259,16 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     },
     advisoryProse: true,
     directToMain: true, // the apply is a low-risk candidate-doc append, not real code -- straight to main
+    // ADR-0022 Stage A3: how a completed review counts toward system-report.js's
+    // junk/filtering/benefit accounting. A review that correctly dismissed a false
+    // positive is real triage work ('filtering'); one that confirmed a genuine issue
+    // is a 'benefit'. Read off the registry there instead of a hardcoded source check.
+    reportClass: (task) => {
+      const text = (task.implementResponse || '').toLowerCase();
+      if (text.includes('false positive') || text.includes('false-positive')) return 'filtering';
+      if (text.includes('genuine')) return 'benefit';
+      return 'unclear';
+    },
   });
   updateTaskSource('observability_review', { buildPlanPrompt: observabilityReviewPlanPrompt, buildImplementPrompt: observabilityReviewImplementPrompt });
 

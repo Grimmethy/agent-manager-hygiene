@@ -239,6 +239,12 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     },
     advisoryProse: true,
     directToMain: true, // see observability_review
+    reportClass: (task) => { // see observability_review -- same filtering vs benefit split
+      const text = (task.implementResponse || '').toLowerCase();
+      if (text.includes('false positive') || text.includes('false-positive')) return 'filtering';
+      if (text.includes('genuine')) return 'benefit';
+      return 'unclear';
+    },
   });
   updateTaskSource('performance_review', { buildPlanPrompt: performanceReviewPlanPrompt, buildImplementPrompt: performanceReviewImplementPrompt });
 
