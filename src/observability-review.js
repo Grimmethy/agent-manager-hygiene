@@ -5,7 +5,7 @@
 // plugin 2026-08-27 (the "fully separate npm later" that move was staging for). Wired via
 // register(deps) from ../register.js with the injected-deps bag; the pure detector
 // (observability-scan.js) stays in agent-manager core (staleness-fastpath.js re-runs its
-// rules), imported here as agent-manager/src/maintenance/observability-scan.js.
+// rules), imported here as ./observability-scan.js.
 //
 // REDIRECTED 2026-08-20 (Grimmethy: "What tangible benefits are we getting from the huge
 // number of observability review tasks?" -> real numbers showed 2,025 real Ollama calls /
@@ -24,8 +24,8 @@
 
 const fs = require('fs');
 const path = require('path');
-const { scanProject } = require('agent-manager/src/maintenance/observability-scan.js');
-const { isLikelyMinified } = require('agent-manager/src/maintenance/scan-utils.js');
+const { scanProject } = require('./observability-scan.js');
+const { isLikelyMinified } = require('./scan-utils.js');
 const { registerTaskSource, updateTaskSource } = require('agent-manager/src/task-source-registry.js');
 const { applyArchDiscoveryCandidates } = require('agent-manager/src/candidate-docs.js');
 

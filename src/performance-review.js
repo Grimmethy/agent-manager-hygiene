@@ -14,8 +14,8 @@
 
 const fs = require('fs');
 const path = require('path');
-const { scanProject } = require('agent-manager/src/maintenance/performance-scan.js');
-const { isLikelyMinified } = require('agent-manager/src/maintenance/scan-utils.js');
+const { scanProject } = require('./performance-scan.js');
+const { isLikelyMinified } = require('./scan-utils.js');
 const { registerTaskSource, updateTaskSource } = require('agent-manager/src/task-source-registry.js');
 const { applyArchDiscoveryCandidates } = require('agent-manager/src/candidate-docs.js');
 
