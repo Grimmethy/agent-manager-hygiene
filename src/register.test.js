@@ -52,9 +52,10 @@ function loadPluginFresh() {
   const registry = require('agent-manager/src/task-source-registry.js');
   registry.clearRegistry();
   require('agent-manager/src/model-profile-registry.js').clearModelProfileRegistry();
+  require('agent-manager/src/deterministic-recheck-registry.js').clearDeterministicRecheckRegistry();
   for (const p of ['agent-manager/src/task-sources.js', 'agent-manager/src/prompts.js',
     './function-length-review.js', './observability-review.js', './performance-review.js',
-    './arch.js', './unused-export.js', '../register.js']) {
+    './arch.js', './unused-export.js', './deterministic-recheck.js', '../register.js']) {
     delete require.cache[require.resolve(p)];
   }
   require('../register.js');

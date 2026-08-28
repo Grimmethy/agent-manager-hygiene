@@ -27,3 +27,8 @@ require('./src/observability-review.js').register(deps);
 require('./src/performance-review.js').register(deps);
 require('./src/arch.js').register(deps);
 require('./src/unused-export.js').register(deps);
+
+// ADR-0022 Stage B: register how observability_review / performance_review scanner rules
+// are re-run against a file's current content, for agent-manager's staleness-fastpath.js
+// deterministic recheck. Takes no deps -- imports the detectors from agent-manager core.
+require('./src/deterministic-recheck.js').register();
