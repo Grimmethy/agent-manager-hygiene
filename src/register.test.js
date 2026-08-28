@@ -43,3 +43,31 @@ test('requiring register.js registers all six hygiene sources on the shared regi
   // singleton), the six names above would not be visible on the object we hold here.
   // Seeing them is the proof the symlink kept it a singleton.
 });
+
+// 2026-08-28: a candidate-fulfillment source must NOT carry emptyApproval -- an empty
+// fulfillment draft means "couldn't produce this fix", not "nothing to do", and
+// emptyApproval was silently auto-closing those with no branch and no human (see
+// agent-manager's retired candidate AC-25). emptyApproval stays on the arch_discovery /
+// arch_import GENERATORS, where "found zero real issues" is a valid, common outcome.
+test('no candidate-fulfillment source carries emptyApproval; the arch generators still do', () => {
+  process.env.AGENT_MANAGER_REPO_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'register-test-'));
+  process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
+  const registry = require('agent-manager/src/task-source-registry.js');
+  registry.clearRegistry();
+  require('agent-manager/src/model-profile-registry.js').clearModelProfileRegistry();
+  for (const p of ['agent-manager/src/task-sources.js', 'agent-manager/src/prompts.js',
+    './function-length-review.js', './observability-review.js', './performance-review.js',
+    './arch.js', './unused-export.js', '../register.js']) {
+    delete require.cache[require.resolve(p)];
+  }
+  require('../register.js');
+
+  for (const name of ['arch_review', 'arch_import_review', 'observability_fix', 'performance_fix', 'function_length_fix']) {
+    const s = registry.getRegisteredSource(name);
+    assert.ok(s && s.candidateFulfillment === true, `${name} should still be a candidateFulfillment source`);
+    assert.notEqual(s.emptyApproval, true, `${name} (a fulfillment source) must not auto-approve an empty draft`);
+  }
+  for (const name of ['arch_discovery', 'arch_import']) {
+    assert.equal(registry.getRegisteredSource(name).emptyApproval, true, `${name} (a generator) keeps emptyApproval`);
+  }
+});

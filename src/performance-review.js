@@ -247,7 +247,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       const { performanceFixCandidatesPath } = getConfig();
       return nextCandidateFulfillmentTask(performanceFixCandidatesPath, 'performance_fix');
     },
-    emptyApproval: true, candidateFulfillment: true,
+    candidateFulfillment: true, // no emptyApproval -- see observability_fix
     candidatesPath: () => getConfig().performanceFixCandidatesPath,
     candidateDocTitle: '# Performance Fix Candidates',
   });

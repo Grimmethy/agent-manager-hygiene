@@ -267,7 +267,11 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       const { observabilityFixCandidatesPath } = getConfig();
       return nextCandidateFulfillmentTask(observabilityFixCandidatesPath, 'observability_fix');
     },
-    emptyApproval: true, candidateFulfillment: true,
+    // No emptyApproval (2026-08-28): an empty fulfillment draft means "couldn't produce
+    // this fix", not "nothing to do" -- with it, those silently auto-closed with no branch
+    // and no human. Without it, an empty draft is rejected -> retried -> blocked for a
+    // human. See agent-manager's retired AC-25.
+    candidateFulfillment: true,
     candidatesPath: () => getConfig().observabilityFixCandidatesPath,
     candidateDocTitle: '# Observability Fix Candidates',
   });
