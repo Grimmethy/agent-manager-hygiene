@@ -6,17 +6,18 @@
 // agent-manager's staleness-fastpath.js re-runs the ORIGINAL scanner rule against a file's
 // CURRENT content to answer "is this finding still live" without an LLM round-trip. Before
 // Stage B it hardcoded the rule -> detector map and require()d the scanners directly; now
-// the source that owns the scanner registers it. The detector FUNCTIONS still live in
-// agent-manager core (src/maintenance/*-scan.js -- see docs/PLUGIN_API.md); this module
-// just wraps them into the { perFileRules, repoWideRules } shape the registry expects.
+// the source that owns the scanner registers it. This module wraps this plugin's own
+// scanner functions (./observability-scan.js, ./performance-scan.js -- moved here from
+// agent-manager core in Stage C) into the { perFileRules, repoWideRules } shape the
+// registry expects.
 //
-// Moved verbatim from agent-manager's src/staleness-fastpath.js (RULE_DETECTORS /
-// REPO_WIDE_RULE_DETECTORS / missingReservedAttribute).
+// The rule map itself was moved verbatim from agent-manager's src/staleness-fastpath.js
+// (its old RULE_DETECTORS / REPO_WIDE_RULE_DETECTORS / missingReservedAttribute).
 
 const fs = require('fs');
-const obsScan = require('agent-manager/src/maintenance/observability-scan.js');
-const perfScan = require('agent-manager/src/maintenance/performance-scan.js');
-const { listSourceFiles, isLikelyMinified } = require('agent-manager/src/maintenance/scan-utils.js');
+const obsScan = require('./observability-scan.js');
+const perfScan = require('./performance-scan.js');
+const { listSourceFiles, isLikelyMinified } = require('./scan-utils.js');
 const { registerDeterministicRecheck } = require('agent-manager/src/deterministic-recheck-registry.js');
 
 // function_length_review's length-not-pattern shape is deliberately absent -- a single-file

@@ -49,9 +49,11 @@ plugin would populate a second, private registry object and its sources would ne
 `--preserve-symlinks`.
 
 The dependency direction is one-way: this plugin imports from `agent-manager/src/*`; core
-never imports back. The pure scanner modules (`agent-manager/src/maintenance/*-scan.js`)
-stay in core — `staleness-fastpath.js` re-runs their rules for the deterministic staleness
-recheck — and are imported here.
+never imports back. The deterministic scanner modules (`src/{observability,performance,
+function-length}-scan.js` + `src/scan-utils.js`) live here as of ADR-0022 Stage C; core's
+`staleness-fastpath.js` re-runs their rules for the deterministic staleness recheck via
+the `registerDeterministicRecheck` seam (`src/deterministic-recheck.js`), holding no
+detector code and no source names of its own.
 
 **`agent-manager/docs/PLUGIN_API.md` is the contract** for exactly which core exports this
 plugin may depend on. Core's `src/plugin-api.test.js` fails if one is removed. If this

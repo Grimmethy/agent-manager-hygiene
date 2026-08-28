@@ -19,7 +19,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { scanProject } = require('agent-manager/src/maintenance/function-length-scan.js');
+const { scanProject } = require('./function-length-scan.js');
 const { registerTaskSource, updateTaskSource } = require('agent-manager/src/task-source-registry.js');
 const { applyArchDiscoveryCandidates } = require('agent-manager/src/candidate-docs.js');
 const { groupBJsonInstructions, candidateSplitInstructions, formatFileContents } = require('agent-manager/src/prompts.js');
