@@ -12,11 +12,8 @@
 // --preserve-symlinks.
 
 const { getConfig } = require('agent-manager/src/config.js');
-const {
-  nextCandidateFulfillmentTask,
-  taskIdExistsInQueue,
-  taskPriority,
-} = require('agent-manager/src/task-sources.js');
+const { nextCandidateFulfillmentTask } = require('agent-manager/src/sdk/candidate-fulfillment.js');
+const { taskIdExistsInQueue, taskPriority } = require('agent-manager/src/task-sources.js');
 
 // The same injected-deps bag the three review modules expected when task-sources.js wired
 // them in-tree (removed from task-sources.js in the same change that added this file).
