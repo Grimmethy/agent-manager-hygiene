@@ -258,6 +258,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       });
     },
     advisoryProse: true,
+    directToMain: true, // the apply is a low-risk candidate-doc append, not real code -- straight to main
   });
   updateTaskSource('observability_review', { buildPlanPrompt: observabilityReviewPlanPrompt, buildImplementPrompt: observabilityReviewImplementPrompt });
 

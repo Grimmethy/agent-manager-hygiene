@@ -324,6 +324,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       return applyArchDiscoveryCandidates({ implementResponse, candidatesPath: archReviewCandidatesPath });
     },
     emptyApproval: true,
+    directToMain: true, // low-risk additive candidate-doc append -- commit straight to main, no throwaway branch
   });
   updateTaskSource('arch_discovery', { buildPlanPrompt: archDiscoveryPlanPrompt, buildImplementPrompt: archDiscoveryImplementPrompt });
 
@@ -336,6 +337,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       return applyArchImportCandidate({ implementResponse, candidatesPath: archImportCandidatesPath, importCoveragePath, task });
     },
     emptyApproval: true,
+    directToMain: true, // see arch_discovery
   });
   updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });
 }
