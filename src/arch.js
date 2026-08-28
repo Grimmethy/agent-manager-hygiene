@@ -283,10 +283,17 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
   // on its final retry live. candidatesPath is a lazy getter (getConfig() isn't callable
   // at module-load time) -- where a {"mode":"split"} implement response writes its
   // sub-candidates back.
+  // No emptyApproval (2026-08-28): a fulfillment source consumes an already-Strong-rated
+  // candidate -- an empty draft there means "I couldn't produce this fix" (model gave up,
+  // couldn't locate the code, or the code moved), not "there was nothing to do". With
+  // emptyApproval those silently auto-closed with no branch and no human (see retired
+  // AC-25, whose target had moved to this plugin). Without it, an empty draft is rejected
+  // -> retried -> eventually blocked for a human. emptyApproval stays on the arch_discovery
+  // / arch_import GENERATORS below, where "found zero real issues" is a valid common outcome.
   registerTaskSource('arch_review', {
     priority: taskPriority('arch_review', 70),
     next: () => nextCandidateFulfillmentTask(getConfig().archReviewCandidatesPath, 'arch_review'),
-    emptyApproval: true, candidateFulfillment: true,
+    candidateFulfillment: true,
     candidatesPath: () => getConfig().archReviewCandidatesPath,
     candidateDocTitle: '# Architecture Review Candidates',
     reasoningTier: 'high',
@@ -299,7 +306,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
   registerTaskSource('arch_import_review', {
     priority: taskPriority('arch_import_review', 71),
     next: () => nextCandidateFulfillmentTask(getConfig().archImportCandidatesPath, 'arch_import_review'),
-    emptyApproval: true, candidateFulfillment: true,
+    candidateFulfillment: true, // no emptyApproval -- see arch_review above
     candidatesPath: () => getConfig().archImportCandidatesPath,
     candidateDocTitle: '# Architecture Import Candidates',
     reasoningTier: 'high',

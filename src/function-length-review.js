@@ -266,10 +266,14 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
         || path.join(repoRoot, 'Docs', 'FUNCTION_LENGTH_CANDIDATES.md');
       return nextCandidateFulfillmentTask(candidatesPath, 'function_length_fix');
     },
-    // emptyApproval: a false-positive-adjacent candidate can legitimately resolve to "no
-    // real decomposition here after all" once the fix stage sees real file content.
+    // No emptyApproval (2026-08-28): a Strong candidate legitimately resolving to "no real
+    // decomposition after all" is rare, and it was letting the common case -- an empty
+    // draft because the model gave up or the code moved -- silently auto-close with no
+    // branch and no human (agent-manager's retired AC-25). An empty fulfillment draft is
+    // now rejected -> retried -> blocked for a human to look at. A genuine false-positive
+    // still surfaces that way, just visibly.
     // candidateFulfillment: opts into local-draft.js's find-verification retry for free.
-    emptyApproval: true, candidateFulfillment: true,
+    candidateFulfillment: true,
     // candidatesPath/candidateDocTitle: where a `{"mode": "split"}` implement response
     // (prompts.js's candidateSplitInstructions) writes its sub-candidates back to. Same
     // env-var-or-default resolution as this source's own `next` above, duplicated rather

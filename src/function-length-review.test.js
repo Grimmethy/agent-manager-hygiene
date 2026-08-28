@@ -66,7 +66,8 @@ test('register() wires function_length_review (advisoryProse) + function_length_
   const fix = getRegisteredSource('function_length_fix');
   assert.ok(review && typeof review.apply === 'function');
   assert.equal(review.advisoryProse, true);
-  assert.ok(fix && fix.candidateFulfillment === true && fix.emptyApproval === true);
+  assert.ok(fix && fix.candidateFulfillment === true);
+  assert.notEqual(fix.emptyApproval, true, 'a fulfillment source must NOT auto-approve an empty draft (2026-08-28)');
   assert.equal(typeof review.buildPlanPrompt, 'function');
 });
 
