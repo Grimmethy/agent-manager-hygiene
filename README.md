@@ -14,9 +14,14 @@ tracking, worker management), which stays in `agent-manager`.
 | `function_length_review` / `function_length_fix` | review → fix | flags over-long functions, judges genuine vs. false positive, turns a vetted candidate into a decomposition diff |
 | `observability_review` / `observability_fix` | review → fix | silent catch blocks, unguarded loops, OpenTelemetry naming/attribute gaps |
 | `performance_review` / `performance_fix` | review → fix | sync I/O in loops, sequential awaits, `JSON.parse(JSON.stringify(...))` deep-clone antipattern |
-| `arch_discovery` / `arch_review` | *(Phase 2)* | community-graph-driven architecture candidates |
-| `arch_import` / `arch_import_review` | *(Phase 2)* | promote a deep-dive finding from an external repo into an architecture candidate |
-| `unused_export` | *(Phase 2)* | low-usage exported symbols |
+| `arch_discovery` → `arch_review` | generate → fulfill | community-graph-driven architecture candidates, then turned into diffs |
+| `arch_import` → `arch_import_review` | generate → fulfill | promote a deep-dive finding from an external repo into an architecture candidate |
+| `unused_export` | triage | low-usage exported CommonJS symbols (majority-vote genuine-dead vs. false-positive) |
+
+`arch_review` / `arch_import_review` are consumers of agent-manager's own
+`nextCandidateFulfillmentTask` (which stays in core — `backlog_fulfillment` uses it too).
+The `community-coverage.json` / graph inputs `arch_discovery` reads are produced by
+agent-manager's `python/build_graph.py` and consumed here read-only.
 
 ## How it loads
 

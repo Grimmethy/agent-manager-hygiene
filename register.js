@@ -25,6 +25,5 @@ const deps = { getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, tas
 require('./src/function-length-review.js').register(deps);
 require('./src/observability-review.js').register(deps);
 require('./src/performance-review.js').register(deps);
-// Phase 2 will add:
-//   require('./src/arch.js').register(deps);
-//   require('./src/unused-export.js').register(deps);
+require('./src/arch.js').register(deps);
+require('./src/unused-export.js').register(deps);
