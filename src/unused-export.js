@@ -15,7 +15,7 @@
 
 const path = require('path');
 const fs = require('fs');
-const { registerTaskSource, updateTaskSource } = require('agent-manager/src/task-source-registry.js');
+const { registerTaskSource, updateTaskSource, registerSourceAlias } = require('agent-manager/src/task-source-registry.js');
 const { applyVerdictOnly } = require('agent-manager/src/apply-group-a.js');
 const { unusedExportPlanPrompt } = require('agent-manager/src/prompts.js');
 
@@ -72,6 +72,11 @@ function register({ getConfig, taskIdExistsInQueue, taskPriority }) {
     apply: applyVerdictOnly,
   });
   updateTaskSource('unused_export', { buildPlanPrompt: unusedExportPlanPrompt });
+  // Generated tasks stamp source: 'deadcode_triage' (not 'unused_export') -- declare that
+  // here rather than relying on agent-manager's legacy hardcoded fallback in
+  // resolveSourceName(). Guarded: registerSourceAlias landed in agent-manager Stage A1;
+  // an older core still has the hardcoded fallback, so this is belt-and-suspenders.
+  if (typeof registerSourceAlias === 'function') registerSourceAlias('deadcode_triage', 'unused_export');
 }
 
 module.exports = { register, nextUnusedExportTask };

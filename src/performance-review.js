@@ -238,6 +238,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       });
     },
     advisoryProse: true,
+    directToMain: true, // see observability_review
   });
   updateTaskSource('performance_review', { buildPlanPrompt: performanceReviewPlanPrompt, buildImplementPrompt: performanceReviewImplementPrompt });
 
