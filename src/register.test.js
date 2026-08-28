@@ -110,6 +110,24 @@ test('arch_discovery / arch_import declare reviewGuidance; the review/fix consum
   }
 });
 
+// Stage A4 (2026-08-28): arch_import's plan pass proposes QUERY: terms only; agent-manager's
+// local-draft.js runs the between-plan-and-implement grep of its own repo, driven by the
+// harnessSearch field, and skips the implement call on a genuine zero-hit search
+// (skipImplementWhenNoHarnessHits). Neither is set on any other hygiene source.
+test('arch_import declares harnessSearch + skipImplementWhenNoHarnessHits; no other hygiene source does', () => {
+  const registry = loadPluginFresh();
+  const ai = registry.getRegisteredSource('arch_import');
+  assert.equal(ai.harnessSearch, 'archImport');
+  assert.equal(ai.skipImplementWhenNoHarnessHits, true);
+  for (const name of ['arch_discovery', 'arch_review', 'arch_import_review', 'observability_review',
+    'observability_fix', 'performance_review', 'performance_fix', 'function_length_review',
+    'function_length_fix', 'unused_export']) {
+    const s = registry.getRegisteredSource(name);
+    assert.notEqual(s.harnessSearch, 'archImport', `${name} must not declare harnessSearch`);
+    assert.notEqual(s.skipImplementWhenNoHarnessHits, true, `${name} must not declare skipImplementWhenNoHarnessHits`);
+  }
+});
+
 // Stage A3 (2026-08-28): sources declare how their completed tasks count toward
 // system-report.js's junk/filtering/benefit accounting via reportClass, read off the
 // registry there instead of a hardcoded source check. The arch generators are a flat
