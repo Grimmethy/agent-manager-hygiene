@@ -26,6 +26,14 @@ const {
   archImportPlanPrompt, archImportImplementPrompt,
 } = require('agent-manager/src/prompts.js');
 
+// Review-gate guidance for the two arch generators, read by agent-manager's review-task.js
+// buildVerdictPrompt off source.reviewGuidance (ADR-0022 Stage A2: the plugin that defines
+// the work defines how its draft is judged). Core keeps a byte-identical FALLBACK_REVIEW_GUIDANCE
+// for these two names so its gate stays correct when this plugin isn't loaded; that fallback
+// goes away in Stage G once this field is the only source.
+const ARCH_DISCOVERY_REVIEW_GUIDANCE = 'This is an architecture-discovery task: finding ZERO real issues in the given files is a valid, EXPECTED, and often correct outcome -- do not reject a draft merely for concluding there is nothing worth flagging. Only reject an empty result if the draft itself looks like it never actually engaged with the given file content (e.g. generic boilerplate with no reference to anything specific in the files).';
+const ARCH_IMPORT_REVIEW_GUIDANCE = "This is an architecture-import task (an idea from an external project, being checked against agent-manager's own code): the drafter was told to output nothing if the harness search found no real agent-manager files this idea concretely applies to -- do not reject an empty result on that basis alone. Reject only if the draft names a file the harness search results do NOT show, or proposes something contradicted by the real file content given.";
+
 // Tiny helpers duplicated from task-sources.js (which keeps them unexported) rather than
 // reached across a module boundary -- same convention the maintenance modules follow.
 function slugifyForId(str) {
@@ -325,6 +333,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     },
     emptyApproval: true,
     directToMain: true, // low-risk additive candidate-doc append -- commit straight to main, no throwaway branch
+    reviewGuidance: ARCH_DISCOVERY_REVIEW_GUIDANCE,
   });
   updateTaskSource('arch_discovery', { buildPlanPrompt: archDiscoveryPlanPrompt, buildImplementPrompt: archDiscoveryImplementPrompt });
 
@@ -338,6 +347,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     },
     emptyApproval: true,
     directToMain: true, // see arch_discovery
+    reviewGuidance: ARCH_IMPORT_REVIEW_GUIDANCE,
   });
   updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });
 }

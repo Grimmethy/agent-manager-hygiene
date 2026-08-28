@@ -92,3 +92,20 @@ test('directToMain is set on the 4 candidate-doc-append sources; deadcode_triage
   }
   assert.equal(registry.resolveSourceName({ source: 'deadcode_triage' }), 'unused_export');
 });
+
+// Stage A2 (2026-08-28): the two arch GENERATORS carry their own review-gate guidance so
+// agent-manager's review-task.js buildVerdictPrompt reads it off the registry instead of a
+// hardcoded `if (task.source === 'arch_discovery')` chain. agent-manager keeps a byte-identical
+// fallback for when this plugin isn't loaded; this test pins the plugin side of that pair.
+test('arch_discovery / arch_import declare reviewGuidance; the review/fix consumers do not', () => {
+  const registry = loadPluginFresh();
+  const disc = registry.getRegisteredSource('arch_discovery').reviewGuidance;
+  const imp = registry.getRegisteredSource('arch_import').reviewGuidance;
+  assert.equal(typeof disc, 'string');
+  assert.match(disc, /architecture-discovery task: finding ZERO real issues/);
+  assert.equal(typeof imp, 'string');
+  assert.match(imp, /architecture-import task \(an idea from an external project/);
+  for (const name of ['arch_review', 'arch_import_review', 'observability_fix', 'performance_fix', 'function_length_fix']) {
+    assert.equal(registry.getRegisteredSource(name).reviewGuidance, undefined, `${name} must not set reviewGuidance`);
+  }
+});
