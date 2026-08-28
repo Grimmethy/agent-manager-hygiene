@@ -53,6 +53,11 @@ never imports back. The pure scanner modules (`agent-manager/src/maintenance/*-s
 stay in core — `staleness-fastpath.js` re-runs their rules for the deterministic staleness
 recheck — and are imported here.
 
+**`agent-manager/docs/PLUGIN_API.md` is the contract** for exactly which core exports this
+plugin may depend on. Core's `src/plugin-api.test.js` fails if one is removed. If this
+plugin needs to reach for something not on that list, add it there first — never a private
+internal.
+
 ## Plugin-owned config
 
 `function-length-review.js` reads these directly from the environment (no `config.js` key):
