@@ -350,6 +350,13 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     directToMain: true, // see arch_discovery
     reviewGuidance: ARCH_IMPORT_REVIEW_GUIDANCE,
     reportClass: 'benefit', // see arch_discovery
+    // ADR-0022 Stage A4: arch_import's plan pass only proposes QUERY: terms; agent-manager's
+    // local-draft.js greps its own repo for them between plan and implement and hands the
+    // hits to the implement pass as grounding. On a genuine zero-hit search, skip the
+    // implement call entirely (the model fabricates file paths instead of following the
+    // "output nothing" instruction) -- an empty draft here auto-approves via emptyApproval.
+    harnessSearch: 'archImport',
+    skipImplementWhenNoHarnessHits: true,
   });
   updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });
 }
