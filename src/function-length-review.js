@@ -20,6 +20,7 @@
 const fs = require('fs');
 const path = require('path');
 const { scanProject } = require('./function-length-scan.js');
+const { reconcileFlags } = require('./flag-store.js');
 const { registerTaskSource, updateTaskSource } = require('agent-manager/src/task-source-registry.js');
 const { applyArchDiscoveryCandidates } = require('agent-manager/src/candidate-docs.js');
 const { groupBJsonInstructions, candidateSplitInstructions, formatFileContents } = require('agent-manager/src/prompts.js');
@@ -160,24 +161,20 @@ function nextFunctionLengthReviewTask({ repoRoot, pipelineDir, defaultDomain, ta
   let flagsChanged = false;
   if (due && fs.existsSync(repoRoot)) {
     let freshFindings = [];
+    let scanOk = false;
     try {
       freshFindings = scanProject(repoRoot, projectTag);
+      scanOk = true;
     } catch (e) {
       console.error(`function_length_review: failed to scan "${projectTag}": ${e.message}`);
     }
 
-    const beforePrune = flags.length;
-    flags = flags.filter((f) => f.projectSlug === projectTag && (!f.file || fs.existsSync(path.join(repoRoot, f.file))));
-    if (flags.length !== beforePrune) flagsChanged = true;
-
-    const existingKeys = new Set(flags.map((f) => `${f.rule}::${f.file}::${f.line}`));
-    for (const finding of freshFindings) {
-      const key = `${finding.rule}::${finding.file}::${finding.line}`;
-      if (existingKeys.has(key)) continue;
-      flags.push(finding);
-      existingKeys.add(key);
-      flagsChanged = true;
-    }
+    // Reconcile the persistent backlog against this fresh scan -- prune flags the scan no
+    // longer reproduces (function shrank/moved/renamed/line-shifted), append genuinely
+    // new ones. See flag-store.js for why the old file-exists-only prune was not enough.
+    const reconciled = reconcileFlags({ flags, freshFindings, scanOk, projectTag, repoRoot });
+    flags = reconciled.flags;
+    if (reconciled.changed) flagsChanged = true;
 
     coverage = { lastScannedAt: new Date(now).toISOString() };
     fs.mkdirSync(path.dirname(coveragePath), { recursive: true });
