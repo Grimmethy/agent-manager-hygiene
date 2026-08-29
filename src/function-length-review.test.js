@@ -59,6 +59,34 @@ test('nextFunctionLengthReviewTask emits a review task for an over-threshold fun
   assert.equal(task.promptContext.file, 'big.js');
 });
 
+test('a rescan prunes a persisted flag the scanner no longer reproduces (function moved / line-shifted) and emits no task for it', () => {
+  const dir = makeRepo();
+  const deps = freshPlugin(dir);
+  // A real over-threshold function -> a legitimate live flag.
+  fs.writeFileSync(path.join(dir, 'big.js'), longFunctionSource('bloated'));
+
+  // First pass: creates the flags file and stamps coverage.lastScannedAt.
+  const first = deps.nextFunctionLengthReviewTask({ repoRoot: dir, pipelineDir: dir, defaultDomain: 'default', taskIdExistsInQueue: () => false });
+  assert.ok(first && first.promptContext.file === 'big.js');
+
+  const flagsPath = path.join(dir, 'queue', 'function-length-flags.json');
+  const flags = JSON.parse(fs.readFileSync(flagsPath, 'utf8'));
+  // Inject a stale flag: big.js exists, but has no long function at line 999 -- this is
+  // the "function was decomposed / moved / relocated to another repo, but src/<file>
+  // still exists" case the old file-exists-only prune could never clean up.
+  flags.push({ rule: 'function-too-long', file: 'big.js', line: 999, detail: 'function "ghost" is 300 lines long', projectSlug: path.basename(dir), scannedAt: '2020-01-01T00:00:00.000Z' });
+  fs.writeFileSync(flagsPath, JSON.stringify(flags));
+  // Force the next call to be due for a rescan.
+  fs.writeFileSync(path.join(dir, 'function-length-coverage.json'), JSON.stringify({ lastScannedAt: '2020-01-01T00:00:00.000Z' }));
+
+  // Second pass: the stale flag (oldest scannedAt, so it would be tried first) must be
+  // gone, and the only task offered is the real big.js one again.
+  const second = deps.nextFunctionLengthReviewTask({ repoRoot: dir, pipelineDir: dir, defaultDomain: 'default', taskIdExistsInQueue: () => false });
+  const afterFlags = JSON.parse(fs.readFileSync(flagsPath, 'utf8'));
+  assert.equal(afterFlags.some((f) => f.line === 999), false, 'the stale flag must be pruned by the reconcile');
+  assert.ok(second && second.promptContext.file === 'big.js' && second.promptContext.line !== 999);
+});
+
 test('register() wires function_length_review (advisoryProse) + function_length_fix (candidateFulfillment)', () => {
   const dir = makeRepo();
   const { getRegisteredSource } = freshPlugin(dir);
