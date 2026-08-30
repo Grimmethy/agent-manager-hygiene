@@ -111,3 +111,59 @@ test('scanProject picks up Python findings alongside JS ones and skips a clean .
   assert.equal(byFile['clean.py'], undefined);
   for (const f of findings) assert.equal(f.projectSlug, 'py-project');
 });
+
+// --- Regression: the 13 no-op hygiene tasks (2026-08-30) --------------------------------
+// Every one of the 13 done tasks on agent-manager-hygiene was a scanner false positive in
+// one of two shapes. These fixtures are lifted verbatim from those task snippets; each
+// must now produce ZERO findings so the review pipeline never has to run them again.
+
+// Class A -- "code as data": the loop exists ONLY as a string-literal argument (a test
+// fixture seeding a known-bad snippet for the pipeline to detect). stripNonCode() blanks
+// string interiors before matching, so this is not a loop at all as far as the rule is
+// concerned. Uses a NON-test relPath to prove the string-literal handling stands alone.
+test('class A: a for/await loop that is only string-literal fixture data is not flagged (stripNonCode)', () => {
+  const cases = [
+    `const dir = t();\nfs.writeFileSync(path.join(dir, 'worker.js'), 'for (const x of xs) {\\n  await fetch(x);\\n}\\n');\nconst v = check(dir);\n`,
+    `writePerformanceFinding(dir, 'other.js', 'for (const item of items2) {\\n  await fetch(item.url);\\n}\\n');\nconst { result } = callNext(dir, deps);\n`,
+    `performanceReview.apply({\n  implementResponse: r,\n  task: { promptContext: { snippet: '  for (const item of items) {\\n    await fetch(item.url);\\n  }' } },\n});\n`,
+  ];
+  for (const text of cases) {
+    assert.deepEqual(findLoopBodyIssues(text, 'src/real-module.js'), [], text.slice(0, 50));
+  }
+});
+
+test('class A: an await/io token inside a string INSIDE a real loop body is not flagged', () => {
+  const text = 'for (const f of files) {\n  log("run: await fetch happens elsewhere");\n  const n = f.length;\n}\n';
+  assert.deepEqual(findLoopBodyIssues(text, 'src/real-module.js'), []);
+});
+
+// Class B -- a bounded fixture loop in a test file. sync-io-in-loop / sequential-await
+// are hot-path rules; a two-element fixture-setup loop that runs once per suite has no
+// per-request cost. isTestFile() short-circuits the loop rules for these paths.
+test('class B: a real sync-IO loop in a *.test.js / __tests__ / fixtures path is not flagged', () => {
+  const text = "for (const state of ['needs-clarification', 'awaiting-confirm']) {\n  fs.writeFileSync(path.join(dir, state), '{}');\n}\n";
+  assert.deepEqual(findLoopBodyIssues(text, 'src/observability-review.test.js'), []);
+  assert.deepEqual(findLoopBodyIssues(text, 'src/__tests__/helpers.js'), []);
+  assert.deepEqual(findLoopBodyIssues(text, 'test/fixtures/seed.js'), []);
+  assert.deepEqual(findPyLoopBodyIssues('for x in ("a", "b"):\n    subprocess.run(x)\n', 'tests/test_seed.py'), []);
+});
+
+// Positive control: the identical construct in real production source still fires -- the
+// fixes narrow precision, they do not disable the rules.
+test('positive control: a real sync-IO / sequential-await loop in production source is STILL flagged', () => {
+  const text = 'async function run(urls) {\n  for (const u of urls) {\n    await fetch(u);\n    fs.writeFileSync("/tmp/x", u);\n  }\n}\n';
+  const rules = findLoopBodyIssues(text, 'src/worker.js').map((f) => f.rule).sort();
+  assert.deepEqual(rules, ['sequential-await-in-loop', 'sync-io-in-loop']);
+});
+
+test('class A: JSON.parse(JSON.stringify(...)) that is only string-literal fixture data is not flagged', () => {
+  const text = "const seed = 'const copy = JSON.parse(JSON.stringify(original));\\n';\nwrite(seed);\n";
+  assert.deepEqual(findJsonDeepCloneAntipattern(text, 'src/real-module.js'), []);
+});
+
+test('positive control: a real JSON.parse(JSON.stringify(...)) deep clone is STILL flagged', () => {
+  const text = 'function clone(x) {\n  return JSON.parse(JSON.stringify(x));\n}\n';
+  const f = findJsonDeepCloneAntipattern(text, 'src/util.js');
+  assert.equal(f.length, 1);
+  assert.equal(f[0].line, 2);
+});

@@ -22,7 +22,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { listSourceFiles, isLikelyMinified, lineOfIndex, extractBraceBody, extractIndentedBlock } = require('./scan-utils.js');
+const { listSourceFiles, isLikelyMinified, lineOfIndex, extractBraceBody, extractIndentedBlock, stripNonCode } = require('./scan-utils.js');
 
 const SCAN_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.py', '.go'];
 const LOOP_CONTEXT_WINDOW_LINES = 40;
@@ -112,8 +112,13 @@ const LOOP_START_RE = /\bwhile\s*\(\s*true\s*\)|\bfor\s*\(\s*;\s*;\s*\)|\bsetInt
 function findUnguardedLoops(text, relPath) {
   const findings = [];
   let m;
+  // Match loop headers against a string/comment-blanked view so a `while (true)` that is
+  // only string-literal fixture data is never flagged. The health-signal window below is
+  // checked against the REAL text -- a "heartbeat handled elsewhere" note in a comment is
+  // a legitimate all-clear, not something to blank away.
+  const scan = stripNonCode(text);
   LOOP_START_RE.lastIndex = 0;
-  while ((m = LOOP_START_RE.exec(text))) {
+  while ((m = LOOP_START_RE.exec(scan))) {
     const startLine = lineOfIndex(text, m.index);
     const lines = text.split('\n');
     const windowText = lines.slice(startLine - 1, startLine - 1 + LOOP_CONTEXT_WINDOW_LINES).join('\n');

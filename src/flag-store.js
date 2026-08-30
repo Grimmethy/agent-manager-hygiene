@@ -35,12 +35,16 @@ function flagKey(f) {
   return `${f.rule}::${f.file}::${f.line}`;
 }
 
-// { flags, freshFindings, scanOk, projectTag, repoRoot } -> { flags, changed }.
-// `flags`   : the reconciled array the caller should persist and then read tasks from.
-// `changed` : whether it differs from the input, so the caller only rewrites the file
-//             when there's a real change (a prune of N plus an append of N is still a
-//             change even though the length is unmoved -- a length check would miss it).
-function reconcileFlags({ flags, freshFindings, scanOk, projectTag, repoRoot }) {
+// { flags, freshFindings, scanOk, projectTag, repoRoot, isSuppressed? } -> { flags, changed }.
+// `flags`        : the reconciled array the caller should persist and then read tasks from.
+// `changed`      : whether it differs from the input, so the caller only rewrites the file
+//                  when there's a real change (a prune of N plus an append of N is still a
+//                  change even though the length is unmoved -- a length check would miss it).
+// `isSuppressed` : optional (finding) -> bool. A finding for THIS project that a prior
+//                  review already ruled a false positive (suppression-store.js) is pruned
+//                  from the backlog entirely -- it will never spawn another review task,
+//                  even after a rescan re-detects it or a commit shifts its line.
+function reconcileFlags({ flags, freshFindings, scanOk, projectTag, repoRoot, isSuppressed }) {
   const before = JSON.stringify(flags);
   const fresh = Array.isArray(freshFindings) ? freshFindings : [];
 
@@ -62,7 +66,17 @@ function reconcileFlags({ flags, freshFindings, scanOk, projectTag, repoRoot }) 
     keptKeys.add(key);
   }
 
+  if (typeof isSuppressed === 'function') {
+    kept = kept.filter((f) => !(f.projectSlug === projectTag && safeSuppressed(isSuppressed, f)));
+  }
+
   return { flags: kept, changed: JSON.stringify(kept) !== before };
+}
+
+// A broken suppression lookup must never wipe the live backlog -- treat any throw as
+// "not suppressed", same fail-open rule the scanOk:false branch above already follows.
+function safeSuppressed(isSuppressed, finding) {
+  try { return isSuppressed(finding) === true; } catch { return false; }
 }
 
 module.exports = { reconcileFlags, flagKey };

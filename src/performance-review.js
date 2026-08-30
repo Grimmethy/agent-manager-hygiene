@@ -15,8 +15,22 @@
 const fs = require('fs');
 const path = require('path');
 const { scanProject } = require('./performance-scan.js');
-const { isLikelyMinified } = require('./scan-utils.js');
+const { isLikelyMinified, windowFromContent } = require('./scan-utils.js');
 const { reconcileFlags } = require('./flag-store.js');
+const { isSuppressed, recordFalsePositiveIfVerdict } = require('./suppression-store.js');
+
+// The -before / +after window that becomes promptContext.snippet AND the suppression key.
+const SNIPPET_BEFORE = 4;
+const SNIPPET_AFTER = 3;
+
+// A flag whose current on-disk window was already ruled a false positive (any line) --
+// used both to prune the persistent backlog and to skip at task-emit time.
+function findingIsSuppressed(pipelineDir, repoRoot, finding) {
+  if (!finding.file) return false;
+  const content = readIfExists(path.join(repoRoot, finding.file));
+  if (!content) return false;
+  return isSuppressed(pipelineDir, finding.rule, windowFromContent(content, finding.line, SNIPPET_BEFORE, SNIPPET_AFTER));
+}
 const { registerTaskSource, updateTaskSource } = require('agent-manager/src/task-source-registry.js');
 const { applyArchDiscoveryCandidates } = require('agent-manager/src/candidate-docs.js');
 
@@ -168,7 +182,10 @@ function nextPerformanceReviewTask({ repoRoot, pipelineDir, defaultDomain, taskI
     // Reconcile the persistent backlog against this fresh scan -- prune flags the scan no
     // longer reproduces (issue fixed/moved/line-shifted), append genuinely new ones. See
     // flag-store.js for why the old file-exists-only prune was not enough.
-    const reconciled = reconcileFlags({ flags, freshFindings, scanOk, projectTag, repoRoot });
+    const reconciled = reconcileFlags({
+      flags, freshFindings, scanOk, projectTag, repoRoot,
+      isSuppressed: (f) => findingIsSuppressed(pipelineDir, repoRoot, f),
+    });
     flags = reconciled.flags;
     if (reconciled.changed) flagsChanged = true;
 
@@ -191,11 +208,11 @@ function nextPerformanceReviewTask({ repoRoot, pipelineDir, defaultDomain, taskI
       const content = readIfExists(path.join(repoRoot, finding.file));
       if (content && isLikelyMinified(content)) continue;
       if (!content) continue;
-      const lines = content.split('\n');
-      const start = Math.max(0, (finding.line || 1) - 4);
-      const end = Math.min(lines.length, (finding.line || 1) + 3);
-      snippet = lines.slice(start, end).join('\n');
+      snippet = windowFromContent(content, finding.line, SNIPPET_BEFORE, SNIPPET_AFTER);
     }
+
+    // A prior review already ruled this exact construct a false positive -- never re-ask.
+    if (isSuppressed(pipelineDir, finding.rule, snippet)) continue;
 
     return {
       id: taskId,
@@ -224,15 +241,19 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       return nextPerformanceReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue, coveragePath: performanceCoveragePath });
     },
     apply: ({ implementResponse, task }) => {
-      const { performanceFixCandidatesPath } = getConfig();
+      const { performanceFixCandidatesPath, pipelineDir } = getConfig();
       // See apply-group-a.js's applyArchDiscoveryCandidates for why this real,
       // review-time-fresh snippet is threaded through deterministically.
-      return applyArchDiscoveryCandidates({
+      const res = applyArchDiscoveryCandidates({
         implementResponse,
         candidatesPath: performanceFixCandidatesPath,
         docTitle: '# Performance Fix Candidates',
         snippet: task && task.promptContext && task.promptContext.snippet,
       });
+      // A "false positive" verdict wrote no candidate (res.skipped) -- remember the
+      // flagged construct so the scanner never re-emits it (suppression-store.js).
+      recordFalsePositiveIfVerdict({ applyResult: res, implementResponse, task, pipelineDir });
+      return res;
     },
     advisoryProse: true,
     directToMain: true, // see observability_review

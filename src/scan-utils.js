@@ -119,6 +119,140 @@ function extractBraceBody(text, openIndex) {
   return null; // unbalanced -- truncated file or scan artifact, nothing to report
 }
 
+// Returns a copy of `text` with the SAME length and line breaks, but the *interior* of
+// every string literal ('...', "...", `...`), regex literal, line comment and block
+// comment replaced by spaces (delimiter chars and newlines are kept). A rule regex run
+// against the result can only match REAL code -- it will never match a `for (...) {` or an
+// `await` that is actually string data (a test fixture seeding a known-bad snippet), a
+// comment, or the contents of a `/.../ ` pattern.
+//
+// Extends the string/comment state machine extractBraceBody uses with a heuristic regex-
+// literal detector: a `/` starts a regex when the previous significant code token is one
+// that cannot end an expression (an operator, `(`, `[`, `{`, `,`, `;`, `:`, `=>`, or a
+// keyword like `return` / `typeof` / `case`). This is the standard "is this `/` a regex
+// or a divide" rule; getting it wrong only costs a missed finding, never a false one --
+// but NOT handling regex at all was a real bug (a `\"` inside `/.../ ` sent the scanner
+// into a never-closing false string and blanked the rest of the file).
+//
+// A template literal is blanked wholesale, `${...}` interpolation included (an `await`
+// inside `${}` in a loop body is rare; missing it is only a false negative). Indices are
+// preserved, so a match position in the stripped text maps 1:1 onto the original.
+const REGEX_PREV_KEYWORDS = new Set([
+  'return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void', 'throw',
+  'case', 'do', 'else', 'yield', 'await',
+]);
+
+const IDENT_CHAR_RE = /[A-Za-z0-9_$]/;
+
+function stripNonCode(text) {
+  const out = text.split('');
+  let inString = null; // "'", '"', '`', or null
+  let inLineComment = false;
+  let inBlockComment = false;
+  let escapeNext = false;
+  let prevCodeChar = ''; // last non-whitespace char processed as real code
+  let word = '';         // identifier run ending at prevCodeChar (for keyword detection)
+  let wordOpen = false;  // is the current run contiguous with the last code char?
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const next = text[i + 1];
+
+    if (inLineComment) {
+      if (ch === '\n') inLineComment = false;
+      else out[i] = ' ';
+      continue;
+    }
+    if (inBlockComment) {
+      if (ch === '*' && next === '/') { out[i] = ' '; out[i + 1] = ' '; i++; inBlockComment = false; }
+      else if (ch !== '\n') out[i] = ' ';
+      continue;
+    }
+    if (inString) {
+      if (escapeNext) { escapeNext = false; if (ch !== '\n') out[i] = ' '; continue; }
+      if (ch === '\\') { escapeNext = true; out[i] = ' '; continue; }
+      if (ch === inString) { inString = null; prevCodeChar = ch; word = ''; wordOpen = false; continue; }
+      if (ch !== '\n') out[i] = ' ';
+      continue;
+    }
+    if (ch === '/' && next === '/') { inLineComment = true; out[i] = ' '; continue; }
+    if (ch === '/' && next === '*') { inBlockComment = true; out[i] = ' '; continue; }
+
+    if (ch === '/' && regexAllowedAfter(prevCodeChar, word)) {
+      // Scan a regex body: /.../ with \ escapes and [...] char classes (a / inside a
+      // class is literal). Blank the interior, keep both delimiters and trailing flags.
+      let j = i + 1;
+      let inClass = false;
+      let esc = false;
+      let closed = false;
+      for (; j < text.length; j++) {
+        const c = text[j];
+        if (c === '\n') break; // unterminated on this line -- not a regex, bail
+        if (esc) { esc = false; out[j] = ' '; continue; }
+        if (c === '\\') { esc = true; out[j] = ' '; continue; }
+        if (c === '[') { inClass = true; out[j] = ' '; continue; }
+        if (c === ']') { inClass = false; out[j] = ' '; continue; }
+        if (c === '/' && !inClass) { closed = true; break; } // keep the closing '/'
+        out[j] = ' ';
+      }
+      if (closed) {
+        i = j; // resume at the closing '/'; the loop's i++ steps past it
+        prevCodeChar = '/';
+        word = '';
+        wordOpen = false;
+        continue;
+      }
+      // fall through: treat this '/' as an ordinary code char
+    }
+
+    if (ch === '"' || ch === "'" || ch === '`') { inString = ch; word = ''; wordOpen = false; continue; }
+
+    if (/\s/.test(ch)) { wordOpen = false; continue; } // whitespace: keep prevCodeChar & word, just break the run
+
+    if (IDENT_CHAR_RE.test(ch)) {
+      word = wordOpen ? word + ch : ch;
+      wordOpen = true;
+    } else {
+      word = '';
+      wordOpen = false;
+    }
+    prevCodeChar = ch;
+  }
+  return out.join('');
+}
+
+// True when a `/` at this position begins a regex literal rather than a division: the
+// previous significant token cannot end an expression.
+function regexAllowedAfter(prevCodeChar, word) {
+  if (word && REGEX_PREV_KEYWORDS.has(word)) return true;
+  if (!prevCodeChar) return true; // start of input
+  return '([{,;:=!&|?+-*%^~<>'.includes(prevCodeChar);
+}
+
+// A path (repo-relative, forward slashes) that is test/fixture code, not production
+// source. Hot-path perf rules (sync I/O in a loop, sequential await in a loop) are about
+// per-request/per-tick cost and simply do not apply to a fixture loop that runs a
+// handful of times once per suite -- every such finding to date has been a false
+// positive the review stage had to hand-clear.
+function isTestFile(relPath) {
+  const p = String(relPath || '');
+  return /\.(test|spec)\.[cm]?[jt]sx?$/i.test(p)                       // foo.test.js / foo.spec.ts
+    || /(^|\/)(?:tests?|__tests__|__mocks__|fixtures?|__fixtures__)\//i.test(p) // in a tests/ or fixtures/ dir
+    || /(^|\/)(?:test_[^/]+|conftest)\.py$/i.test(p)                   // pytest: test_foo.py / conftest.py
+    || /_test\.py$/i.test(p);                                         // pytest: foo_test.py
+}
+
+// The -before / +after line window around a finding's line, used verbatim as the review
+// task's promptContext.snippet AND (normalized) as the false-positive suppression key.
+// One definition so the read-side window and the suppression-store write-side window can
+// never drift apart.
+function windowFromContent(content, line, before = 4, after = 3) {
+  const lines = String(content == null ? '' : content).split('\n');
+  const start = Math.max(0, (line || 1) - before);
+  const end = Math.min(lines.length, (line || 1) + after);
+  return lines.slice(start, end).join('\n');
+}
+
 function leadingWhitespace(line) {
   return (line.match(/^[ \t]*/) || [''])[0];
 }
@@ -180,6 +314,9 @@ module.exports = {
   extractBraceBody,
   extractIndentedBlock,
   leadingWhitespace,
+  stripNonCode,
+  isTestFile,
+  windowFromContent,
   MINIFIED_LINE_LENGTH_THRESHOLD,
   SKIP_DIRS,
 };
