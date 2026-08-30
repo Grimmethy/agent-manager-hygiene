@@ -22,25 +22,37 @@
 
 const fs = require('fs');
 const path = require('path');
-const { listSourceFiles, isLikelyMinified, lineOfIndex, extractBraceBody } = require('./scan-utils.js');
+const { listSourceFiles, isLikelyMinified, lineOfIndex, extractBraceBody, extractIndentedBlock } = require('./scan-utils.js');
 
 const SCAN_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.py', '.go'];
 const LOOP_CONTEXT_WINDOW_LINES = 40;
 const HEALTH_SIGNAL_RE = /heartbeat|health.?check|liveness|readiness/i;
 
-// Strips comments from a body so a body that's "empty except for a comment explaining
-// why it's intentionally empty" doesn't read as suspicious content.
+// Strips comments AND string/docstring literals from a body so a body that's "empty
+// except for a comment (or a lone docstring) explaining why it's intentionally empty"
+// doesn't read as suspicious content. Covers both languages: // and /* */ (JS), # (Python/
+// shell-ish), and triple-quoted Python strings.
 function stripComments(body) {
-  return body.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  return body
+    .replace(/'''[\s\S]*?'''|"""[\s\S]*?"""/g, '')
+    .replace(/\/\/.*$/gm, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/#.*$/gm, '')
+    .trim();
 }
 
 // error-handling.md's Guidance #2/#3/self-diagnostics: a caught error that is neither
 // rethrown nor surfaced (logged, recorded as a metric, etc.) has silently vanished.
 // Skips a body containing any of these tokens -- presence of ANY of them is read as
-// "this error was surfaced somehow," even if imperfectly.
-const SURFACES_ERROR_RE = /throw|console\.|log(ger)?\.|\.error\(|Error\(|raise\b|panic\(|record|notify|alert|metric/i;
+// "this error was surfaced somehow," even if imperfectly. Covers JS and Python idioms.
+const SURFACES_ERROR_RE = /throw|console\.|log(ger|ging)?\.|\.error\(|Error\(|raise\b|panic\(|record|notify|alert|metric|traceback|warn|capture_exception|sys\.exc_info/i;
+
+// A Python `except` body that is ONLY `pass` or `...` is the silent-swallow equivalent of
+// an empty JS catch block.
+const PY_EMPTY_EXCEPT_RE = /^(?:pass|\.\.\.)$/;
 
 function findSilentCatchBlocks(text, relPath) {
+  if (relPath.endsWith('.py')) return findSilentExceptBlocks(text, relPath);
   const findings = [];
   const catchRe = /\bcatch\s*(\([^)]*\))?\s*\{/g;
   let m;
@@ -63,10 +75,39 @@ function findSilentCatchBlocks(text, relPath) {
   return findings;
 }
 
+// Python counterpart of findSilentCatchBlocks: `except [Type [as e]]:` whose indented
+// body neither re-raises nor surfaces the error. Same rule name / finding shape so the
+// downstream review + deterministic-recheck paths treat it identically.
+function findSilentExceptBlocks(text, relPath) {
+  const findings = [];
+  const exceptRe = /^([ \t]*)except\b[^\n:]*:/gm;
+  let m;
+  while ((m = exceptRe.exec(text))) {
+    const block = extractIndentedBlock(text, m.index);
+    if (!block) continue;
+    // body's first line is the `except ...:` header itself -- judge only the block body.
+    const bodyOnly = block.body.split('\n').slice(1).join('\n');
+    const stripped = stripComments(bodyOnly);
+    const isEmpty = stripped.length === 0 || PY_EMPTY_EXCEPT_RE.test(stripped);
+    if (isEmpty || !SURFACES_ERROR_RE.test(stripped)) {
+      findings.push({
+        rule: 'silent-catch-block',
+        file: relPath,
+        line: lineOfIndex(text, m.index),
+        detail: isEmpty
+          ? 'except block is empty (only pass/.../a comment) -- the exception is silently discarded with no log/re-raise/metric'
+          : 'except block does not appear to log, re-raise, or otherwise surface the exception',
+      });
+    }
+  }
+  return findings;
+}
+
 // self-observability.md: a long-running process should expose a health signal an
-// operator can monitor. Heuristic: a while(true)/for(;;)/setInterval construct with no
-// heartbeat/health-check/liveness keyword within the following N lines.
-const LOOP_START_RE = /\bwhile\s*\(\s*true\s*\)|\bfor\s*\(\s*;\s*;\s*\)|\bsetInterval\s*\(/g;
+// operator can monitor. Heuristic: a while(true)/for(;;)/setInterval (JS) or `while True:`
+// (Python) construct with no heartbeat/health-check/liveness keyword within the following
+// N lines.
+const LOOP_START_RE = /\bwhile\s*\(\s*true\s*\)|\bfor\s*\(\s*;\s*;\s*\)|\bsetInterval\s*\(|\bwhile\s+True\s*:/g;
 
 function findUnguardedLoops(text, relPath) {
   const findings = [];
@@ -116,7 +157,9 @@ function isValidOtelName(name) {
   return null;
 }
 
-const OTEL_CALL_RE = /\.(setAttribute|createCounter|createUpDownCounter|createHistogram|createGauge|startSpan)\(\s*['"]([^'"]+)['"]/g;
+// camelCase (JS SDK) and snake_case (Python SDK) method names both -- start_as_current_span
+// is Python-only, the rest have a form in each.
+const OTEL_CALL_RE = /\.(set_?[Aa]ttribute|create_?[Cc]ounter|create_?[Uu]p_?[Dd]own_?[Cc]ounter|create_?[Hh]istogram|create_?[Gg]auge|start_?[Ss]pan|start_as_current_span)\(\s*['"]([^'"]+)['"]/g;
 
 function findOtelNamingViolations(text, relPath) {
   const findings = [];
@@ -125,15 +168,16 @@ function findOtelNamingViolations(text, relPath) {
   while ((m = OTEL_CALL_RE.exec(text))) {
     const [, method, name] = m;
     const line = lineOfIndex(text, m.index);
+    const canonical = method.replace(/_/g, '').toLowerCase(); // createcounter / createupdowncounter / ...
     const nameError = isValidOtelName(name);
     if (nameError) {
       findings.push({ rule: 'otel-naming-convention', file: relPath, line, detail: `${method}('${name}'): ${nameError}` });
       continue;
     }
-    if ((method === 'createCounter' || method === 'createUpDownCounter') && name.endsWith('_total')) {
+    if ((canonical === 'createcounter' || canonical === 'createupdowncounter') && name.endsWith('_total')) {
       findings.push({ rule: 'otel-naming-convention', file: relPath, line, detail: `${method}('${name}'): counter/UpDownCounter names should not use a '_total' suffix (naming.md)` });
     }
-    if (method === 'createUpDownCounter' && /s$/.test(name) && !/ss$/.test(name)) {
+    if (canonical === 'createupdowncounter' && /s$/.test(name) && !/ss$/.test(name)) {
       findings.push({ rule: 'otel-naming-convention', file: relPath, line, detail: `${method}('${name}'): UpDownCounter names should not be pluralized (naming.md) -- verify this isn't a false positive on a naturally-plural word` });
     }
   }
@@ -204,6 +248,7 @@ function scanProject(clonePath, projectSlug) {
 module.exports = {
   scanProject,
   findSilentCatchBlocks,
+  findSilentExceptBlocks,
   findUnguardedLoops,
   findOtelNamingViolations,
   findMissingReservedAttributes,

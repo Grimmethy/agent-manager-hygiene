@@ -9,7 +9,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { scanProject, findLoopBodyIssues, findJsonDeepCloneAntipattern } = require('./performance-scan.js');
+const { scanProject, findLoopBodyIssues, findPyLoopBodyIssues, findJsonDeepCloneAntipattern } = require('./performance-scan.js');
 
 test('findLoopBodyIssues flags a synchronous fs call inside a for loop', () => {
   const text = 'function run(files) {\n  for (let i = 0; i < files.length; i++) {\n    const data = fs.readFileSync(files[i]);\n  }\n}\n';
@@ -68,12 +68,46 @@ test('scanProject combines loop and clone findings across scanned files', () => 
   }
 });
 
-test('scanProject only scans JS/TS extensions, ignoring non-JS source', () => {
+// --- Python -------------------------------------------------------------------------
+
+test('findPyLoopBodyIssues flags a blocking subprocess call inside a for loop', () => {
+  const text = 'def run(items):\n    for it in items:\n        subprocess.run(["do", it])\n';
+  const findings = findLoopBodyIssues(text, 'a.py'); // dispatches on the .py extension
+  assert.deepEqual(findings.map((f) => f.rule), ['blocking-call-in-loop']);
+  assert.equal(findings[0].line, 2); // the `for` line, not the call's line
+});
+
+test('findPyLoopBodyIssues flags a sequential await inside an async for/while loop', () => {
+  const text = 'async def run(items):\n    for it in items:\n        await fetch(it)\n';
+  const findings = findPyLoopBodyIssues(text, 'a.py');
+  assert.deepEqual(findings.map((f) => f.rule), ['sequential-await-in-loop']);
+});
+
+test('findPyLoopBodyIssues does not flag a Python loop with no blocking call or await', () => {
+  const text = 'for x in data:\n    total += x * 2\n';
+  assert.deepEqual(findPyLoopBodyIssues(text, 'a.py'), []);
+});
+
+test('findJsonDeepCloneAntipattern flags json.loads(json.dumps(...)) in a .py file', () => {
+  const text = 'snapshot = json.loads(json.dumps(state))\n';
+  const findings = findJsonDeepCloneAntipattern(text, 'a.py');
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].rule, 'json-deep-clone-antipattern');
+  assert.match(findings[0].detail, /copy\.deepcopy/);
+});
+
+test('scanProject picks up Python findings alongside JS ones and skips a clean .py file', () => {
   const os = require('os');
   const path = require('path');
   const fs = require('fs');
-  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'performance-scan-test-'));
-  fs.writeFileSync(path.join(repoRoot, 'script.py'), 'for f in files:\n    open(f).read()\n');
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'performance-scan-py-test-'));
+  fs.writeFileSync(path.join(repoRoot, 'svc.py'), 'for job in jobs:\n    requests.get(job.url)\n    copy = json.loads(json.dumps(job.spec))\n');
+  fs.writeFileSync(path.join(repoRoot, 'clean.py'), 'for x in xs:\n    acc.append(x + 1)\n');
 
-  assert.deepEqual(scanProject(repoRoot, 'test-project'), []);
+  const findings = scanProject(repoRoot, 'py-project');
+  const byFile = findings.reduce((m, f) => ((m[f.file] = (m[f.file] || []).concat(f.rule)), m), {});
+  assert.ok(byFile['svc.py'].includes('blocking-call-in-loop'));
+  assert.ok(byFile['svc.py'].includes('json-deep-clone-antipattern'));
+  assert.equal(byFile['clean.py'], undefined);
+  for (const f of findings) assert.equal(f.projectSlug, 'py-project');
 });
