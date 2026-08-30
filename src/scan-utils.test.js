@@ -11,7 +11,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { extractBraceBody, listSourceFiles, isLikelyMinified, lineOfIndex } = require('./scan-utils.js');
+const { extractBraceBody, extractIndentedBlock, leadingWhitespace, listSourceFiles, isLikelyMinified, lineOfIndex } = require('./scan-utils.js');
 
 test('extractBraceBody returns the body between matching braces', () => {
   const text = 'function f() { return 1; }';
@@ -29,6 +29,56 @@ test('extractBraceBody ignores braces inside string and comment content', () => 
 test('extractBraceBody returns null for an unbalanced (truncated) body', () => {
   const text = 'function f() { return 1;';
   assert.equal(extractBraceBody(text, text.indexOf('{')), null);
+});
+
+test('extractIndentedBlock returns the header + indented body, trimming trailing blanks', () => {
+  const text = [
+    'def f(a):',        // 0
+    '    x = 1',         // 1
+    '    if x:',         // 2
+    '        y = 2',     // 3
+    '',                  // 4  blank inside block
+    '    return x',      // 5
+    '',                  // 6  trailing blank -- trimmed
+    'def g():',          // 7  dedent -- stops the block
+    '    pass',
+  ].join('\n');
+  const block = extractIndentedBlock(text, text.indexOf('def f'));
+  assert.equal(block.lineCount, 6);
+  assert.equal(block.body, 'def f(a):\n    x = 1\n    if x:\n        y = 2\n\n    return x');
+  assert.equal(block.body.includes('def g'), false);
+  assert.equal(text.slice(block.endIndex).trimStart().startsWith('def g'), true);
+});
+
+test('extractIndentedBlock follows a multi-line (parenthesised) header to the line ending with ":"', () => {
+  const text = 'def wrapper(a,\n            b):\n    return a\n\nx = 1\n';
+  const block = extractIndentedBlock(text, 0);
+  assert.equal(block.lineCount, 3); // 2 header lines + 1 body line
+  assert.equal(block.body, 'def wrapper(a,\n            b):\n    return a');
+});
+
+test('extractIndentedBlock returns null when no header terminator (":") is found', () => {
+  assert.equal(extractIndentedBlock('def f(): return 1\nx = 2\n', 0), null);
+});
+
+test('extractIndentedBlock stops at a same-indent sibling, not a deeper nested block', () => {
+  const text = [
+    'for item in items:',
+    '    handle(item)',
+    '    for sub in item:',
+    '        deeper(sub)',
+    'after = 1',
+  ].join('\n');
+  const block = extractIndentedBlock(text, 0);
+  assert.equal(block.lineCount, 4); // header + 3 nested lines, stops before `after`
+  assert.equal(block.body.includes('deeper(sub)'), true);
+  assert.equal(block.body.includes('after = 1'), false);
+});
+
+test('leadingWhitespace returns the exact leading run of spaces/tabs', () => {
+  assert.equal(leadingWhitespace('    x'), '    ');
+  assert.equal(leadingWhitespace('\t\tx'), '\t\t');
+  assert.equal(leadingWhitespace('x'), '');
 });
 
 test('lineOfIndex counts real newlines up to the given index, 1-indexed', () => {

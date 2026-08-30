@@ -15,6 +15,14 @@
 // Scope note: export DEFINITIONS are detected for CommonJS only (module.exports / exports.x),
 // so .js/.jsx define candidates; call sites are searched across .js/.jsx/.ts/.tsx so a symbol
 // referenced from TypeScript still counts. ESM/TS `export` *definitions* are not detected.
+//
+// Python is deliberately NOT covered here (unlike function-length / observability /
+// performance, which gained .py support 2026-08-30). "Unused module-level def/class" in
+// Python is a false-positive minefield without a real analyzer: framework-invoked handlers
+// (@app.route, pytest fixtures, Django models, click commands), `__all__` re-exports,
+// `from .x import *`, and runtime getattr/plugin lookups all look unused to grep but
+// aren't -- and this scanner's whole selling point is NOT needing vulture. Point vulture
+// at a Python repo for this rule instead.
 
 const fs = require('fs');
 const path = require('path');

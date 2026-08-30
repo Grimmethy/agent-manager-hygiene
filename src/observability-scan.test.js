@@ -14,7 +14,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const {
-  scanProject, findSilentCatchBlocks, findUnguardedLoops, findOtelNamingViolations,
+  scanProject, findSilentCatchBlocks, findSilentExceptBlocks, findUnguardedLoops, findOtelNamingViolations,
   findMissingReservedAttributes, hasOtelDependency, isValidOtelName,
 } = require('./observability-scan.js');
 
@@ -51,6 +51,43 @@ test('findSilentCatchBlocks does not flag a catch that logs the error', () => {
 test('findSilentCatchBlocks does not flag a catch that rethrows', () => {
   const text = 'try {\n  risky();\n} catch (e) {\n  throw e;\n}\n';
   assert.equal(findSilentCatchBlocks(text, 'a.js').length, 0);
+});
+
+// --- Python ------------------------------------------------------------------------
+
+test('findSilentCatchBlocks routes .py files to the except-block detector: bare "except: pass"', () => {
+  const text = 'def f():\n    try:\n        risky()\n    except ValueError:\n        pass\n';
+  const findings = findSilentCatchBlocks(text, 'a.py');
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].rule, 'silent-catch-block');
+  assert.equal(findings[0].line, 4);
+  assert.match(findings[0].detail, /silently discarded/);
+});
+
+test('findSilentExceptBlocks flags an except whose only content is "..." or a comment', () => {
+  assert.equal(findSilentExceptBlocks('try:\n    x()\nexcept Exception:\n    ...\n', 'a.py').length, 1);
+  assert.equal(findSilentExceptBlocks('try:\n    x()\nexcept Exception:\n    # not our problem\n    pass\n', 'a.py').length, 1);
+});
+
+test('findSilentExceptBlocks does not flag an except that logs or re-raises', () => {
+  assert.equal(findSilentExceptBlocks('try:\n    x()\nexcept Exception as e:\n    logging.exception(e)\n', 'a.py').length, 0);
+  assert.equal(findSilentExceptBlocks('try:\n    x()\nexcept Exception:\n    raise\n', 'a.py').length, 0);
+  assert.equal(findSilentExceptBlocks('try:\n    x()\nexcept Exception:\n    traceback.print_exc()\n', 'a.py').length, 0);
+});
+
+test('findUnguardedLoops flags a Python `while True:` with no health signal nearby', () => {
+  const text = 'def run():\n    while True:\n        do_work()\n        time.sleep(60)\n';
+  const findings = findUnguardedLoops(text, 'worker.py');
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].rule, 'unguarded-long-running-loop');
+});
+
+test('findOtelNamingViolations recognises the snake_case (Python SDK) method names', () => {
+  const text = "span.set_attribute('Bad.Name', 1)\nmeter.create_counter('requests_total')\n";
+  const findings = findOtelNamingViolations(text, 'app.py');
+  const details = findings.map((f) => f.detail).join(' | ');
+  assert.match(details, /set_attribute\('Bad\.Name'\).*not lowercase/);
+  assert.match(details, /create_counter\('requests_total'\).*_total/);
 });
 
 test('findUnguardedLoops flags a while(true) with no health signal nearby', () => {

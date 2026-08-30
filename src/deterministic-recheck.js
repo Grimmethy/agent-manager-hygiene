@@ -29,8 +29,12 @@ const OBSERVABILITY_PER_FILE_RULES = {
   'otel-naming-convention': (text, relPath) => obsScan.findOtelNamingViolations(text, relPath),
 };
 
+// findLoopBodyIssues dispatches on relPath ('.py' -> the Python detectors), so the same
+// three entries cover both languages; blocking-call-in-loop is the Python-only rule name
+// (the .py analogue of sync-io-in-loop).
 const PERFORMANCE_PER_FILE_RULES = {
   'sync-io-in-loop': (text, relPath) => perfScan.findLoopBodyIssues(text, relPath).filter((f) => f.rule === 'sync-io-in-loop'),
+  'blocking-call-in-loop': (text, relPath) => perfScan.findLoopBodyIssues(text, relPath).filter((f) => f.rule === 'blocking-call-in-loop'),
   'sequential-await-in-loop': (text, relPath) => perfScan.findLoopBodyIssues(text, relPath).filter((f) => f.rule === 'sequential-await-in-loop'),
   'json-deep-clone-antipattern': (text, relPath) => perfScan.findJsonDeepCloneAntipattern(text, relPath),
 };

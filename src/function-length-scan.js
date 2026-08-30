@@ -25,9 +25,9 @@
 
 const fs = require('fs');
 const path = require('path');
-const { extractBraceBody, listSourceFiles, isLikelyMinified, lineOfIndex } = require('./scan-utils.js');
+const { extractBraceBody, extractIndentedBlock, listSourceFiles, isLikelyMinified, lineOfIndex } = require('./scan-utils.js');
 
-const SCAN_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx'];
+const SCAN_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.py'];
 
 // Starting calibration, not a strict NASA-60 mandate -- this codebase's own real style
 // (heavily commented, verbose identifiers) runs longer than typical C, and the review
@@ -96,10 +96,36 @@ function findLongFunctions(text, relPath, threshold = maxFunctionLines()) {
   return findings;
 }
 
+// Python's brace-free equivalent: match `def` / `async def` at a line start (nested defs
+// included -- flagged separately, same as JS nested functions), take the indented block
+// via scan-utils' extractIndentedBlock, and measure its line span. `line` points at the
+// `def`. Same regex-not-a-parser tradeoff as findLongFunctions above; a decorator stack
+// above the def is not counted toward the length (it belongs to call sites, not the body).
+const PY_DEF_RE = /^([ \t]*)(?:async[ \t]+)?def[ \t]+([A-Za-z_]\w*)[ \t]*\(/gm;
+
+function findLongPythonFunctions(text, relPath, threshold = maxFunctionLines()) {
+  const findings = [];
+  PY_DEF_RE.lastIndex = 0;
+  let m;
+  while ((m = PY_DEF_RE.exec(text))) {
+    const block = extractIndentedBlock(text, m.index);
+    if (!block) continue;
+    if (block.lineCount <= threshold) continue;
+    findings.push({
+      rule: 'function-too-long',
+      file: relPath,
+      line: lineOfIndex(text, m.index),
+      detail: `function "${m[2]}" is ${block.lineCount} lines long (threshold ${threshold}) -- consider decomposing into smaller, single-purpose functions`,
+    });
+  }
+  return findings;
+}
+
 // Scans one project (a real repoRoot, already checked out -- this module never clones or
 // mutates anything). Returns findings with projectSlug/scannedAt attached, ready to
 // append to a persistent flags file, same shape observability-scan.js's own scanProject
-// returns.
+// returns. JS/TS files go through findLongFunctions (brace-matched), .py files through
+// findLongPythonFunctions (indentation-matched).
 function scanProject(clonePath, projectSlug) {
   const allFiles = listSourceFiles(clonePath, SCAN_EXTENSIONS);
   const scannedAt = new Date().toISOString();
@@ -111,7 +137,8 @@ function scanProject(clonePath, projectSlug) {
     try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
     if (isLikelyMinified(text)) continue;
     const relPath = path.relative(clonePath, file).replace(/\\/g, '/');
-    findings.push(...findLongFunctions(text, relPath, threshold));
+    const finder = file.endsWith('.py') ? findLongPythonFunctions : findLongFunctions;
+    findings.push(...finder(text, relPath, threshold));
   }
 
   return findings.map((f) => ({ ...f, projectSlug, scannedAt }));
@@ -120,6 +147,7 @@ function scanProject(clonePath, projectSlug) {
 module.exports = {
   scanProject,
   findLongFunctions,
+  findLongPythonFunctions,
   countLines,
   maxFunctionLines,
   DEFAULT_MAX_FUNCTION_LINES,

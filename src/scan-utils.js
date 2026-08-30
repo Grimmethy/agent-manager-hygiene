@@ -119,11 +119,67 @@ function extractBraceBody(text, openIndex) {
   return null; // unbalanced -- truncated file or scan artifact, nothing to report
 }
 
+function leadingWhitespace(line) {
+  return (line.match(/^[ \t]*/) || [''])[0];
+}
+
+// The Python equivalent of extractBraceBody: Python compound statements have no closing
+// token, so a block's body is every following line indented deeper than its header line,
+// up to (not including) the first line dedented back to the header's own indent or less.
+// Given the index of any character on the HEADER line (a `def`/`for`/`while`/`try`/`with`/
+// `if` line), returns { body, endIndex, lineCount } where:
+//   - body      is the header line(s) + block-body text (blank and comment-only lines
+//               inside the block belong to it; trailing blank lines are trimmed off)
+//   - endIndex  is the char offset just past the last real body line
+//   - lineCount is body's line span, the intuitive "this block is N lines long"
+// Best-effort, same spirit as extractBraceBody: the header may span several physical
+// lines (parenthesised args), so its terminator is taken to be the first physical line
+// whose code (># comment stripped) ends with ':'. Returns null if no terminator is found
+// within a small runaway window. Indentation is compared by leading-whitespace LENGTH,
+// which is correct for any file that is internally consistent (all-spaces or all-tabs per
+// level) -- a file that mixes them within one block is a heuristic miss the review stage
+// filters, same tolerance every other rule here already accepts.
+function extractIndentedBlock(text, headerStartIndex) {
+  const lines = text.split('\n');
+
+  let charCount = 0;
+  let headerLineIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const lineEnd = charCount + lines[i].length;
+    if (headerStartIndex >= charCount && headerStartIndex <= lineEnd) { headerLineIdx = i; break; }
+    charCount = lineEnd + 1; // + 1 for the '\n'
+  }
+  if (headerLineIdx === -1) return null;
+
+  const headerIndentLen = leadingWhitespace(lines[headerLineIdx]).length;
+
+  let headerEndIdx = -1;
+  for (let i = headerLineIdx; i < lines.length && i - headerLineIdx <= 40; i++) {
+    const code = lines[i].replace(/#.*$/, '').replace(/\s+$/, '');
+    if (code.endsWith(':')) { headerEndIdx = i; break; }
+  }
+  if (headerEndIdx === -1) return null;
+
+  let lastRealLine = headerEndIdx;
+  for (let i = headerEndIdx + 1; i < lines.length; i++) {
+    if (lines[i].trim() === '') continue; // blank -- only counts if a deeper line follows
+    if (leadingWhitespace(lines[i]).length <= headerIndentLen) break; // dedent -> block over
+    lastRealLine = i;
+  }
+
+  const body = lines.slice(headerLineIdx, lastRealLine + 1).join('\n');
+  let endIndex = 0;
+  for (let i = 0; i <= lastRealLine; i++) endIndex += lines[i].length + 1;
+  return { body, endIndex: endIndex - 1, lineCount: lastRealLine - headerLineIdx + 1 };
+}
+
 module.exports = {
   listSourceFiles,
   isLikelyMinified,
   lineOfIndex,
   extractBraceBody,
+  extractIndentedBlock,
+  leadingWhitespace,
   MINIFIED_LINE_LENGTH_THRESHOLD,
   SKIP_DIRS,
 };

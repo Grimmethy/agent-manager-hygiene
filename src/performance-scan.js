@@ -9,31 +9,39 @@
 // keyword windows), not a real profiler or parser, so false positives are expected and
 // are Ornith's job to filter, not this script's.
 //
-// Rules are JS/TS-specific (unlike observability-scan.js's file-level rules, which are
-// language-agnostic) since two of the three key off Node-specific APIs (fs.*Sync,
-// child_process's *Sync) and the third off a JS-only idiom -- scanning .py/.go source
-// for them would just be noise.
+// Each rule has a JS form and a Python form (dispatched by file extension inside the
+// find* functions). The JS forms key off Node APIs (fs.*Sync, child_process's *Sync) and
+// a JS idiom; the Python forms key off blocking stdlib calls (subprocess/requests/urlopen)
+// and the direct Python analogues (`await` in a loop, `json.loads(json.dumps(...))`).
 
 const fs = require('fs');
 const path = require('path');
-const { extractBraceBody, listSourceFiles, lineOfIndex, isLikelyMinified } = require('./scan-utils.js');
+const { extractBraceBody, extractIndentedBlock, listSourceFiles, lineOfIndex, isLikelyMinified } = require('./scan-utils.js');
 
-const SCAN_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx'];
+const SCAN_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.py'];
 const LOOP_START_RE = /\bfor\s*\([^)]*\)\s*\{|\bwhile\s*\([^)]*\)\s*\{/g;
+// Python loop headers: `for ... :` / `while ... :` / `async for ... :` at a line start.
+const PY_LOOP_RE = /^[ \t]*(?:async[ \t]+)?for[ \t]+[^\n]+?:[ \t]*(?:#.*)?$|^[ \t]*while[ \t]+[^\n]+?:[ \t]*(?:#.*)?$/gm;
 
 // A synchronous fs/child_process call blocks the event loop for its full duration --
 // fine once, a CPU/latency problem when it runs once per loop iteration instead of
 // once total or in parallel.
 const SYNC_IO_RE = /\b(?:readFileSync|writeFileSync|appendFileSync|existsSync|statSync|lstatSync|readdirSync|mkdirSync|renameSync|copyFileSync|unlinkSync|execSync|spawnSync)\s*\(/;
 
+// The Python analogue: a blocking stdlib call (subprocess spawn, a synchronous HTTP
+// request, os.system) run once per loop iteration where it could be batched, moved out,
+// or run concurrently (asyncio / a thread pool).
+const PY_BLOCKING_IO_RE = /\b(?:subprocess\.(?:run|call|check_output|check_call|Popen)|requests\.(?:get|post|put|delete|patch|head|request)|urlopen|os\.system)\s*\(/;
+
 // A sequential `await` inside a loop serializes work that's very often independent
 // per-iteration (e.g. N separate network/file fetches) and could run concurrently via
-// Promise.all -- not always wrong (a deliberate rate-limited/ordered sequence is a
-// legitimate reason), which is exactly why this is a candidate for Ornith to judge, not
-// an auto-fix.
+// Promise.all / asyncio.gather -- not always wrong (a deliberate rate-limited/ordered
+// sequence is a legitimate reason), which is exactly why this is a candidate for the
+// review model to judge, not an auto-fix.
 const AWAIT_RE = /\bawait\b/;
 
 function findLoopBodyIssues(text, relPath) {
+  if (relPath.endsWith('.py')) return findPyLoopBodyIssues(text, relPath);
   const findings = [];
   LOOP_START_RE.lastIndex = 0;
   let m;
@@ -62,21 +70,55 @@ function findLoopBodyIssues(text, relPath) {
   return findings;
 }
 
-// JSON.parse(JSON.stringify(x)) is a common "deep clone" idiom that pays for a full
-// serialize+reparse of the whole structure -- wasteful on a large/hot object compared
-// to a real structural clone (structuredClone, or a targeted shallow copy).
+function findPyLoopBodyIssues(text, relPath) {
+  const findings = [];
+  PY_LOOP_RE.lastIndex = 0;
+  let m;
+  while ((m = PY_LOOP_RE.exec(text))) {
+    const block = extractIndentedBlock(text, m.index);
+    if (!block) continue;
+    const body = block.body.split('\n').slice(1).join('\n'); // drop the loop header line
+    const line = lineOfIndex(text, m.index);
+    if (PY_BLOCKING_IO_RE.test(body)) {
+      findings.push({
+        rule: 'blocking-call-in-loop',
+        file: relPath,
+        line,
+        detail: 'a blocking subprocess/HTTP/os.system call runs once per loop iteration -- consider batching it, hoisting it out, or running the iterations concurrently',
+      });
+    }
+    if (AWAIT_RE.test(body)) {
+      findings.push({
+        rule: 'sequential-await-in-loop',
+        file: relPath,
+        line,
+        detail: 'an await inside this loop serializes work that may be independent per-iteration and could run concurrently (e.g. via asyncio.gather)',
+      });
+    }
+  }
+  return findings;
+}
+
+// JSON.parse(JSON.stringify(x)) / json.loads(json.dumps(x)) is a common "deep clone"
+// idiom that pays for a full serialize+reparse of the whole structure -- wasteful on a
+// large/hot object compared to a real structural clone (structuredClone in JS,
+// copy.deepcopy in Python, or a targeted shallow copy).
 const JSON_CLONE_RE = /JSON\.parse\s*\(\s*JSON\.stringify\s*\(/g;
+const PY_JSON_CLONE_RE = /json\.loads\s*\(\s*json\.dumps\s*\(/g;
 
 function findJsonDeepCloneAntipattern(text, relPath) {
   const findings = [];
-  JSON_CLONE_RE.lastIndex = 0;
+  const [re, hint] = relPath.endsWith('.py')
+    ? [PY_JSON_CLONE_RE, 'json.loads(json.dumps(...)) used to deep-clone -- pays for a full serialize+reparse; consider copy.deepcopy or a targeted copy']
+    : [JSON_CLONE_RE, 'JSON.parse(JSON.stringify(...)) used to deep-clone -- pays for a full serialize+reparse; consider structuredClone or a targeted copy'];
+  re.lastIndex = 0;
   let m;
-  while ((m = JSON_CLONE_RE.exec(text))) {
+  while ((m = re.exec(text))) {
     findings.push({
       rule: 'json-deep-clone-antipattern',
       file: relPath,
       line: lineOfIndex(text, m.index),
-      detail: 'JSON.parse(JSON.stringify(...)) used to deep-clone -- pays for a full serialize+reparse; consider structuredClone or a targeted copy',
+      detail: hint,
     });
   }
   return findings;
@@ -111,5 +153,6 @@ function scanProject(clonePath, projectSlug) {
 module.exports = {
   scanProject,
   findLoopBodyIssues,
+  findPyLoopBodyIssues,
   findJsonDeepCloneAntipattern,
 };
