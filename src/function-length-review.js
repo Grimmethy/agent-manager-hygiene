@@ -21,6 +21,20 @@ const fs = require('fs');
 const path = require('path');
 const { scanProject } = require('./function-length-scan.js');
 const { reconcileFlags } = require('./flag-store.js');
+const { windowFromContent } = require('./scan-utils.js');
+const { isSuppressed, recordFalsePositiveIfVerdict } = require('./suppression-store.js');
+
+// A longer window than observability's -- judging a function's real shape needs its body,
+// not just its start line. Used verbatim as promptContext.snippet AND the suppression key.
+const SNIPPET_BEFORE = 2;
+const SNIPPET_AFTER = 30;
+
+function findingIsSuppressed(pipelineDir, repoRoot, finding) {
+  if (!finding.file) return false;
+  const content = readIfExists(path.join(repoRoot, finding.file));
+  if (!content) return false;
+  return isSuppressed(pipelineDir, finding.rule, windowFromContent(content, finding.line, SNIPPET_BEFORE, SNIPPET_AFTER));
+}
 const { registerTaskSource, updateTaskSource } = require('agent-manager/src/task-source-registry.js');
 const { applyArchDiscoveryCandidates } = require('agent-manager/src/candidate-docs.js');
 const { groupBJsonInstructions, candidateSplitInstructions, formatFileContents } = require('agent-manager/src/prompts.js');
@@ -172,7 +186,10 @@ function nextFunctionLengthReviewTask({ repoRoot, pipelineDir, defaultDomain, ta
     // Reconcile the persistent backlog against this fresh scan -- prune flags the scan no
     // longer reproduces (function shrank/moved/renamed/line-shifted), append genuinely
     // new ones. See flag-store.js for why the old file-exists-only prune was not enough.
-    const reconciled = reconcileFlags({ flags, freshFindings, scanOk, projectTag, repoRoot });
+    const reconciled = reconcileFlags({
+      flags, freshFindings, scanOk, projectTag, repoRoot,
+      isSuppressed: (f) => findingIsSuppressed(pipelineDir, repoRoot, f),
+    });
     flags = reconciled.flags;
     if (reconciled.changed) flagsChanged = true;
 
@@ -194,11 +211,11 @@ function nextFunctionLengthReviewTask({ repoRoot, pipelineDir, defaultDomain, ta
     if (finding.file) {
       const content = readIfExists(path.join(repoRoot, finding.file));
       if (!content) continue;
-      const lines = content.split('\n');
-      const start = Math.max(0, (finding.line || 1) - 2);
-      const end = Math.min(lines.length, (finding.line || 1) + 30); // a longer window than observability's -- the whole point here is judging the function's real shape, not just its start line
-      snippet = lines.slice(start, end).join('\n');
+      snippet = windowFromContent(content, finding.line, SNIPPET_BEFORE, SNIPPET_AFTER);
     }
+
+    // A prior review already ruled this exact construct a false positive -- never re-ask.
+    if (isSuppressed(pipelineDir, finding.rule, snippet)) continue;
 
     return {
       id: taskId,
@@ -233,17 +250,21 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       return nextFunctionLengthReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue });
     },
     apply: ({ implementResponse, task }) => {
-      const { repoRoot } = getConfig();
+      const { repoRoot, pipelineDir } = getConfig();
       const candidatesPath = process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH
         || path.join(repoRoot, 'Docs', 'FUNCTION_LENGTH_CANDIDATES.md');
       // See apply-group-a.js's applyArchDiscoveryCandidates for why this real,
       // review-time-fresh snippet is threaded through deterministically.
-      return applyArchDiscoveryCandidates({
+      const res = applyArchDiscoveryCandidates({
         implementResponse,
         candidatesPath,
         docTitle: '# Function Length Decomposition Candidates',
         snippet: task && task.promptContext && task.promptContext.snippet,
       });
+      // A "false positive" verdict wrote no candidate -- remember the flagged construct
+      // so the scanner never re-emits it (suppression-store.js).
+      recordFalsePositiveIfVerdict({ applyResult: res, implementResponse, task, pipelineDir });
+      return res;
     },
     // 2026-08-23: review-task.js/local-draft.js now read these two flags directly off
     // the registry entry instead of a hardcoded array a plugin author would otherwise

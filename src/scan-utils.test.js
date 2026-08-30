@@ -114,3 +114,83 @@ test('listSourceFiles walks nested directories, skips dot-dirs and known build/t
 test('listSourceFiles returns an empty array (not a throw) for a directory that does not exist', () => {
   assert.deepEqual(listSourceFiles('/definitely/not/a/real/path', ['.js']), []);
 });
+
+// --- stripNonCode / isTestFile / windowFromContent (2026-08-30) -------------------------
+const { stripNonCode, isTestFile, windowFromContent } = require('./scan-utils.js');
+
+test('stripNonCode preserves length and line count', () => {
+  const src = "const a = 'for (x) {';\n// await here\nconst b = `tpl\nspanning`;\n/* block\ncomment */\ncode();\n";
+  const out = stripNonCode(src);
+  assert.equal(out.length, src.length);
+  assert.equal(out.split('\n').length, src.split('\n').length);
+});
+
+test('stripNonCode blanks string interiors and comment bodies, keeps delimiters and newlines', () => {
+  const s = "x('for (i) { await y }')";                 // 19-char interior
+  assert.equal(stripNonCode(s), "x('" + ' '.repeat(19) + "')");
+  assert.equal(stripNonCode(s).length, s.length);
+  const lc = stripNonCode('a; // for (i) { await }\nb;');
+  assert.equal(lc.length, 'a; // for (i) { await }\nb;'.length);
+  assert.match(lc, /^a; +\nb;$/);
+  assert.ok(!/for|await/.test(lc));
+  const blk = 'a /* await\nfetch */ b';
+  const stripped = stripNonCode(blk);
+  assert.equal(stripped.length, blk.length);
+  assert.equal(stripped.split('\n').length, 2);
+  assert.ok(!/await|fetch/.test(stripped), 'comment tokens are blanked');
+  assert.match(stripped, /^a +\n + b$/);
+});
+
+test('stripNonCode keeps a real loop header + real await intact', () => {
+  const src = 'for (const x of xs) {\n  await fetch(x);\n}';
+  assert.equal(stripNonCode(src), src);
+});
+
+test('isTestFile matches JS test/fixture paths and pytest names, not plain source', () => {
+  for (const p of ['src/foo.test.js', 'src/foo.spec.ts', 'src/__tests__/x.js', 'test/fixtures/seed.js', 'tests/util.js', 'pkg/test_thing.py', 'pkg/thing_test.py', 'conftest.py']) {
+    assert.equal(isTestFile(p), true, p);
+  }
+  for (const p of ['src/foo.js', 'src/performance-scan.js', 'lib/test-helpers.js', 'src/latest.js']) {
+    assert.equal(isTestFile(p), false, p);
+  }
+});
+
+test('windowFromContent slices a stable window around the finding line across a line shift', () => {
+  const body = 'A\nB\nfor (x) {}\nD\nE';
+  const shifted = '// pad\n// pad\n' + body;           // same construct, moved down 2 lines
+  const w = windowFromContent(body, 3, 2, 1);          // line 3 is `for (x) {}`
+  assert.equal(w, windowFromContent(shifted, 5, 2, 1), 'window text is identical after the shift');
+  assert.match(w, /for \(x\) \{\}/);
+});
+
+test('stripNonCode: a regex literal (even one containing a quote) does not derail the scan', () => {
+  // Real bug (2026-08-30): `re: /\"@opentelemetry\//` in observability-scan.js sent the
+  // old stripper into a never-closing false string, blanking every real loop after it.
+  const src = [
+    "const checks = [",
+    "  { file: 'package.json', re: /\\\"@opentelemetry\\// },",
+    "];",
+    "for (const file of files) {",
+    "  fs.readFileSync(file);",
+    "}",
+  ].join('\n');
+  const s = stripNonCode(src);
+  assert.equal(s.length, src.length);
+  assert.ok(s.includes('for (const file of files) {'), 'the real loop after a regex literal survives');
+  assert.ok(s.includes('fs.readFileSync(file)'), 'the real loop body survives');
+  assert.ok(!s.includes('@opentelemetry'), 'the regex interior is blanked');
+});
+
+test('stripNonCode: `return /re/.test(x)` keeps the divide-vs-regex call sane (regex after a keyword)', () => {
+  const s = stripNonCode('function f(x) { return /ab["c]/.test(x); }');
+  assert.equal(s.length, 'function f(x) { return /ab["c]/.test(x); }'.length);
+  assert.ok(s.includes('return /'), 'keyword-preceded regex is recognized');
+  assert.ok(s.includes('.test(x)'));
+  assert.ok(!s.includes('ab'), 'regex interior blanked, so a stray quote inside it is inert');
+});
+
+test('stripNonCode: real division is left alone', () => {
+  const s = stripNonCode('const rate = total / count;\nfor (const x of xs) { await y(x); }');
+  assert.ok(s.includes('total / count'), 'a / after an identifier stays as division');
+  assert.ok(s.includes('for (const x of xs) { await y(x); }'), 'the following real loop is untouched');
+});

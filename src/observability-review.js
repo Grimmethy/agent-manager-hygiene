@@ -25,8 +25,20 @@
 const fs = require('fs');
 const path = require('path');
 const { scanProject } = require('./observability-scan.js');
-const { isLikelyMinified } = require('./scan-utils.js');
+const { isLikelyMinified, windowFromContent } = require('./scan-utils.js');
 const { reconcileFlags } = require('./flag-store.js');
+const { isSuppressed, recordFalsePositiveIfVerdict } = require('./suppression-store.js');
+
+// The -before / +after window that becomes promptContext.snippet AND the suppression key.
+const SNIPPET_BEFORE = 4;
+const SNIPPET_AFTER = 3;
+
+function findingIsSuppressed(pipelineDir, repoRoot, finding) {
+  if (!finding.file) return false;
+  const content = readIfExists(path.join(repoRoot, finding.file));
+  if (!content) return false;
+  return isSuppressed(pipelineDir, finding.rule, windowFromContent(content, finding.line, SNIPPET_BEFORE, SNIPPET_AFTER));
+}
 const { registerTaskSource, updateTaskSource } = require('agent-manager/src/task-source-registry.js');
 const { applyArchDiscoveryCandidates } = require('agent-manager/src/candidate-docs.js');
 
@@ -186,7 +198,10 @@ function nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, tas
     // Reconcile the persistent backlog against this fresh scan -- prune flags the scan no
     // longer reproduces (issue fixed/moved/line-shifted), append genuinely new ones. See
     // flag-store.js for why the old file-exists-only prune was not enough.
-    const reconciled = reconcileFlags({ flags, freshFindings, scanOk, projectTag, repoRoot });
+    const reconciled = reconcileFlags({
+      flags, freshFindings, scanOk, projectTag, repoRoot,
+      isSuppressed: (f) => findingIsSuppressed(pipelineDir, repoRoot, f),
+    });
     flags = reconciled.flags;
     if (reconciled.changed) flagsChanged = true;
 
@@ -209,11 +224,11 @@ function nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, tas
       const content = readIfExists(path.join(repoRoot, finding.file));
       if (content && isLikelyMinified(content)) continue;
       if (!content) continue;
-      const lines = content.split('\n');
-      const start = Math.max(0, (finding.line || 1) - 4);
-      const end = Math.min(lines.length, (finding.line || 1) + 3);
-      snippet = lines.slice(start, end).join('\n');
+      snippet = windowFromContent(content, finding.line, SNIPPET_BEFORE, SNIPPET_AFTER);
     }
+
+    // A prior review already ruled this exact construct a false positive -- never re-ask.
+    if (isSuppressed(pipelineDir, finding.rule, snippet)) continue;
 
     return {
       id: taskId,
@@ -242,17 +257,21 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       return nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue, coveragePath: observabilityCoveragePath });
     },
     apply: ({ implementResponse, task }) => {
-      const { observabilityFixCandidatesPath } = getConfig();
+      const { observabilityFixCandidatesPath, pipelineDir } = getConfig();
       // task.promptContext.snippet is the real, review-time-fresh code text this
       // finding is about (see nextObservabilityReviewTask below) -- passed through
       // deterministically so it survives into the candidate doc as data, not just
       // however faithfully the model's own prose happened to paraphrase it.
-      return applyArchDiscoveryCandidates({
+      const res = applyArchDiscoveryCandidates({
         implementResponse,
         candidatesPath: observabilityFixCandidatesPath,
         docTitle: '# Observability Fix Candidates',
         snippet: task && task.promptContext && task.promptContext.snippet,
       });
+      // A "false positive" verdict wrote no candidate -- remember the flagged construct
+      // so the scanner never re-emits it (suppression-store.js).
+      recordFalsePositiveIfVerdict({ applyResult: res, implementResponse, task, pipelineDir });
+      return res;
     },
     advisoryProse: true,
     directToMain: true, // the apply is a low-risk candidate-doc append, not real code -- straight to main

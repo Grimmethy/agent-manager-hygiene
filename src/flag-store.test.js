@@ -119,3 +119,36 @@ test('a failed scan on an all-present, single-project backlog changes nothing', 
   });
   assert.equal(changed, false);
 });
+
+// --- isSuppressed pruning (2026-08-30) -------------------------------------------------
+test('reconcileFlags with isSuppressed drops a matching flag for the scanned project (from kept AND fresh)', () => {
+  const a = flag('a.js', 10);                    // will be suppressed
+  const b = flag('b.js', 20);                    // survives
+  const other = flag('c.js', 5, { projectSlug: 'other-proj' }); // different project -- never touched
+  const { flags, changed } = reconcileFlags({
+    flags: [a, b, other],
+    freshFindings: [flag('a.js', 10), flag('b.js', 20), flag('d.js', 99)], // scan still sees a.js:10 and a new d.js:99
+    scanOk: true,
+    projectTag: 'proj',
+    repoRoot: '/nope',
+    isSuppressed: (f) => f.file === 'a.js' || f.file === 'd.js',
+  });
+  const keys = flags.map(flagKey).sort();
+  assert.deepEqual(keys, ['function-too-long::b.js::20', 'function-too-long::c.js::5'].sort());
+  assert.equal(changed, true);
+});
+
+test('reconcileFlags without isSuppressed is unchanged (back-compat)', () => {
+  const { flags } = reconcileFlags({
+    flags: [flag('a.js', 1)], freshFindings: [flag('a.js', 1)], scanOk: true, projectTag: 'proj', repoRoot: '/nope',
+  });
+  assert.equal(flags.length, 1);
+});
+
+test('reconcileFlags fails open: a throwing isSuppressed does not wipe the backlog', () => {
+  const { flags } = reconcileFlags({
+    flags: [flag('a.js', 1)], freshFindings: [flag('a.js', 1)], scanOk: true, projectTag: 'proj', repoRoot: '/nope',
+    isSuppressed: () => { throw new Error('boom'); },
+  });
+  assert.equal(flags.length, 1);
+});

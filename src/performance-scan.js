@@ -16,7 +16,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { extractBraceBody, extractIndentedBlock, listSourceFiles, lineOfIndex, isLikelyMinified } = require('./scan-utils.js');
+const { extractBraceBody, extractIndentedBlock, listSourceFiles, lineOfIndex, isLikelyMinified, stripNonCode, isTestFile } = require('./scan-utils.js');
 
 const SCAN_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.py'];
 const LOOP_START_RE = /\bfor\s*\([^)]*\)\s*\{|\bwhile\s*\([^)]*\)\s*\{/g;
@@ -42,15 +42,25 @@ const AWAIT_RE = /\bawait\b/;
 
 function findLoopBodyIssues(text, relPath) {
   if (relPath.endsWith('.py')) return findPyLoopBodyIssues(text, relPath);
+  // Hot-path loop rules do not apply to fixture/test code -- a loop that runs a handful
+  // of times once per suite has no per-request cost to regress. Every such finding so far
+  // has been a false positive.
+  if (isTestFile(relPath)) return [];
   const findings = [];
+  // Match loop headers and test the body against a string/comment-blanked view of the
+  // source, so a `for (...) { await ... }` that only exists as string-literal fixture
+  // data (its most common shape in this codebase's own tests) is never flagged. Indices
+  // in `scan` line up 1:1 with `text`, so extractBraceBody / lineOfIndex use the real text.
+  const scan = stripNonCode(text);
   LOOP_START_RE.lastIndex = 0;
   let m;
-  while ((m = LOOP_START_RE.exec(text))) {
+  while ((m = LOOP_START_RE.exec(scan))) {
     const openIndex = m.index + m[0].length - 1;
     const body = extractBraceBody(text, openIndex);
     if (body === null) continue;
+    const codeBody = stripNonCode(body);
     const line = lineOfIndex(text, m.index);
-    if (SYNC_IO_RE.test(body)) {
+    if (SYNC_IO_RE.test(codeBody)) {
       findings.push({
         rule: 'sync-io-in-loop',
         file: relPath,
@@ -58,7 +68,7 @@ function findLoopBodyIssues(text, relPath) {
         detail: 'a synchronous fs/child_process call runs inside this loop, blocking the event loop once per iteration',
       });
     }
-    if (AWAIT_RE.test(body)) {
+    if (AWAIT_RE.test(codeBody)) {
       findings.push({
         rule: 'sequential-await-in-loop',
         file: relPath,
@@ -71,6 +81,7 @@ function findLoopBodyIssues(text, relPath) {
 }
 
 function findPyLoopBodyIssues(text, relPath) {
+  if (isTestFile(relPath)) return []; // same reasoning as findLoopBodyIssues
   const findings = [];
   PY_LOOP_RE.lastIndex = 0;
   let m;
@@ -111,9 +122,13 @@ function findJsonDeepCloneAntipattern(text, relPath) {
   const [re, hint] = relPath.endsWith('.py')
     ? [PY_JSON_CLONE_RE, 'json.loads(json.dumps(...)) used to deep-clone -- pays for a full serialize+reparse; consider copy.deepcopy or a targeted copy']
     : [JSON_CLONE_RE, 'JSON.parse(JSON.stringify(...)) used to deep-clone -- pays for a full serialize+reparse; consider structuredClone or a targeted copy'];
+  // Match against a string/comment-blanked view so a `JSON.parse(JSON.stringify(...))` that
+  // is only string-literal fixture data (its shape in this codebase's own scanner tests)
+  // is never flagged. Indices align 1:1, so lineOfIndex uses the real text.
+  const scan = stripNonCode(text);
   re.lastIndex = 0;
   let m;
-  while ((m = re.exec(text))) {
+  while ((m = re.exec(scan))) {
     findings.push({
       rule: 'json-deep-clone-antipattern',
       file: relPath,
