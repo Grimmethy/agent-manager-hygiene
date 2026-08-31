@@ -255,6 +255,11 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       recordFalsePositiveIfVerdict({ applyResult: res, implementResponse, task, pipelineDir });
       return res;
     },
+    // 2026-08-31: thread the flagged code window into review grounding -- see
+    // observability_review's own comment. Without this the reviewer never sees the snippet
+    // the drafter was told to ground its verdict in, and rejects correct false-positive
+    // calls as unverified.
+    groundingFields: ['snippet'],
     advisoryProse: true,
     directToMain: true, // see observability_review
     reportClass: (task) => { // see observability_review -- same filtering vs benefit split

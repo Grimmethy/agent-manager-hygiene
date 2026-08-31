@@ -266,6 +266,11 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       recordFalsePositiveIfVerdict({ applyResult: res, implementResponse, task, pipelineDir });
       return res;
     },
+    // 2026-08-31: thread the flagged function window into review grounding -- see
+    // observability_review's own comment. Without this the reviewer never sees the snippet
+    // the drafter was told to ground its verdict in, and rejects correct calls as
+    // unverified speculation.
+    groundingFields: ['snippet'],
     // 2026-08-23: review-task.js/local-draft.js now read these two flags directly off
     // the registry entry instead of a hardcoded array a plugin author would otherwise
     // have to go edit inside those files -- the actual prerequisite this family's

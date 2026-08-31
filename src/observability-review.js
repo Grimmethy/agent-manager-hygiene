@@ -273,6 +273,17 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       recordFalsePositiveIfVerdict({ applyResult: res, implementResponse, task, pipelineDir });
       return res;
     },
+    // 2026-08-31: the reviewer must see the SAME code window the drafter was given.
+    // nextObservabilityReviewTask puts the flagged code into promptContext.snippet and the
+    // implement prompt tells the model to "ground your verdict in the snippet you were
+    // given" -- but get-grounding-source.js only threads a fixed set of promptContext
+    // fields into review-task.js's grounding block, and `snippet` wasn't one of them. So
+    // the reviewer saw only PLAN + IMPLEMENT + "file exists", was told to treat every
+    // claim as UNVERIFIED, and rejected correct verdicts ("there is no try/except in this
+    // 5-line handler") as "an unverified assertion based on a snippet not provided in the
+    // prompt" -> 2 retries -> blocked. Declaring it here makes get-grounding-source.js's
+    // generic source.groundingFields consumer include it.
+    groundingFields: ['snippet'],
     advisoryProse: true,
     directToMain: true, // the apply is a low-risk candidate-doc append, not real code -- straight to main
     // ADR-0022 Stage A3: how a completed review counts toward system-report.js's
