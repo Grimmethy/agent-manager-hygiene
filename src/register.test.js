@@ -79,13 +79,15 @@ test('no candidate-fulfillment source carries emptyApproval; the arch generators
   }
 });
 
-// Stage A1 (2026-08-28): the 4 "candidate-doc append" sources declare directToMain: true so
+// Stage A1 (2026-08-28): the "candidate-doc append" sources declare directToMain: true so
 // apply-task.js routes them straight to main without an agent-manager code change; and
 // unused_export declares its 'deadcode_triage' source-field alias via registerSourceAlias()
-// instead of relying on agent-manager's legacy hardcoded fallback.
-test('directToMain is set on the 4 candidate-doc-append sources; deadcode_triage resolves via a registered alias', () => {
+// instead of relying on agent-manager's legacy hardcoded fallback. (2026-08-31:
+// function_length_review joined the list -- it was the last candidate-generating review
+// source still producing a hand-merge branch for a one-line markdown append.)
+test('directToMain is set on the candidate-doc-append review sources; deadcode_triage resolves via a registered alias', () => {
   const registry = loadPluginFresh();
-  for (const name of ['arch_discovery', 'arch_import', 'observability_review', 'performance_review']) {
+  for (const name of ['arch_discovery', 'arch_import', 'observability_review', 'performance_review', 'function_length_review']) {
     assert.equal(registry.getRegisteredSource(name).directToMain, true, `${name} must declare directToMain: true`);
   }
   for (const name of ['arch_review', 'arch_import_review', 'observability_fix', 'performance_fix', 'function_length_fix', 'unused_export']) {

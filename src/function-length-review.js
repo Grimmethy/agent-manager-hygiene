@@ -273,6 +273,14 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     // EXPECTED deliverable here, not a refusal. See review-task.js's own ADVISORY_PROSE_
     // SOURCES-turned-flag comment for the full history.
     advisoryProse: true,
+    // 2026-08-31: the apply is a low-risk additive candidate-doc append, not real code --
+    // commit straight to main, no throwaway agent/<id> branch to hand-merge. Matches the
+    // sibling candidate-generating review sources (observability_review, performance_review,
+    // arch_discovery); function_length_review was the only one still missing it, which meant
+    // every function_length_fix hand-off needed a human to merge the review branch before
+    // function_length_fix (which reads FUNCTION_LENGTH_CANDIDATES.md from the working copy)
+    // could even see the candidate.
+    directToMain: true,
   });
   updateTaskSource('function_length_review', { buildPlanPrompt: functionLengthReviewPlanPrompt, buildImplementPrompt: functionLengthReviewImplementPrompt });
 
