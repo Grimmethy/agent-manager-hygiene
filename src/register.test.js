@@ -113,6 +113,22 @@ test('arch_discovery / arch_import declare reviewGuidance; the review/fix consum
   }
 });
 
+// 2026-08-31: the three scanner-review sources hand the drafter promptContext.snippet (the
+// flagged code window) and tell it to ground its verdict there. get-grounding-source.js
+// only threads a promptContext field into review-task.js's grounding block if the source
+// declares it in groundingFields -- without this the reviewer never saw the snippet and
+// rejected correct false-positive verdicts as unverified. The fix/consumer sources have
+// their own grounding (fetchedFiles) and must NOT pull the stale creation-time snippet.
+test('the scanner-review sources declare groundingFields: ["snippet"]; the fix consumers do not', () => {
+  const registry = loadPluginFresh();
+  for (const name of ['observability_review', 'performance_review', 'function_length_review']) {
+    assert.deepEqual(registry.getRegisteredSource(name).groundingFields, ['snippet'], `${name} must ground review on its snippet`);
+  }
+  for (const name of ['observability_fix', 'performance_fix', 'function_length_fix', 'arch_discovery', 'arch_import']) {
+    assert.equal(registry.getRegisteredSource(name).groundingFields, undefined, `${name} must not set groundingFields`);
+  }
+});
+
 // Stage A4 (2026-08-28): arch_import's plan pass proposes QUERY: terms only; agent-manager's
 // local-draft.js runs the between-plan-and-implement grep of its own repo, driven by the
 // harnessSearch field, and skips the implement call on a genuine zero-hit search
