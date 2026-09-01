@@ -22,7 +22,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { listSourceFiles, isLikelyMinified, lineOfIndex, extractBraceBody, extractIndentedBlock, stripNonCode } = require('./scan-utils.js');
+const { listSourceFiles, isLikelyMinified, lineOfIndex, extractBraceBody, extractIndentedBlock, stripNonCode, isTestFile } = require('./scan-utils.js');
 
 const SCAN_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.py', '.go'];
 const LOOP_CONTEXT_WINDOW_LINES = 40;
@@ -45,13 +45,30 @@ function stripComments(body) {
 // rethrown nor surfaced (logged, recorded as a metric, etc.) has silently vanished.
 // Skips a body containing any of these tokens -- presence of ANY of them is read as
 // "this error was surfaced somehow," even if imperfectly. Covers JS and Python idioms.
-const SURFACES_ERROR_RE = /throw|console\.|log(ger|ging)?\.|\.error\(|Error\(|raise\b|panic\(|record|notify|alert|metric|traceback|warn|capture_exception|sys\.exc_info/i;
+const SURFACES_ERROR_RE = /throw|console\.|log(ger|ging)?\.|\.error\(|Error\(|raise\b|panic\(|record|notify|alert|metric|traceback|warn|capture_exception|sys\.exc_info|reject\(|Promise\.reject|next\(err|captureException|Sentry|reportError|toast\(|showError\(|\.exception\(|\.critical\(|\.fatal\(|print\(|(?:cb|callback|done)\(\s*err/i;
 
 // A Python `except` body that is ONLY `pass` or `...` is the silent-swallow equivalent of
 // an empty JS catch block.
 const PY_EMPTY_EXCEPT_RE = /^(?:pass|\.\.\.)$/;
 
+// A catch/except body that is exactly `return <simple literal>` (or a bare `return`) is a
+// deliberate "on failure, produce this default value" convention -- not an error that
+// silently vanished. Scoped to LITERALS only: `return someFallbackVar` is a judgement
+// call this scanner deliberately leaves to the review stage.
+const JS_SIMPLE_RETURN_RE = /^return(\s+(null|undefined|false|true|\[\s*\]|\{\s*\}|0|-1|''|""|``))?\s*;?$/;
+const PY_SIMPLE_RETURN_RE = /^return(\s+(None|False|True|\[\s*\]|\{\s*\}|0|-1|''|""))?$/;
+
+// The RAW body (before stripComments) is non-empty but strips to nothing -> it is
+// exclusively comment(s): a documented, deliberate no-op, not a silent swallow. (JS only;
+// a Python `except:` body cannot be comment-only without a SyntaxError.)
+function isCommentOnlyBody(rawBody, strippedBody) {
+  return rawBody.trim().length > 0 && strippedBody.length === 0;
+}
+
 function findSilentCatchBlocks(text, relPath) {
+  // Test / fixture / mock files deliberately swallow errors to exercise failure paths;
+  // flagging them is noise. Matches performance-scan.js's use of the same helper.
+  if (isTestFile(relPath)) return [];
   if (relPath.endsWith('.py')) return findSilentExceptBlocks(text, relPath);
   const findings = [];
   const catchRe = /\bcatch\s*(\([^)]*\))?\s*\{/g;
@@ -61,6 +78,11 @@ function findSilentCatchBlocks(text, relPath) {
     const body = extractBraceBody(text, openIndex);
     if (body === null) continue;
     const stripped = stripComments(body);
+    // A body that is exclusively comment(s) is a documented, deliberate no-op.
+    if (isCommentOnlyBody(body, stripped)) continue;
+    // `catch { return null }` / bare `return;` etc. -- a deliberate "failure -> default
+    // value" convention, not a vanished error.
+    if (JS_SIMPLE_RETURN_RE.test(stripped)) continue;
     if (stripped.length === 0 || !SURFACES_ERROR_RE.test(stripped)) {
       findings.push({
         rule: 'silent-catch-block',
@@ -88,6 +110,8 @@ function findSilentExceptBlocks(text, relPath) {
     // body's first line is the `except ...:` header itself -- judge only the block body.
     const bodyOnly = block.body.split('\n').slice(1).join('\n');
     const stripped = stripComments(bodyOnly);
+    // `except X: return None` / bare `return` -- deliberate "failure -> default value".
+    if (PY_SIMPLE_RETURN_RE.test(stripped)) continue;
     const isEmpty = stripped.length === 0 || PY_EMPTY_EXCEPT_RE.test(stripped);
     if (isEmpty || !SURFACES_ERROR_RE.test(stripped)) {
       findings.push({

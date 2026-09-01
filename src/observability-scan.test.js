@@ -37,10 +37,45 @@ test('findSilentCatchBlocks flags a truly empty catch block', () => {
   assert.match(findings[0].detail, /silently discarded/);
 });
 
-test('findSilentCatchBlocks flags a catch whose only content is a comment', () => {
+test('findSilentCatchBlocks does NOT flag a catch whose only content is a comment (documented no-op)', () => {
   const text = 'try {\n  risky();\n} catch (e) {\n  // ignore, this is fine\n}\n';
   const findings = findSilentCatchBlocks(text, 'a.js');
-  assert.equal(findings.length, 1);
+  assert.equal(findings.length, 0);
+});
+
+test('findSilentCatchBlocks does NOT flag a catch with a block-comment-only body', () => {
+  const text = 'try {\n  risky();\n} catch (e) {\n  /* best-effort: cache warm is optional */\n}\n';
+  assert.equal(findSilentCatchBlocks(text, 'a.js').length, 0);
+});
+
+test('findSilentCatchBlocks does NOT flag `catch { return <literal> }` (deliberate fallback value)', () => {
+  assert.equal(findSilentCatchBlocks('try { a() } catch (e) {\n  return null;\n}\n', 'a.js').length, 0);
+  assert.equal(findSilentCatchBlocks('try { a() } catch {\n  return [];\n}\n', 'a.js').length, 0);
+  assert.equal(findSilentCatchBlocks('try { a() } catch {\n  return;\n}\n', 'a.js').length, 0);
+  assert.equal(findSilentCatchBlocks('try { a() } catch {\n  return false\n}\n', 'a.js').length, 0);
+});
+
+test('findSilentCatchBlocks still flags `catch { return someFallbackVar }` (identifier, not a literal)', () => {
+  assert.equal(findSilentCatchBlocks('try { a() } catch {\n  return cached;\n}\n', 'a.js').length, 1);
+});
+
+test('findSilentCatchBlocks skips test / fixture files', () => {
+  const silent = 'try {\n  risky();\n} catch {}\n';
+  assert.equal(findSilentCatchBlocks(silent, 'src/foo.test.js').length, 0);
+  assert.equal(findSilentCatchBlocks(silent, 'pkg/tests/x.js').length, 0);
+  assert.equal(findSilentCatchBlocks('try:\n    x()\nexcept Exception:\n    pass\n', 'a_test.py').length, 0);
+});
+
+test('findSilentCatchBlocks recognises widened error-surfacing tokens', () => {
+  assert.equal(findSilentCatchBlocks("try { a() } catch (err) {\n  next(err);\n}\n", 'a.js').length, 0);
+  assert.equal(findSilentCatchBlocks("try { a() } catch (err) {\n  reject(err);\n}\n", 'a.js').length, 0);
+  assert.equal(findSilentCatchBlocks("try { a() } catch (e) {\n  Sentry.captureException(e);\n}\n", 'a.js').length, 0);
+  assert.equal(findSilentCatchBlocks("try { a() } catch (e) {\n  toast('failed: ' + e.message);\n}\n", 'a.js').length, 0);
+});
+
+test('findSilentExceptBlocks does NOT flag `except: return None` (deliberate fallback value)', () => {
+  assert.equal(findSilentExceptBlocks('try:\n    x()\nexcept Exception:\n    return None\n', 'a.py').length, 0);
+  assert.equal(findSilentExceptBlocks('try:\n    x()\nexcept Exception:\n    return\n', 'a.py').length, 0);
 });
 
 test('findSilentCatchBlocks does not flag a catch that logs the error', () => {
