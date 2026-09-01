@@ -33,6 +33,18 @@ function findingIsSuppressed(pipelineDir, repoRoot, finding) {
 }
 const { registerTaskSource, updateTaskSource } = require('agent-manager/src/task-source-registry.js');
 const { applyArchDiscoveryCandidates } = require('agent-manager/src/candidate-docs.js');
+const { projectCapabilityProfile } = require('./project-capabilities.js');
+
+// See observability-review.js's identical helper: a factual "what this project has"
+// block so a *_fix draft doesn't invent a caching/profiling/metrics primitive the
+// project can't support. Lazy getConfig(); safe no-repo fallback on any failure.
+function capabilityProfileBlock() {
+  try {
+    return projectCapabilityProfile(require('agent-manager/src/config.js').getConfig().repoRoot, { kind: 'performance' });
+  } catch {
+    return projectCapabilityProfile(null, { kind: 'performance' });
+  }
+}
 
 const RESCAN_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
@@ -63,6 +75,9 @@ function performanceReviewPlanPrompt(task) {
     '- "false positive — here\'s why (e.g. the loop only ever runs a handful of times, the sequence is deliberately rate-limited/ordered, the sync call runs once at startup not in a hot path)"',
     '- "uncertain — here\'s what would need to be checked that isn\'t given here (e.g. real call frequency, profiling data)"',
     'Do not assume the scanner is right just because it flagged something -- it is a heuristic, not a profiler, and false positives are expected.',
+    '',
+    capabilityProfileBlock(),
+    'Any fix you propose in your verdict must be implementable with what this project already has (above) -- do not propose adding a caching / profiling / metrics library or an API this project does not expose.',
   ];
   const volatile = [
     `Rule flagged: ${ctx.rule}`,
@@ -83,6 +98,9 @@ function performanceReviewImplementPrompt(task, planText) {
     planText,
     '',
     'If the verdict is FALSE POSITIVE or UNCERTAIN: write ONE short paragraph (2-4 sentences) recording why, for a human to read later. Plain prose only -- no JSON, no code fence, no "steps", no candidate block.',
+    '',
+    capabilityProfileBlock(),
+    'Your candidate\'s "Solution" must be achievable with this project\'s existing dependencies -- do not write "add a cache library / profiler / metrics histogram" if none is listed above.',
     '',
     'If the verdict is GENUINE: write ONE fix candidate for it, in EXACTLY this format (must match this parser exactly or it cannot be consumed downstream):',
     '',
@@ -112,9 +130,13 @@ function performanceFixPlanPrompt(task) {
     '',
     `CANDIDATE: ${ctx.candidateId} -- ${ctx.title}`,
     '',
-    'Full candidate write-up (Problem / Solution / Benefits, already vetted -- do not second-guess ' +
-      'whether this is worth doing, only how to do it safely):',
+    'Full candidate write-up (Problem / Solution / Benefits). It is already vetted for WHETHER it is ' +
+      'worth doing -- do not re-litigate that. But it was written WITHOUT checking this project\'s actual ' +
+      'capabilities (see PROJECT CAPABILITIES below): if its Solution needs a library or API this project ' +
+      'does not have, plan the simplest approach that IS available instead.',
     ctx.body,
+    '',
+    capabilityProfileBlock(),
     '',
     `Files involved: ${ctx.files.join(', ') || '(not specified -- infer from the write-up)'}`,
     '',
@@ -145,6 +167,8 @@ function performanceFixImplementPrompt(task, planText) {
       : '',
     '',
     'Ground every "find" value in the real file content shown above, character for character -- never in your own memory of the plan or candidate write-up.',
+    '',
+    capabilityProfileBlock(),
     '',
     candidateSplitInstructions,
     '',
