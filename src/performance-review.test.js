@@ -260,3 +260,30 @@ test('performance_review false-positive verdict -> apply is a clean no-op, no ca
   assert.equal(applyResult.skipped, true);
   assert.equal(fs.existsSync(candidatesPath), false);
 });
+
+// --- 2026-09-01: PROJECT CAPABILITIES grounding (mirror of the observability change) ---
+
+function perfPrompts(dir) {
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  delete require.cache[require.resolve('./performance-review.js')];
+  delete require.cache[require.resolve('./project-capabilities.js')];
+  return require('./performance-review.js');
+}
+
+test('all four performance prompts carry the PROJECT CAPABILITIES block with the perf guardrail', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'perf-caps-prompt-'));
+  fs.writeFileSync(path.join(dir, 'package.json'), '{"dependencies":{"express":"^4"}}');
+  const m = perfPrompts(dir);
+  const task = { title: 't', promptContext: { rule: 'sync-io-in-loop', projectSlug: 'p', file: 'src/x.js', line: 5, detail: 'blocking read per iteration', snippet: 'for (...) fs.readFileSync', candidateId: 'AC-9', title: 'x', body: 'Problem: ...\nSolution: add a prom-client histogram to time it.\nBenefits: ...', files: ['src/x.js'], fetchedFiles: [{ path: 'src/x.js', content: 'for (const f of files) fs.readFileSync(f)' }] } };
+
+  for (const text of [
+    m.performanceReviewPlanPrompt(task),
+    m.performanceReviewImplementPrompt(task, 'PLAN'),
+    m.performanceFixPlanPrompt(task),
+    m.performanceFixImplementPrompt(task, 'PLAN'),
+  ]) {
+    assert.match(text, /PROJECT CAPABILITIES/);
+    assert.match(text, /Do NOT add a new dependency \(a caching \/ pooling \/ profiling \/ metrics library\)|do not propose adding a caching \/ profiling \/ metrics library|must be achievable with this project's existing dependencies|plan the simplest approach that IS available/);
+  }
+});

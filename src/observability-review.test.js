@@ -271,3 +271,42 @@ test('observability_review false-positive verdict -> apply is a clean no-op, no 
   assert.equal(applyResult.skipped, true);
   assert.equal(fs.existsSync(candidatesPath), false);
 });
+
+// --- 2026-09-01: PROJECT CAPABILITIES grounding (see project-capabilities.js). AC-47
+// fabricated a metric emission for a project with no metrics system because no prompt
+// told the model what primitives exist. Every review/fix prompt now carries the block.
+
+function obsPrompts(dir) {
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  delete require.cache[require.resolve('./observability-review.js')];
+  delete require.cache[require.resolve('./project-capabilities.js')];
+  return require('./observability-review.js');
+}
+
+test('all four observability prompts carry the PROJECT CAPABILITIES block for a no-metrics repo', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'obs-caps-prompt-'));
+  fs.writeFileSync(path.join(dir, 'package.json'), '{"dependencies":{"express":"^4"}}');
+  const m = obsPrompts(dir);
+  const task = { title: 't', promptContext: { rule: 'silent-catch-block', projectSlug: 'p', file: 'src/x.js', line: 5, detail: 'the error is silently discarded with no log/rethrow/metric', snippet: '} catch {}', candidateId: 'AC-9', title: 'x', body: 'Problem: ...\nSolution: add a metric counting the failures.\nBenefits: ...', files: ['src/x.js'], fetchedFiles: [{ path: 'src/x.js', content: 'try { risky(); } catch {}' }] } };
+
+  for (const text of [
+    m.observabilityReviewPlanPrompt(task),
+    m.observabilityReviewImplementPrompt(task, 'PLAN'),
+    m.observabilityFixPlanPrompt(task),
+    m.observabilityFixImplementPrompt(task, 'PLAN'),
+  ]) {
+    assert.match(text, /PROJECT CAPABILITIES/);
+    assert.match(text, /no metrics system/);
+    assert.match(text, /Do not fabricate the missing primitive|not an instruction to add a metric|only primitives listed above|only primitives this project has/);
+  }
+});
+
+test('observabilityFixPlanPrompt no longer tells the model to trust the candidate unconditionally', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'obs-caps-vetted-'));
+  fs.writeFileSync(path.join(dir, 'package.json'), '{}');
+  const m = obsPrompts(dir);
+  const text = m.observabilityFixPlanPrompt({ promptContext: { candidateId: 'AC-1', title: 't', body: 'b', files: ['f.js'] } });
+  assert.doesNotMatch(text, /do not second-guess/);
+  assert.match(text, /written WITHOUT checking this project's actual capabilities/);
+});

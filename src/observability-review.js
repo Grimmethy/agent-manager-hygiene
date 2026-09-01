@@ -41,6 +41,19 @@ function findingIsSuppressed(pipelineDir, repoRoot, finding) {
 }
 const { registerTaskSource, updateTaskSource } = require('agent-manager/src/task-source-registry.js');
 const { applyArchDiscoveryCandidates } = require('agent-manager/src/candidate-docs.js');
+const { projectCapabilityProfile } = require('./project-capabilities.js');
+
+// The "what observability/logging primitives does this project actually have" grounding
+// block, for every review/fix prompt below. Lazy getConfig() (needs env) -- on any failure
+// fall back to the no-repo profile, which is the SAFE default ("assume nothing exists,
+// don't fabricate"), never a throw that would break prompt assembly.
+function capabilityProfileBlock() {
+  try {
+    return projectCapabilityProfile(require('agent-manager/src/config.js').getConfig().repoRoot, { kind: 'observability' });
+  } catch {
+    return projectCapabilityProfile(null, { kind: 'observability' });
+  }
+}
 
 const RESCAN_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
@@ -75,6 +88,9 @@ function observabilityReviewPlanPrompt(task) {
     '- "false positive — here\'s why (e.g. the catch intentionally no-ops for a known-safe case, or the loop\'s health signal is emitted elsewhere the scanner\'s window missed)"',
     '- "uncertain — here\'s what would need to be checked that isn\'t given here"',
     'Do not assume the scanner is right just because it flagged something -- it is a heuristic, not a parser, and false positives are expected.',
+    '',
+    capabilityProfileBlock(),
+    'Any fix you propose in your verdict must use only primitives this project has (above). The scanner detail may say the error has "no metric" -- that is NOT a reason to propose adding a metric to a project with no metrics system; there the genuine fix is logging + rethrow.',
   ];
   const volatile = [
     `Rule flagged: ${ctx.rule}`,
@@ -95,6 +111,9 @@ function observabilityReviewImplementPrompt(task, planText) {
     planText,
     '',
     'If the verdict is FALSE POSITIVE or UNCERTAIN: write ONE short paragraph (2-4 sentences) recording why, for a human to read later. Plain prose only -- no JSON, no code fence, no "steps", no candidate block.',
+    '',
+    capabilityProfileBlock(),
+    'Your candidate\'s "Solution" must use only primitives listed above. Do not write "add a metric / counter / health-signal number" for a project with no metrics system -- write the logging + rethrow fix instead.',
     '',
     'If the verdict is GENUINE: write ONE fix candidate for it, in EXACTLY this format (must match this parser exactly or it cannot be consumed downstream):',
     '',
@@ -128,9 +147,13 @@ function observabilityFixPlanPrompt(task) {
     '',
     `CANDIDATE: ${ctx.candidateId} -- ${ctx.title}`,
     '',
-    'Full candidate write-up (Problem / Solution / Benefits, already vetted -- do not second-guess ' +
-      'whether this is worth doing, only how to do it safely):',
+    'Full candidate write-up (Problem / Solution / Benefits). It is already vetted for WHETHER it is ' +
+      'worth doing -- do not re-litigate that. But it was written WITHOUT checking this project\'s actual ' +
+      'capabilities (see PROJECT CAPABILITIES below): if its Solution names a primitive this project does ' +
+      'not have, plan only the parts that ARE available and drop the rest -- do not plan to add the missing one.',
     ctx.body,
+    '',
+    capabilityProfileBlock(),
     '',
     `Files involved: ${ctx.files.join(', ') || '(not specified -- infer from the write-up)'}`,
     '',
@@ -161,6 +184,8 @@ function observabilityFixImplementPrompt(task, planText) {
       : '',
     '',
     'Ground every "find" value in the real file content shown above, character for character -- never in your own memory of the plan or candidate write-up.',
+    '',
+    capabilityProfileBlock(),
     '',
     candidateSplitInstructions,
     '',
