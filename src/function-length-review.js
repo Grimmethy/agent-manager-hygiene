@@ -356,6 +356,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
 module.exports = {
   register,
   nextFunctionLengthReviewTask,
+  functionSnippet,
   functionLengthReviewPlanPrompt,
   functionLengthReviewImplementPrompt,
   functionLengthFixPlanPrompt,

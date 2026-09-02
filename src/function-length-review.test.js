@@ -65,6 +65,15 @@ test('nextFunctionLengthReviewTask emits a review task for an over-threshold fun
   assert.doesNotMatch(task.promptContext.snippet, /\[truncated for review/);
 });
 
+test('functionSnippet falls back to the fixed window when lengthLines is missing/invalid', () => {
+  const { functionSnippet } = require('./function-length-review.js');
+  const content = Array.from({ length: 60 }, (_, i) => `line ${i}`).join('\n');
+  const wide = functionSnippet(content, 10, 40);
+  const narrow = functionSnippet(content, 10, undefined);
+  assert.ok(wide.split('\n').length > narrow.split('\n').length);
+  assert.ok(narrow.split('\n').length <= 2 + 30 + 2);
+});
+
 test('nextFunctionLengthReviewTask truncates the snippet for a pathologically long function, with an explicit marker', () => {
   const dir = makeRepo();
   const deps = freshPlugin(dir);
