@@ -24,7 +24,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { scanProject } = require('./observability-scan.js');
+const { scanProject, findSilentCatchBlocks } = require('./observability-scan.js');
 const { isLikelyMinified, windowFromContent } = require('./scan-utils.js');
 const { reconcileFlags } = require('./flag-store.js');
 const { isSuppressed, recordFalsePositiveIfVerdict } = require('./suppression-store.js');
@@ -32,6 +32,51 @@ const { isSuppressed, recordFalsePositiveIfVerdict } = require('./suppression-st
 // The -before / +after window that becomes promptContext.snippet AND the suppression key.
 const SNIPPET_BEFORE = 4;
 const SNIPPET_AFTER = 3;
+// The wider window handed to the review/fix model (and the reviewer, via groundingFields)
+// as promptContext.enclosingCode -- the whole flagged block PLUS enough surrounding code
+// (the enclosing function, usually) to judge intent. This is what fixes "the model was
+// asked to rule on a catch block it was never shown".
+const ENCLOSING_BEFORE = 12;
+const ENCLOSING_AFTER = 6;
+const ENCLOSING_MAX_LINES = 140;
+
+// Re-run the silent-catch-block rule on the CURRENT file and find the fresh finding that
+// corresponds to a persisted flag, so a task is never built from a stale line number (the
+// flags file only reconciles every RESCAN_INTERVAL_MS, but repoRoot changes many times a
+// day). Match priority: same body fingerprint (survives line drift + reindentation) ->
+// exact line -> the only silent-catch finding in the file. Returns the fresh finding, or
+// null when the construct is gone / can't be disambiguated (the caller then drops the flag).
+function relocateSilentCatchFlag(flag, content, relPath) {
+  let fresh;
+  try {
+    fresh = findSilentCatchBlocks(content, relPath).filter((f) => f.rule === 'silent-catch-block');
+  } catch {
+    return null;
+  }
+  if (fresh.length === 0) return null;
+  if (flag.bodyFingerprint) {
+    const byBody = fresh.filter((f) => f.bodyFingerprint === flag.bodyFingerprint);
+    if (byBody.length === 1) return byBody[0];
+    if (byBody.length > 1) {
+      const exact = byBody.find((f) => f.line === flag.line);
+      return exact || null; // several identical bodies -- only trust an exact-line hit
+    }
+  }
+  const exact = fresh.find((f) => f.line === flag.line);
+  if (exact) return exact;
+  return fresh.length === 1 ? fresh[0] : null;
+}
+
+// A headed line-window: the flagged block plus context, bounded, with a real line-range
+// header so the model (and reviewer) know exactly where in the file this is.
+function enclosingCodeWindow(content, relPath, startLine, endLine) {
+  const lines = String(content == null ? '' : content).split('\n');
+  let from = Math.max(1, (startLine || 1) - ENCLOSING_BEFORE);
+  let to = Math.min(lines.length, (endLine || startLine || 1) + ENCLOSING_AFTER);
+  if (to - from + 1 > ENCLOSING_MAX_LINES) to = from + ENCLOSING_MAX_LINES - 1;
+  const body = lines.slice(from - 1, to).join('\n');
+  return `--- ${relPath} lines ${from}-${to} (the flagged block + surrounding code, read from the file) ---\n${body}`;
+}
 
 function findingIsSuppressed(pipelineDir, repoRoot, finding) {
   if (!finding.file) return false;
@@ -82,12 +127,12 @@ function assemblePrompt(stableLines, volatileLines) {
 function observabilityReviewPlanPrompt(task) {
   const ctx = task.promptContext;
   const stable = [
-    'This is a judgment call, NOT a code-change task (yet). A deterministic scanner flagged a possible observability-hygiene issue in a project this pipeline is reviewing (rule/project/file/snippet given below). Determine whether it is a GENUINE issue or a false positive.',
-    'Write a numbered PLAN that is actually a REASONED VERDICT:',
-    '- "genuine issue — here\'s the concrete risk (e.g. a real background-task error swallowed silently) and a proposed fix"',
-    '- "false positive — here\'s why (e.g. the catch intentionally no-ops for a known-safe case, or the loop\'s health signal is emitted elsewhere the scanner\'s window missed)"',
-    '- "uncertain — here\'s what would need to be checked that isn\'t given here"',
-    'Do not assume the scanner is right just because it flagged something -- it is a heuristic, not a parser, and false positives are expected.',
+    'This is a judgment call, NOT a code-change task (yet). A deterministic scanner flagged a possible observability-hygiene issue in a project this pipeline is reviewing (rule/project/file/code given below). Determine whether it is a GENUINE issue or a false positive.',
+    'Write a numbered PLAN that is actually a REASONED VERDICT -- ONE of exactly two conclusions:',
+    '- "GENUINE issue — here\'s the concrete risk (e.g. a real background-task error swallowed silently) and a proposed fix"',
+    '- "FALSE POSITIVE — here\'s why, pointing at the specific lines below (e.g. the except binds the exception and the function\'s contract makes a None return the intended caller-visible outcome, not a swallow; or the error is surfaced a few lines down, outside the scanner\'s window)"',
+    'You have been given the flagged block AND its surrounding code (the enclosing function, usually), read straight from the file. That is enough to decide. Do NOT answer "uncertain" or "a human should open the file" -- reach a verdict from the code shown. Only if the code below is genuinely, visibly truncated mid-statement may you say so, and then name the exact missing line.',
+    'Do not assume the scanner is right just because it flagged something -- it is a heuristic (a keyword/brace match over a fixed window), not a parser, and false positives are expected and common.',
     '',
     capabilityProfileBlock(),
     'Any fix you propose in your verdict must use only primitives this project has (above). The scanner detail may say the error has "no metric" -- that is NOT a reason to propose adding a metric to a project with no metrics system; there the genuine fix is logging + rethrow.',
@@ -98,19 +143,23 @@ function observabilityReviewPlanPrompt(task) {
     ctx.file ? `File: ${ctx.file}:${ctx.line}` : '(repo-wide finding, not tied to one file)',
     `Scanner detail: ${ctx.detail}`,
     '',
-    'SURROUNDING SOURCE (if available):',
-    ctx.snippet || '(no snippet available for this finding)',
+    'REAL SOURCE (the flagged block + surrounding code, read from the file):',
+    ctx.enclosingCode || ctx.snippet || '(no source available for this finding)',
   ];
   return assemblePrompt(stable, volatile);
 }
 
 function observabilityReviewImplementPrompt(task, planText) {
+  const ctx = task.promptContext || {};
   return [
-    'Your plan above is the final REASONED VERDICT for this observability-hygiene finding in OUR OWN project.',
+    'Your plan above is the final REASONED VERDICT for this observability-hygiene finding in OUR OWN project. It is either GENUINE or FALSE POSITIVE -- there is no third option.',
     '',
     planText,
     '',
-    'If the verdict is FALSE POSITIVE or UNCERTAIN: write ONE short paragraph (2-4 sentences) recording why, for a human to read later. Plain prose only -- no JSON, no code fence, no "steps", no candidate block.',
+    'REAL SOURCE this verdict is about (the flagged block + surrounding code):',
+    ctx.enclosingCode || ctx.snippet || '(no source available)',
+    '',
+    'If the verdict is FALSE POSITIVE: write ONE short paragraph (2-4 sentences) recording why, citing the specific lines above, for a human to read later. Plain prose only -- no JSON, no code fence, no "steps", no candidate block. A decisive, code-grounded "not a swallow because <specific reason from the lines above>" is the whole deliverable -- it is NOT hedging.',
     '',
     capabilityProfileBlock(),
     'Your candidate\'s "Solution" must use only primitives listed above. Do not write "add a metric / counter / health-signal number" for a project with no metrics system -- write the logging + rethrow fix instead.',
@@ -122,7 +171,7 @@ function observabilityReviewImplementPrompt(task, planText) {
     `Files: ${task.promptContext.file || '(the file from the finding above)'}`,
     '',
     'Problem:',
-    'A paragraph describing the concrete observability gap, grounded in the snippet you were given.',
+    'A paragraph describing the concrete observability gap, grounded in the real source above.',
     '',
     'Solution:',
     'A paragraph describing the specific fix (e.g. what to log, what to rethrow, what health signal to add) -- scoped to exactly this finding, nothing broader.',
@@ -240,22 +289,56 @@ function nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, tas
   }
 
   const sorted = [...flags].sort((a, b) => new Date(a.scannedAt) - new Date(b.scannedAt));
-  for (const finding of sorted) {
+  const staleKeys = new Set(); // rule::file::line of flags whose construct is gone -- pruned
+
+  // Rewrite the flags file without the stale entries this poll discovered, then return.
+  const persistStaleAnd = (result) => {
+    if (staleKeys.size > 0) {
+      const kept = flags.filter((f) => !staleKeys.has(`${f.rule}::${f.file}::${f.line}`));
+      try {
+        fs.mkdirSync(path.dirname(flagsPath), { recursive: true });
+        fs.writeFileSync(flagsPath, JSON.stringify(kept, null, 2));
+      } catch { /* best-effort -- the 24h reconcile is the backstop */ }
+    }
+    return result;
+  };
+
+  for (const flag of sorted) {
+    let finding = flag;
+    let content = null;
+
+    if (flag.file) {
+      content = readIfExists(path.join(repoRoot, flag.file));
+      if (!content) { staleKeys.add(`${flag.rule}::${flag.file}::${flag.line}`); continue; } // file gone
+      if (isLikelyMinified(content)) continue;
+
+      // silent-catch-block: re-locate against the CURRENT file so the task is never built
+      // from a drifted line (the whole "the model was shown the wrong 8 lines" failure).
+      if (flag.rule === 'silent-catch-block') {
+        const fresh = relocateSilentCatchFlag(flag, content, flag.file);
+        if (!fresh) { staleKeys.add(`${flag.rule}::${flag.file}::${flag.line}`); continue; } // construct fixed/removed
+        finding = { ...flag, line: fresh.line, detail: fresh.detail, blockStartLine: fresh.blockStartLine, blockEndLine: fresh.blockEndLine, bodyFingerprint: fresh.bodyFingerprint };
+      }
+    }
+
     const taskId = `observability-${slugifyForId(projectTag)}-${slugifyForId(finding.rule)}-${slugifyForId(finding.file || 'repo')}-${finding.line || 0}`;
     if (taskIdExistsInQueue(taskId)) continue;
 
     let snippet = null;
-    if (finding.file) {
-      const content = readIfExists(path.join(repoRoot, finding.file));
-      if (content && isLikelyMinified(content)) continue;
-      if (!content) continue;
+    let enclosingCode = null;
+    if (content && finding.file) {
       snippet = windowFromContent(content, finding.line, SNIPPET_BEFORE, SNIPPET_AFTER);
+      enclosingCode = enclosingCodeWindow(
+        content, finding.file,
+        finding.blockStartLine || finding.line,
+        finding.blockEndLine || finding.line,
+      );
     }
 
     // A prior review already ruled this exact construct a false positive -- never re-ask.
     if (isSuppressed(pipelineDir, finding.rule, snippet)) continue;
 
-    return {
+    return persistStaleAnd({
       id: taskId,
       domain: defaultDomain,
       source: 'observability_review',
@@ -267,11 +350,14 @@ function nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, tas
         line: finding.line,
         projectSlug: projectTag,
         snippet,
+        blockStartLine: finding.blockStartLine,
+        blockEndLine: finding.blockEndLine,
+        enclosingCode,
       },
-    };
+    });
   }
 
-  return null;
+  return persistStaleAnd(null);
 }
 
 function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
@@ -307,9 +393,18 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     // claim as UNVERIFIED, and rejected correct verdicts ("there is no try/except in this
     // 5-line handler") as "an unverified assertion based on a snippet not provided in the
     // prompt" -> 2 retries -> blocked. Declaring it here makes get-grounding-source.js's
-    // generic source.groundingFields consumer include it.
-    groundingFields: ['snippet'],
+    // generic source.groundingFields consumer include it. 2026-09-02: also thread
+    // `enclosingCode` -- the wider block+context window nextObservabilityReviewTask now
+    // builds -- so the reviewer judges the verdict against the same real code the drafter saw.
+    groundingFields: ['snippet', 'enclosingCode'],
     advisoryProse: true,
+    // The verdict is binary (GENUINE / FALSE POSITIVE) and the drafter had the flagged
+    // block + enclosing function as real source -- so an "I can't verify / a human should
+    // look" answer IS rejectable, but a decisive, code-grounded false-positive verdict
+    // that happens to read cautiously is NOT hedging. Spell that out so the generic
+    // hedging rule (review-task.js) doesn't reject correct dismissals.
+    reviewGuidance: 'This is an observability_review triage verdict, not a code change. A valid draft is EXACTLY ONE of: (a) "GENUINE" + a correctly-formatted `### AC-NNN` candidate block (Strength/Files/Problem/Solution/Benefits), or (b) "FALSE POSITIVE" + one short paragraph citing the specific lines in the grounding source. The drafter was given the flagged block AND its surrounding code read straight from the file. REJECT the draft if it answers "uncertain", "cannot verify", "a human should open the file", or otherwise refuses to reach a verdict from the code it was shown. But do NOT reject a decisive verdict merely for sounding careful: "not a silent swallow because the except binds `e` and the function\'s documented contract returns None on failure" is a real, complete verdict grounded in the code -- approve it. Reject a FALSE POSITIVE verdict only when its stated reason actually contradicts the grounding source (e.g. it claims the body logs the error but the shown lines are a bare `pass`), and reject a GENUINE verdict whose candidate is malformed or proposes a primitive the project does not have.',
+    reviewCompletenessQuestion: 'Does the draft reach a decisive GENUINE-or-FALSE-POSITIVE verdict (not "uncertain"/"needs a human"), and is that verdict consistent with the flagged block + surrounding code in the grounding source?',
     directToMain: true, // the apply is a low-risk candidate-doc append, not real code -- straight to main
     // ADR-0022 Stage A3: how a completed review counts toward system-report.js's
     // junk/filtering/benefit accounting. A review that correctly dismissed a false

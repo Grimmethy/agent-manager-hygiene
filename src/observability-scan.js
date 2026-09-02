@@ -65,6 +65,14 @@ function isCommentOnlyBody(rawBody, strippedBody) {
   return rawBody.trim().length > 0 && strippedBody.length === 0;
 }
 
+// A whitespace-collapsed fingerprint of the caught-error handler body -- stable across
+// reindentation and line drift, so observability-review.js can re-locate a persisted flag
+// against a re-scan of the current file even after commits moved its line number. Empty
+// bodies fingerprint as '' (matched by exact-line fallback instead).
+function bodyFingerprint(strippedBody) {
+  return String(strippedBody || '').replace(/\s+/g, ' ').trim();
+}
+
 function findSilentCatchBlocks(text, relPath) {
   // Test / fixture / mock files deliberately swallow errors to exercise failure paths;
   // flagging them is noise. Matches performance-scan.js's use of the same helper.
@@ -84,10 +92,14 @@ function findSilentCatchBlocks(text, relPath) {
     // value" convention, not a vanished error.
     if (JS_SIMPLE_RETURN_RE.test(stripped)) continue;
     if (stripped.length === 0 || !SURFACES_ERROR_RE.test(stripped)) {
+      const startLine = lineOfIndex(text, m.index);
       findings.push({
         rule: 'silent-catch-block',
         file: relPath,
-        line: lineOfIndex(text, m.index),
+        line: startLine,
+        blockStartLine: startLine,
+        blockEndLine: lineOfIndex(text, openIndex + 1 + body.length),
+        bodyFingerprint: bodyFingerprint(stripped),
         detail: stripped.length === 0
           ? 'catch block is empty -- the error is silently discarded with no log/rethrow/metric'
           : 'catch block does not appear to log, rethrow, or otherwise surface the error',
@@ -114,10 +126,14 @@ function findSilentExceptBlocks(text, relPath) {
     if (PY_SIMPLE_RETURN_RE.test(stripped)) continue;
     const isEmpty = stripped.length === 0 || PY_EMPTY_EXCEPT_RE.test(stripped);
     if (isEmpty || !SURFACES_ERROR_RE.test(stripped)) {
+      const startLine = lineOfIndex(text, m.index);
       findings.push({
         rule: 'silent-catch-block',
         file: relPath,
-        line: lineOfIndex(text, m.index),
+        line: startLine,
+        blockStartLine: startLine,
+        blockEndLine: startLine + Math.max(0, (block.lineCount || 1) - 1),
+        bodyFingerprint: bodyFingerprint(stripped),
         detail: isEmpty
           ? 'except block is empty (only pass/.../a comment) -- the exception is silently discarded with no log/re-raise/metric'
           : 'except block does not appear to log, re-raise, or otherwise surface the exception',
@@ -276,6 +292,7 @@ function scanProject(clonePath, projectSlug) {
 
 module.exports = {
   scanProject,
+  bodyFingerprint,
   findSilentCatchBlocks,
   findSilentExceptBlocks,
   findUnguardedLoops,

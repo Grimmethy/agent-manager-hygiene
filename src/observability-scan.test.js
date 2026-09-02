@@ -37,6 +37,22 @@ test('findSilentCatchBlocks flags a truly empty catch block', () => {
   assert.match(findings[0].detail, /silently discarded/);
 });
 
+test('silent-catch findings carry blockStartLine/blockEndLine/bodyFingerprint for re-location', () => {
+  const js = 'function f() {\n  try {\n    risky();\n  } catch (e) {\n    doNothing();\n    alsoNothing();\n  }\n}\n';
+  const jf = findSilentCatchBlocks(js, 'a.js')[0];
+  assert.equal(jf.line, 4);            // the `} catch (e) {` line
+  assert.equal(jf.blockStartLine, 4);
+  assert.equal(jf.blockEndLine, 7);    // the closing `}`
+  assert.equal(jf.bodyFingerprint, 'doNothing(); alsoNothing();');
+
+  const py = 'def f():\n    try:\n        risky()\n    except Exception:\n        pass\n    return 1\n';
+  const pf = findSilentExceptBlocks(py, 'a.py')[0];
+  assert.equal(pf.line, 4);            // the `except Exception:` line
+  assert.equal(pf.blockStartLine, 4);
+  assert.equal(pf.blockEndLine, 5);    // the `pass` line
+  assert.equal(pf.bodyFingerprint, 'pass');
+});
+
 test('findSilentCatchBlocks does NOT flag a catch whose only content is a comment (documented no-op)', () => {
   const text = 'try {\n  risky();\n} catch (e) {\n  // ignore, this is fine\n}\n';
   const findings = findSilentCatchBlocks(text, 'a.js');

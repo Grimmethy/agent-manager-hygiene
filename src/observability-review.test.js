@@ -310,3 +310,93 @@ test('observabilityFixPlanPrompt no longer tells the model to trust the candidat
   assert.doesNotMatch(text, /do not second-guess/);
   assert.match(text, /written WITHOUT checking this project's actual capabilities/);
 });
+
+// --- 2026-09-02: A-D grounding fix. The whole observability_review blocked backlog was
+// the model being asked to rule on a catch block it was never shown (stale line -> wrong
+// 8-line snippet), answering "I can't verify / a human should look", and review correctly
+// rejecting that as hedging.
+
+const PY_SILENT = [
+  '# header',
+  'import json',
+  '',
+  'def _parse(text):',           // line 4
+  '    if not text:',
+  '        return None',
+  '    try:',                     // line 7
+  '        return json.loads(text)',
+  '    except Exception:',        // line 9  <-- the real finding
+  '        pass',                 // line 10
+  '    return None',
+  '',
+].join('\n');
+
+test('nextObservabilityReviewTask re-locates a stale-line flag against the current file (not-due window)', () => {
+  const dir = makeObservabilityFixtureRepo();
+  writeObservabilityFinding(dir, 'app.py', PY_SILENT);
+  const deps = freshDeps(dir);
+
+  // first call: scans, writes coverage + a correct flag
+  const { result: first } = callNext(dir, deps);
+  assert.ok(first);
+  assert.equal(first.promptContext.line, 9);
+
+  // simulate a pre-existing flag with a DRIFTED line and no new fields, and no rescan due
+  const flagsPath = path.join(dir, 'queue', 'observability-flags.json');
+  const staleFlag = { rule: 'silent-catch-block', file: 'app.py', line: 3, projectSlug: path.basename(dir), scannedAt: new Date(Date.now() - 1000).toISOString(), detail: 'except block is empty' };
+  fs.writeFileSync(flagsPath, JSON.stringify([staleFlag], null, 2));
+
+  const { result: relocated } = callNext(dir, deps);
+  assert.ok(relocated, 'a task is still produced');
+  assert.equal(relocated.promptContext.line, 9, 're-located to the real except line');
+  assert.equal(relocated.promptContext.blockStartLine, 9);
+  assert.equal(relocated.promptContext.blockEndLine, 10);
+  assert.match(relocated.promptContext.enclosingCode, /def _parse/); // the enclosing function is in view
+  assert.match(relocated.promptContext.enclosingCode, /except Exception:\n\s*pass/);
+  assert.match(relocated.promptContext.enclosingCode, /lines \d+-\d+/);
+});
+
+test('nextObservabilityReviewTask drops a flag whose construct is gone, produces no task', () => {
+  const dir = makeObservabilityFixtureRepo();
+  writeObservabilityFinding(dir, 'app.py', PY_SILENT);
+  const deps = freshDeps(dir);
+  const { result: first } = callNext(dir, deps);
+  assert.ok(first);
+
+  // the silent except is fixed (now logs) -- but no rescan is due, the flag lingers
+  fs.writeFileSync(path.join(dir, 'app.py'), PY_SILENT.replace('        pass', '        logger.exception("parse failed")'));
+  const flagsPath = path.join(dir, 'queue', 'observability-flags.json');
+  const flag = JSON.parse(fs.readFileSync(flagsPath, 'utf8'))[0];
+  fs.writeFileSync(flagsPath, JSON.stringify([flag], null, 2)); // keep just the one, still at its old line
+
+  const { result: gone } = callNext(dir, deps);
+  assert.equal(gone, null, 'no task built from a construct that no longer matches the rule');
+  assert.deepEqual(JSON.parse(fs.readFileSync(flagsPath, 'utf8')), [], 'the dead flag was pruned');
+});
+
+test('observabilityReviewPlanPrompt forces a binary verdict and shows the enclosing code', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'obs-binary-'));
+  fs.writeFileSync(path.join(dir, 'package.json'), '{}');
+  const m = obsPrompts(dir);
+  const p = m.observabilityReviewPlanPrompt({ promptContext: {
+    rule: 'silent-catch-block', projectSlug: 'p', file: 'app.py', line: 9, detail: 'except block is empty',
+    snippet: 'except Exception:\n    pass', enclosingCode: '--- app.py lines 4-12 (the flagged block + surrounding code) ---\ndef _parse(text):\n    ...\n    except Exception:\n        pass',
+  } });
+  assert.match(p, /GENUINE/);
+  assert.match(p, /FALSE POSITIVE/);
+  assert.match(p, /Do NOT answer "uncertain"/i);
+  assert.doesNotMatch(p, /- "uncertain —/);          // no longer offered as a verdict option
+  assert.match(p, /REAL SOURCE/);
+  assert.match(p, /def _parse\(text\)/);              // the enclosing code is inlined
+});
+
+test('observability_review registers reviewGuidance that permits a decisive false-positive verdict', () => {
+  const dir = makeObservabilityFixtureRepo();
+  const deps = freshDeps(dir);
+  const src = deps.getRegisteredSource('observability_review');
+  assert.deepEqual(src.groundingFields, ['snippet', 'enclosingCode']);
+  assert.equal(typeof src.reviewGuidance, 'string');
+  assert.match(src.reviewGuidance, /REJECT the draft if it answers "uncertain"/);
+  assert.match(src.reviewGuidance, /do NOT reject a decisive verdict merely for sounding careful/);
+  assert.match(src.reviewCompletenessQuestion, /decisive GENUINE-or-FALSE-POSITIVE verdict/);
+});

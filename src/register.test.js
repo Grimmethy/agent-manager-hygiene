@@ -121,7 +121,11 @@ test('arch_discovery / arch_import declare reviewGuidance; the review/fix consum
 // their own grounding (fetchedFiles) and must NOT pull the stale creation-time snippet.
 test('the scanner-review sources declare groundingFields: ["snippet"]; the fix consumers do not', () => {
   const registry = loadPluginFresh();
-  for (const name of ['observability_review', 'performance_review', 'function_length_review']) {
+  // observability_review also grounds on `enclosingCode` -- the wider block+context window
+  // nextObservabilityReviewTask builds so the reviewer sees the same real code the drafter did.
+  assert.deepEqual(registry.getRegisteredSource('observability_review').groundingFields, ['snippet', 'enclosingCode'],
+    'observability_review must ground review on its snippet AND the enclosing code window');
+  for (const name of ['performance_review', 'function_length_review']) {
     assert.deepEqual(registry.getRegisteredSource(name).groundingFields, ['snippet'], `${name} must ground review on its snippet`);
   }
   for (const name of ['observability_fix', 'performance_fix', 'function_length_fix', 'arch_discovery', 'arch_import']) {
