@@ -356,6 +356,43 @@ test('nextObservabilityReviewTask re-locates a stale-line flag against the curre
   assert.match(relocated.promptContext.enclosingCode, /lines \d+-\d+/);
 });
 
+test('nextObservabilityReviewTask relocates several drifted flags in ONE big file (per-poll file cache)', () => {
+  const dir = makeObservabilityFixtureRepo();
+  // three distinct silent excepts in one file
+  const py = [
+    'def a():',
+    '    try:', '        x()', '    except Exception:', '        pass',        // except @ line 4, body "pass"
+    '',
+    'def b():',
+    '    try:', '        y()', '    except ValueError:', '        ...',        // except @ line 10, body "..."
+    '',
+    'def c():',
+    '    try:', '        z()', '    except KeyError:', '        return None if False else None',  // not simple-return literal -> flagged, line 16
+    '',
+  ].join('\n');
+  writeObservabilityFinding(dir, 'big.py', py);
+  const deps = freshDeps(dir);
+  callNext(dir, deps); // establish coverage + real flags (with bodyFingerprint)
+
+  const flagsPath = path.join(dir, 'queue', 'observability-flags.json');
+  const real = JSON.parse(fs.readFileSync(flagsPath, 'utf8'));
+  assert.equal(real.length, 3, 'all three excepts flagged');
+  // drift every flag's line by +100 but keep its bodyFingerprint -> must relocate by fingerprint
+  const drifted = real.map((f) => ({ ...f, line: f.line + 100 }));
+  fs.writeFileSync(flagsPath, JSON.stringify(drifted, null, 2));
+
+  const seen = new Set();
+  const lines = [];
+  for (let i = 0; i < 3; i++) {
+    const t = deps.nextObservabilityReviewTask({ repoRoot: dir, pipelineDir: dir, defaultDomain: 'default', taskIdExistsInQueue: (id) => seen.has(id), coveragePath: path.join(dir, 'observability-coverage.json') });
+    assert.ok(t, `task ${i} produced`);
+    seen.add(t.id);
+    lines.push(t.promptContext.line);
+    assert.match(t.promptContext.enclosingCode, /lines \d+-\d+/);
+  }
+  assert.deepEqual(lines.sort((a, b) => a - b), [4, 10, 16], 'each drifted flag relocated to its own real except line');
+});
+
 test('nextObservabilityReviewTask drops a flag whose construct is gone, produces no task', () => {
   const dir = makeObservabilityFixtureRepo();
   writeObservabilityFinding(dir, 'app.py', PY_SILENT);

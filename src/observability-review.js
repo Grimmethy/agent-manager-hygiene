@@ -40,20 +40,37 @@ const ENCLOSING_BEFORE = 12;
 const ENCLOSING_AFTER = 6;
 const ENCLOSING_MAX_LINES = 140;
 
-// Re-run the silent-catch-block rule on the CURRENT file and find the fresh finding that
-// corresponds to a persisted flag, so a task is never built from a stale line number (the
-// flags file only reconciles every RESCAN_INTERVAL_MS, but repoRoot changes many times a
-// day). Match priority: same body fingerprint (survives line drift + reindentation) ->
-// exact line -> the only silent-catch finding in the file. Returns the fresh finding, or
-// null when the construct is gone / can't be disambiguated (the caller then drops the flag).
-function relocateSilentCatchFlag(flag, content, relPath) {
-  let fresh;
-  try {
-    fresh = findSilentCatchBlocks(content, relPath).filter((f) => f.rule === 'silent-catch-block');
-  } catch {
-    return null;
-  }
-  if (fresh.length === 0) return null;
+// Per-poll cache of "read + re-scan this file once" -- a busy repo can have dozens of
+// silent-catch flags in the same large file (app.py etc.), and without this every one of
+// them re-read and re-scanned the whole file (O(flags x filesize) per nextObservability
+// ReviewTask call). Keyed by repo-relative path; value is { content, silentCatch } (both
+// null-safe). Rebuilt fresh each call -- the file can change between polls.
+function makeFileCache(repoRoot) {
+  const cache = new Map();
+  return (relPath) => {
+    if (cache.has(relPath)) return cache.get(relPath);
+    const content = readIfExists(path.join(repoRoot, relPath));
+    const minified = !!content && isLikelyMinified(content);
+    let silentCatch = [];
+    if (content && !minified) {
+      try {
+        silentCatch = findSilentCatchBlocks(content, relPath).filter((f) => f.rule === 'silent-catch-block');
+      } catch { silentCatch = []; }
+    }
+    const entry = { content, minified, silentCatch };
+    cache.set(relPath, entry);
+    return entry;
+  };
+}
+
+// Given a persisted flag and the fresh silent-catch findings for its file, find the one
+// that corresponds to it -- so a task is never built from a stale line number (the flags
+// file only reconciles every RESCAN_INTERVAL_MS, but repoRoot changes many times a day).
+// Match priority: same body fingerprint (survives line drift + reindentation) -> exact
+// line -> the only silent-catch finding in the file. Returns the fresh finding, or null
+// when the construct is gone / can't be disambiguated (the caller then drops the flag).
+function relocateSilentCatchFlag(flag, fresh) {
+  if (!Array.isArray(fresh) || fresh.length === 0) return null;
   if (flag.bodyFingerprint) {
     const byBody = fresh.filter((f) => f.bodyFingerprint === flag.bodyFingerprint);
     if (byBody.length === 1) return byBody[0];
@@ -290,6 +307,7 @@ function nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, tas
 
   const sorted = [...flags].sort((a, b) => new Date(a.scannedAt) - new Date(b.scannedAt));
   const staleKeys = new Set(); // rule::file::line of flags whose construct is gone -- pruned
+  const getFile = makeFileCache(repoRoot); // read + re-scan each file at most once per poll
 
   // Rewrite the flags file without the stale entries this poll discovered, then return.
   const persistStaleAnd = (result) => {
@@ -308,14 +326,15 @@ function nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, tas
     let content = null;
 
     if (flag.file) {
-      content = readIfExists(path.join(repoRoot, flag.file));
+      const cached = getFile(flag.file);
+      content = cached.content;
       if (!content) { staleKeys.add(`${flag.rule}::${flag.file}::${flag.line}`); continue; } // file gone
-      if (isLikelyMinified(content)) continue;
+      if (cached.minified) continue;
 
       // silent-catch-block: re-locate against the CURRENT file so the task is never built
       // from a drifted line (the whole "the model was shown the wrong 8 lines" failure).
       if (flag.rule === 'silent-catch-block') {
-        const fresh = relocateSilentCatchFlag(flag, content, flag.file);
+        const fresh = relocateSilentCatchFlag(flag, cached.silentCatch);
         if (!fresh) { staleKeys.add(`${flag.rule}::${flag.file}::${flag.line}`); continue; } // construct fixed/removed
         finding = { ...flag, line: fresh.line, detail: fresh.detail, blockStartLine: fresh.blockStartLine, blockEndLine: fresh.blockEndLine, bodyFingerprint: fresh.bodyFingerprint };
       }
