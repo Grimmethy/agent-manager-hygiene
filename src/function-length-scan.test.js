@@ -36,6 +36,8 @@ test('findLongFunctions flags a named function declaration over the threshold', 
   assert.equal(findings[0].rule, 'function-too-long');
   assert.equal(findings[0].file, 'x.js');
   assert.match(findings[0].detail, /function "tooLong"/);
+  // lengthLines: the measured body span, so the review stage can window the whole function.
+  assert.equal(findings[0].lengthLines, 14); // 1 decl + 12 body + 1 close
 });
 
 test('findLongFunctions flags an arrow-function assignment and a function-expression assignment, with real names', () => {
@@ -80,6 +82,7 @@ test('findLongPythonFunctions flags an over-threshold def (and reports its name 
   assert.equal(findings[0].file, 'x.py');
   assert.equal(findings[0].line, 3);
   assert.match(findings[0].detail, /function "bloated" is 14 lines long/);
+  assert.equal(findings[0].lengthLines, 14);
 });
 
 test('findLongPythonFunctions handles a multi-line def header and stops the block at the next dedent', () => {

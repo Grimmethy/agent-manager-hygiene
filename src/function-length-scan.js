@@ -88,6 +88,10 @@ function findLongFunctions(text, relPath, threshold = maxFunctionLines()) {
         rule: 'function-too-long',
         file: relPath,
         line: lineOfIndex(text, m.index),
+        // The measured body span, so the review stage can put the WHOLE flagged function
+        // into its grounding snippet rather than a fixed +N-line window that cuts off
+        // mid-body and makes the reviewer hallucinate the rest.
+        lengthLines: lines,
         detail: `${name ? `function "${name}"` : 'this function'} is ${lines} lines long (threshold ${threshold}) -- consider decomposing into smaller, single-purpose functions`,
       });
     }
@@ -115,6 +119,7 @@ function findLongPythonFunctions(text, relPath, threshold = maxFunctionLines()) 
       rule: 'function-too-long',
       file: relPath,
       line: lineOfIndex(text, m.index),
+      lengthLines: block.lineCount,
       detail: `function "${m[2]}" is ${block.lineCount} lines long (threshold ${threshold}) -- consider decomposing into smaller, single-purpose functions`,
     });
   }

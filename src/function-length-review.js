@@ -24,16 +24,44 @@ const { reconcileFlags } = require('./flag-store.js');
 const { windowFromContent } = require('./scan-utils.js');
 const { isSuppressed, recordFalsePositiveIfVerdict } = require('./suppression-store.js');
 
-// A longer window than observability's -- judging a function's real shape needs its body,
-// not just its start line. Used verbatim as promptContext.snippet AND the suppression key.
+// Judging a function's real shape needs its WHOLE body, not just its start line. A fixed
+// +30-line window (the old value) cut off mid-body on any function meaningfully over the
+// 100-line threshold, and the reviewer then hallucinated everything past the cutoff --
+// 2026-09-02, two blocked function_length_review tasks on src/local-draft.js root-caused
+// to exactly this ("the draft contradicts the grounding source" when the grounding source
+// was 30 of 143 lines). SNIPPET_BEFORE lines of lead-in for context; the whole function
+// body after that, capped at SNIPPET_MAX_LINES so a pathological 900-line function can't
+// blow the review prompt (with an explicit truncation marker when the cap bites, so the
+// reviewer knows it is not seeing all of it). Used verbatim as promptContext.snippet AND
+// the suppression key -- both sides call functionSnippet, so they cannot drift.
 const SNIPPET_BEFORE = 2;
-const SNIPPET_AFTER = 30;
+const SNIPPET_AFTER = 30; // legacy fallback window only (flags recorded before the scanner emitted lengthLines)
+const SNIPPET_MAX_LINES = 200;
+
+// (content, 1-based declaration line, measured body span) -> the flagged function's full
+// text with a couple of lines of lead-in. Falls back to the old fixed window when the
+// scanner did not report a span (an old flags-file entry that predates lengthLines).
+function functionSnippet(content, line, lengthLines) {
+  if (!Number.isFinite(lengthLines) || lengthLines <= 0) {
+    return windowFromContent(content, line, SNIPPET_BEFORE, SNIPPET_AFTER);
+  }
+  const lines = String(content == null ? '' : content).split('\n');
+  const start = Math.max(0, (line || 1) - 1 - SNIPPET_BEFORE);
+  const fnEndExclusive = (line || 1) - 1 + lengthLines;
+  const cappedEndExclusive = Math.min(lines.length, start + SNIPPET_BEFORE + SNIPPET_MAX_LINES);
+  const end = Math.min(fnEndExclusive, cappedEndExclusive);
+  const body = lines.slice(start, end).join('\n');
+  if (end < fnEndExclusive) {
+    return `${body}\n// ... [truncated for review: this function continues for ${fnEndExclusive - end} more line(s) not shown]`;
+  }
+  return body;
+}
 
 function findingIsSuppressed(pipelineDir, repoRoot, finding) {
   if (!finding.file) return false;
   const content = readIfExists(path.join(repoRoot, finding.file));
   if (!content) return false;
-  return isSuppressed(pipelineDir, finding.rule, windowFromContent(content, finding.line, SNIPPET_BEFORE, SNIPPET_AFTER));
+  return isSuppressed(pipelineDir, finding.rule, functionSnippet(content, finding.line, finding.lengthLines));
 }
 const { registerTaskSource, updateTaskSource } = require('agent-manager/src/task-source-registry.js');
 const { applyArchDiscoveryCandidates } = require('agent-manager/src/candidate-docs.js');
@@ -73,7 +101,7 @@ function functionLengthReviewPlanPrompt(task) {
     `File: ${ctx.file}:${ctx.line}`,
     `Scanner detail: ${ctx.detail}`,
     '',
-    'SURROUNDING SOURCE (if available):',
+    'THE FULL FLAGGED FUNCTION (its whole body, unless marked truncated at the end for an unusually long one):',
     ctx.snippet || '(no snippet available for this finding)',
   ];
   return assemblePrompt(stable, volatile);
@@ -211,7 +239,7 @@ function nextFunctionLengthReviewTask({ repoRoot, pipelineDir, defaultDomain, ta
     if (finding.file) {
       const content = readIfExists(path.join(repoRoot, finding.file));
       if (!content) continue;
-      snippet = windowFromContent(content, finding.line, SNIPPET_BEFORE, SNIPPET_AFTER);
+      snippet = functionSnippet(content, finding.line, finding.lengthLines);
     }
 
     // A prior review already ruled this exact construct a false positive -- never re-ask.

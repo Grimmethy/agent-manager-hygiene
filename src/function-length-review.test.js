@@ -57,6 +57,24 @@ test('nextFunctionLengthReviewTask emits a review task for an over-threshold fun
   assert.ok(task, 'expected a review task for the long function');
   assert.equal(task.source, 'function_length_review');
   assert.equal(task.promptContext.file, 'big.js');
+  // The snippet must be the WHOLE function body (143 lines here, under the cap), not a
+  // fixed +30-line window that stops mid-body -- see functionSnippet's own comment.
+  assert.match(task.promptContext.snippet, /const x0 = 0;/);
+  assert.match(task.promptContext.snippet, /const x139 = 139;/);
+  assert.match(task.promptContext.snippet, /return 0;/);
+  assert.doesNotMatch(task.promptContext.snippet, /\[truncated for review/);
+});
+
+test('nextFunctionLengthReviewTask truncates the snippet for a pathologically long function, with an explicit marker', () => {
+  const dir = makeRepo();
+  const deps = freshPlugin(dir);
+  const body = Array.from({ length: 400 }, (_, i) => `  const x${i} = ${i};`).join('\n');
+  fs.writeFileSync(path.join(dir, 'huge.js'), `function monster() {\n${body}\n  return 0;\n}\n`);
+  const task = deps.nextFunctionLengthReviewTask({ repoRoot: dir, pipelineDir: dir, defaultDomain: 'default', taskIdExistsInQueue: deps.taskIdExistsInQueue });
+  assert.ok(task);
+  assert.match(task.promptContext.snippet, /const x0 = 0;/);
+  assert.match(task.promptContext.snippet, /\[truncated for review: this function continues for \d+ more line\(s\) not shown\]/);
+  assert.doesNotMatch(task.promptContext.snippet, /const x399 = 399;/);
 });
 
 test('a rescan prunes a persisted flag the scanner no longer reproduces (function moved / line-shifted) and emits no task for it', () => {
