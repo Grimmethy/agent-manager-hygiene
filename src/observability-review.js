@@ -229,10 +229,38 @@ function observabilityFixPlanPrompt(task) {
   ].join('\n');
 }
 
+// The flagged code block, straight from the candidate body (`Snippet:` fence). The
+// implement prompt otherwise only had the plan's paraphrase of it -- root cause of 8
+// blocked tasks whose `find` matched a DIFFERENT try/except/catch than the flagged one.
+function flaggedSnippet(ctx) {
+  const m = /(?:^|\n)\s*Snippet:\s*```[\w-]*\n([\s\S]*?)```/i.exec(String((ctx && ctx.body) || ''));
+  return m ? m[1].replace(/\s+$/, '') : '';
+}
+
+// Per-fetched-file: does `import logging` and a module-level logger already exist? The
+// model routinely re-adds them (5 blocked tasks: "duplicate import logging" / import
+// inserted inside a function).
+function importStatusBlock(fetched) {
+  const lines = [];
+  for (const f of fetched) {
+    if (!/\.py$/.test(f.path)) continue;
+    const c = f.content || '';
+    const hasImport = /^\s*(?:import logging\b|from logging import)/m.test(c);
+    const hasLogger = /^\s*(?:logger|log|_log|LOG|LOGGER)\s*=\s*logging\.getLogger\(/m.test(c);
+    if (hasImport || hasLogger) {
+      lines.push(`- ${f.path}: ${hasImport ? '`import logging` is ALREADY present' : '`import logging` is NOT present'}; ${hasLogger ? 'a module logger is ALREADY defined -- USE IT, do not create another' : 'no module logger -- if you need one, add exactly ONE `logger = logging.getLogger(__name__)` at module top with the other imports, never inside a function'}.`);
+    } else {
+      lines.push(`- ${f.path}: no \`import logging\` yet -- add it with the other top-level imports (NOT inside a function), plus one \`logger = logging.getLogger(__name__)\`.`);
+    }
+  }
+  return lines.length ? `IMPORT / LOGGER STATUS (do not blindly re-add what is already there):\n${lines.join('\n')}\n` : '';
+}
+
 function observabilityFixImplementPrompt(task, planText) {
   const ctx = task.promptContext;
   const fetched = ctx.fetchedFiles || [];
   const namedButMissing = (ctx.files || []).filter((f) => !fetched.some((ff) => ff.path === f));
+  const snippet = flaggedSnippet(ctx);
   const { formatFileContents, groupBJsonInstructions, candidateSplitInstructions } = require('agent-manager/src/prompts.js');
   return [
     'Earlier you wrote this PLAN for a narrow observability-hygiene fix:',
@@ -241,10 +269,15 @@ function observabilityFixImplementPrompt(task, planText) {
     '',
     `The corrected plan is for: ${ctx.candidateId} -- ${ctx.title}.`,
     '',
+    snippet
+      ? `THE EXACT BLOCK THIS CANDIDATE FLAGGED (this, and only this, is what you are changing):\n\n\`\`\`\n${snippet}\n\`\`\`\n\nYour "find" value MUST be a verbatim substring of this block, or of the real file text immediately around it (shown below). Do NOT target a different try/except or catch elsewhere in the file even if it looks similar -- there is exactly one flagged block and it is the one above.`
+      : '',
+    '',
     fetched.length > 0
       ? `Real, current content of the file(s) this candidate named (this is the ONLY source of truth for what the file actually contains right now -- the plan/candidate write-up above may be stale or approximate; this is not):\n\n${formatFileContents(fetched)}`
       : '(none of the file(s) this candidate named could be read -- see the note below before assuming why.)',
     '',
+    importStatusBlock(fetched),
     namedButMissing.length > 0
       ? `NOTE: ${namedButMissing.join(', ')} named by this candidate could not be read (does not exist at that path, or is outside the repo). If your plan calls for creating this file, use mode "create". If your plan assumed this file already exists and you cannot proceed without seeing its real content, output the empty string instead of guessing at content you were never shown.`
       : '',

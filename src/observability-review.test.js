@@ -437,3 +437,34 @@ test('observability_review registers reviewGuidance that permits a decisive fals
   assert.match(src.reviewGuidance, /do NOT reject a decisive verdict merely for sounding careful/);
   assert.match(src.reviewCompletenessQuestion, /decisive GENUINE-or-FALSE-POSITIVE verdict/);
 });
+
+test('observabilityFixImplementPrompt surfaces the flagged Snippet and the import/logger status', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'obs-fix-anchor-'));
+  fs.writeFileSync(path.join(dir, 'package.json'), '{}');
+  const m = obsPrompts(dir);
+  const task = { promptContext: {
+    candidateId: 'AC-9', title: 'Log the swallowed decode error', files: ['m.py'],
+    body: '### AC-9 · Log the swallowed decode error\nStrength: Strong\nFiles: m.py\nSnippet:\n```python\n    except Exception:\n        return None  # THE FLAGGED ONE\n```\n\nProblem:\n...',
+    fetchedFiles: [{ path: 'm.py', content: 'import os\nimport logging\nlogger = logging.getLogger(__name__)\n\ndef f():\n    try:\n        g()\n    except Exception:\n        return None  # THE FLAGGED ONE\n    try:\n        h()\n    except OSError:\n        return None  # decoy block\n' }],
+  } };
+  const p = m.observabilityFixImplementPrompt(task, 'PLAN');
+  assert.match(p, /THE EXACT BLOCK THIS CANDIDATE FLAGGED/);
+  assert.match(p, /THE FLAGGED ONE/);
+  assert.match(p, /Do NOT target a different try\/except or catch/);
+  assert.match(p, /IMPORT \/ LOGGER STATUS/);
+  assert.match(p, /`import logging` is ALREADY present/);
+  assert.match(p, /a module logger is ALREADY defined/);
+});
+
+test('observabilityFixImplementPrompt import status tells the model to ADD when neither exists', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'obs-fix-noimport-'));
+  fs.writeFileSync(path.join(dir, 'package.json'), '{}');
+  const m = obsPrompts(dir);
+  const task = { promptContext: {
+    candidateId: 'AC-9', title: 't', files: ['m.py'],
+    body: 'Snippet:\n```\n    except Exception:\n        pass\n```',
+    fetchedFiles: [{ path: 'm.py', content: 'import os\n\ndef f():\n    try:\n        g()\n    except Exception:\n        pass\n' }],
+  } };
+  const p = m.observabilityFixImplementPrompt(task, 'PLAN');
+  assert.match(p, /no `import logging` yet -- add it with the other top-level imports/);
+});
