@@ -261,6 +261,16 @@ test('performance_review false-positive verdict -> apply is a clean no-op, no ca
   assert.equal(fs.existsSync(candidatesPath), false);
 });
 
+test('performance_review registers reviewGuidance so a prose verdict / candidate block is not rejected as "prose-only, no code"', () => {
+  const dir = makePerformanceFixtureRepo();
+  const { getRegisteredSource } = freshPlugin(dir);
+  const src = getRegisteredSource('performance_review');
+  assert.equal(typeof src.reviewGuidance, 'string');
+  assert.match(src.reviewGuidance, /NOT a code change/);
+  assert.match(src.reviewGuidance, /do NOT reject the draft for lacking an implementation/);
+  assert.match(src.reviewCompletenessQuestion, /decisive GENUINE-or-FALSE-POSITIVE verdict/);
+});
+
 // --- 2026-09-01: PROJECT CAPABILITIES grounding (mirror of the observability change) ---
 
 function perfPrompts(dir) {

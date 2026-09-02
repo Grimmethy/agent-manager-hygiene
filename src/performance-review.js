@@ -285,6 +285,12 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     // calls as unverified.
     groundingFields: ['snippet'],
     advisoryProse: true,
+    // 2026-09-02: advisoryProse alone left the review vote falling back to the generic
+    // "does it contain real, complete code" question, which rejected correct verdicts as
+    // "a prose-only plan with no actual code implementation" -- same gap function_length_
+    // review just had. This source produces a PROSE verdict or a candidate BLOCK, not code.
+    reviewGuidance: 'This is a performance-finding triage verdict for a project this pipeline reviews, NOT a code change (yet). A valid draft is EXACTLY ONE of: (a) "GENUINE" + a correctly-formatted `### AC-NNN` fix-candidate block (Strength: Strong / Files / Problem / Solution / Benefits); or (b) "FALSE POSITIVE" / "UNCERTAIN" + one short paragraph explaining why, grounded in the code snippet shown. There is deliberately NO diff or code here -- do NOT reject the draft for lacking an implementation, and do NOT reject the Solution paragraph for sketching the fix rather than writing it. REJECT only if: the draft refuses to reach a verdict; a GENUINE verdict\'s candidate block is malformed; the Solution proposes an unrelated or much broader change than the flagged construct; or a FALSE POSITIVE verdict\'s stated reason contradicts the snippet shown.',
+    reviewCompletenessQuestion: 'Does the draft reach a decisive GENUINE-or-FALSE-POSITIVE verdict (not "uncertain") and, if GENUINE, is it followed by a well-formed `### AC-NNN` candidate block scoped to the flagged construct?',
     directToMain: true, // see observability_review
     reportClass: (task) => { // see observability_review -- same filtering vs benefit split
       const text = (task.implementResponse || '').toLowerCase();

@@ -99,6 +99,16 @@ test('register() wires function_length_review (advisoryProse) + function_length_
   assert.equal(typeof review.buildPlanPrompt, 'function');
 });
 
+test('function_length_review registers reviewGuidance so a prose verdict / candidate block is not rejected as "not code"', () => {
+  const dir = makeRepo();
+  const { getRegisteredSource } = freshPlugin(dir);
+  const src = getRegisteredSource('function_length_review');
+  assert.equal(typeof src.reviewGuidance, 'string');
+  assert.match(src.reviewGuidance, /NOT a code change/);
+  assert.match(src.reviewGuidance, /describing an extraction refactor rather than the actual code/);
+  assert.match(src.reviewCompletenessQuestion, /decisive GENUINE-or-FALSE-POSITIVE verdict/);
+});
+
 test('function_length_review apply appends a candidate (and threads the snippet) to the decomposition doc', () => {
   const dir = makeRepo();
   const candidatesPath = path.join(dir, 'Docs', 'FUNCTION_LENGTH_CANDIDATES.md');

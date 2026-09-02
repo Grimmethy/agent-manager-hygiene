@@ -278,6 +278,15 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     // EXPECTED deliverable here, not a refusal. See review-task.js's own ADVISORY_PROSE_
     // SOURCES-turned-flag comment for the full history.
     advisoryProse: true,
+    // 2026-09-02: advisoryProse alone was not enough -- the review vote still fell back to
+    // the GENERIC "does it contain real, complete code" completeness question and rejected
+    // every correct output ("a meta-plan describing an extraction refactor rather than the
+    // actual code changes", "meta-commentary rather than the actual code implementation")
+    // -- 5 real function_length_review tasks blocked+exhausted that way. This source's
+    // deliverable is a PROSE verdict or a candidate BLOCK, never code; spell that out for
+    // the reviewer exactly as observability_review already does.
+    reviewGuidance: 'This is a function-length triage verdict for a function in OUR OWN project, NOT a code change. A valid draft is EXACTLY ONE of: (a) "GENUINE" + a correctly-formatted `### AC-NNN` candidate block (Strength: Strong / Files / Problem / Solution / Benefits) sketching which logical pieces to extract, scoped to exactly this one function; or (b) "FALSE POSITIVE" / "UNCERTAIN" + one short paragraph (2-4 sentences) explaining why, grounded in the function snippet shown. There is deliberately NO diff, no code, and no "steps" here -- do NOT reject the draft for lacking them, and do NOT reject a Solution paragraph for "describing an extraction refactor rather than the actual code" (describing the decomposition IS the deliverable). REJECT only if: the draft refuses to reach a verdict ("a human should look", "cannot determine"); a GENUINE verdict\'s candidate block is malformed or missing a required section; a GENUINE verdict\'s Solution proposes something broader than this one function; or a FALSE POSITIVE verdict\'s stated reason actually contradicts the snippet shown (e.g. claims the function is short when the snippet clearly runs past the threshold).',
+    reviewCompletenessQuestion: 'Does the draft reach a decisive GENUINE-or-FALSE-POSITIVE verdict (not "uncertain"/"needs a human") and, if GENUINE, is it followed by a well-formed `### AC-NNN` candidate block whose Solution is a decomposition scoped to exactly this one function?',
     // 2026-08-31: the apply is a low-risk additive candidate-doc append, not real code --
     // commit straight to main, no throwaway agent/<id> branch to hand-merge. Matches the
     // sibling candidate-generating review sources (observability_review, performance_review,
