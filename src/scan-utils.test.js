@@ -101,11 +101,13 @@ test('listSourceFiles walks nested directories, skips dot-dirs and known build/t
   fs.mkdirSync(path.join(dir, 'src', 'nested'), { recursive: true });
   fs.mkdirSync(path.join(dir, 'node_modules'), { recursive: true });
   fs.mkdirSync(path.join(dir, '.git'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'vendor', 'tokenfold'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'src', 'a.js'), 'a');
   fs.writeFileSync(path.join(dir, 'src', 'nested', 'b.js'), 'b');
   fs.writeFileSync(path.join(dir, 'src', 'c.md'), 'not scanned -- wrong extension');
   fs.writeFileSync(path.join(dir, 'node_modules', 'skip.js'), 'skip');
   fs.writeFileSync(path.join(dir, '.git', 'skip.js'), 'skip');
+  fs.writeFileSync(path.join(dir, 'vendor', 'tokenfold', 'skip.js'), 'vendored -- not our code');
 
   const files = listSourceFiles(dir, ['.js']).map((f) => path.relative(dir, f)).sort();
   assert.deepEqual(files, [path.join('src', 'a.js'), path.join('src', 'nested', 'b.js')]);
