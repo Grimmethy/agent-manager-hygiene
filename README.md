@@ -72,6 +72,18 @@ internal.
 `observabilityFixCandidatesPath` / `observabilityCoveragePath` /
 `performanceFixCandidatesPath` / `performanceCoveragePath` keys.
 
+`suppression-store.js` (shared by all three `*_review` sources):
+
+- `SCANNER_REVIEW_MAX_INCONCLUSIVE_ATTEMPTS` (default 3) — after this many completed
+  reviews of one construct that each reach a verdict but produce no candidate, it is
+  promoted to a `scanner-suppressions.json` row (`cause: "unproducible"`) so the scanner
+  stops re-flagging it. The ledgers (`scanner-suppressions.json`,
+  `scanner-review-attempts.json`) sit at `<pipelineDir>/` and MUST be gitignored when
+  `pipelineDir == repoRoot` — `git-runner.js`'s `stash -u` before `resetToMain()` evicts
+  them otherwise (agent-manager `d0be33b5`).
+  Backfill an existing pipeline's ledger from `queue/done/` history with
+  `node scripts/backfill-inconclusive-suppressions.js --apply`.
+
 ## Tests
 
 ```sh
