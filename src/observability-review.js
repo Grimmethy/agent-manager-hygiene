@@ -27,7 +27,7 @@ const path = require('path');
 const { scanProject, findSilentCatchBlocks } = require('./observability-scan.js');
 const { isLikelyMinified, windowFromContent } = require('./scan-utils.js');
 const { reconcileFlags } = require('./flag-store.js');
-const { isSuppressed, recordFalsePositiveIfVerdict } = require('./suppression-store.js');
+const { isSuppressed, recordFalsePositiveIfVerdict, recordInconclusiveReview } = require('./suppression-store.js');
 
 // The -before / +after window that becomes promptContext.snippet AND the suppression key.
 const SNIPPET_BEFORE = 4;
@@ -434,6 +434,9 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       // A "false positive" verdict wrote no candidate -- remember the flagged construct
       // so the scanner never re-emits it (suppression-store.js).
       recordFalsePositiveIfVerdict({ applyResult: res, implementResponse, task, pipelineDir });
+      // A verdict that produced no candidate and is not an explicit false positive:
+      // track it, and after a few such tries stop the scanner re-emitting this construct.
+      recordInconclusiveReview({ applyResult: res, implementResponse, task, pipelineDir });
       return res;
     },
     // 2026-08-31: the reviewer must see the SAME code window the drafter was given.

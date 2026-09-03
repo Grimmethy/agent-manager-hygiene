@@ -22,7 +22,7 @@ const path = require('path');
 const { scanProject } = require('./function-length-scan.js');
 const { reconcileFlags } = require('./flag-store.js');
 const { windowFromContent } = require('./scan-utils.js');
-const { isSuppressed, recordFalsePositiveIfVerdict } = require('./suppression-store.js');
+const { isSuppressed, recordFalsePositiveIfVerdict, recordInconclusiveReview } = require('./suppression-store.js');
 
 // Judging a function's real shape needs its WHOLE body, not just its start line. A fixed
 // +30-line window (the old value) cut off mid-body on any function meaningfully over the
@@ -292,6 +292,9 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       // A "false positive" verdict wrote no candidate -- remember the flagged construct
       // so the scanner never re-emits it (suppression-store.js).
       recordFalsePositiveIfVerdict({ applyResult: res, implementResponse, task, pipelineDir });
+      // A verdict that produced no candidate and is not an explicit false positive:
+      // track it, and after a few such tries stop the scanner re-emitting this construct.
+      recordInconclusiveReview({ applyResult: res, implementResponse, task, pipelineDir });
       return res;
     },
     // 2026-08-31: thread the flagged function window into review grounding -- see
