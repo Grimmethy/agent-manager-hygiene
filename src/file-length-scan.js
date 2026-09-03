@@ -108,12 +108,22 @@ module.exports = {
   SCAN_EXTENSIONS,
 };
 
-// CLI: `node src/file-length-scan.js [--json]` from the plugin dir, or wired into the
-// watchdog by agent-manager (which passes repoRoot/pipelineDir via getConfig()).
+// CLI: `node src/file-length-scan.js [--json]`. Resolves repoRoot/pipelineDir in order:
+// AGENT_MANAGER_REPO_ROOT / AGENT_MANAGER_PIPELINE_DIR env (how the agent-manager watchdog
+// invokes it -- `set -a; source agent-manager.env` puts both in the env), then
+// agent-manager's own getConfig() if this module can resolve it, then cwd.
 if (require.main === module) {
-  let getConfig;
-  try { ({ getConfig } = require('agent-manager/src/config.js')); } catch { /* standalone */ }
-  const cfg = getConfig ? getConfig() : { repoRoot: process.cwd(), pipelineDir: process.cwd() };
+  let cfg = null;
+  const envRepo = process.env.AGENT_MANAGER_REPO_ROOT;
+  const envPipe = process.env.AGENT_MANAGER_PIPELINE_DIR || envRepo;
+  if (envRepo) {
+    cfg = { repoRoot: envRepo, pipelineDir: envPipe };
+  } else {
+    try {
+      const { getConfig } = require('agent-manager/src/config.js');
+      cfg = getConfig();
+    } catch { cfg = { repoRoot: process.cwd(), pipelineDir: process.cwd() }; }
+  }
   const findings = writeFlags(cfg.pipelineDir, cfg.repoRoot);
   if (process.argv.includes('--json')) {
     process.stdout.write(JSON.stringify(findings, null, 2));
