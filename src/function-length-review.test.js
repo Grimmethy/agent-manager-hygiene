@@ -126,6 +126,14 @@ test('register() wires function_length_review (advisoryProse) + function_length_
   assert.equal(typeof review.buildPlanPrompt, 'function');
 });
 
+// 2026-09-04: AC-15..AC-18 (2026-09-01) recursively split instead of ever landing a diff,
+// same incident class that got pipeline_forensics_fix this flag the same day.
+test('function_length_fix is registered noCandidateSplit -- a fix must produce a diff, never re-split', () => {
+  const dir = makeRepo();
+  const { getRegisteredSource } = freshPlugin(dir);
+  assert.equal(getRegisteredSource('function_length_fix').noCandidateSplit, true);
+});
+
 test('function_length_review registers reviewGuidance so a prose verdict / candidate block is not rejected as "not code"', () => {
   const dir = makeRepo();
   const { getRegisteredSource } = freshPlugin(dir);

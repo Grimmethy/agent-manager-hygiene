@@ -345,8 +345,19 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     // still surfaces that way, just visibly.
     // candidateFulfillment: opts into local-draft.js's find-verification retry for free.
     candidateFulfillment: true,
-    // candidatesPath/candidateDocTitle: where a `{"mode": "split"}` implement response
-    // (prompts.js's candidateSplitInstructions) writes its sub-candidates back to. Same
+    // A function_length_fix candidate is already the review stage's decomposed, Strong-
+    // rated extraction target -- re-splitting it just files more decomposition candidates
+    // that get re-split forever instead of ever landing a diff. Confirmed live 2026-09-01:
+    // AC-15 -> AC-15a/b, AC-16 -> AC-16a/b, AC-17 -> AC-17a/b, AC-18 -- four branches
+    // pushed, each touching only the candidates doc, zero real code, each parent marked
+    // done/succeeded for producing nothing. The generic splitDepth>=1 recursion cap
+    // (local-draft.js's finalizeCandidateFulfillment) bounds this to one wasted split, but
+    // never fully stops it -- same class of incident that got pipeline_forensics_fix this
+    // exact flag the same day (task-sources.js). This pass must produce a real diff or
+    // output empty (-> blocked for a human).
+    noCandidateSplit: true,
+    // candidatesPath/candidateDocTitle: still used to file THIS fix's own candidate (from
+    // function_length_review) -- unrelated to the disabled re-split path above. Same
     // env-var-or-default resolution as this source's own `next` above, duplicated rather
     // than shared per this file's own stated convention for tiny same-file helpers.
     candidatesPath: () => process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH
