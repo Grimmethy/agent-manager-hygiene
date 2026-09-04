@@ -25,6 +25,7 @@ const {
   archDiscoveryPlanPrompt, archDiscoveryImplementPrompt,
   archImportPlanPrompt, archImportImplementPrompt,
 } = require('agent-manager/src/prompts.js');
+const { computePremiseEvidence, runPremiseCheck } = require('./arch-import-premise-check.js');
 
 // Review-gate guidance for the two arch generators, read by agent-manager's review-task.js
 // buildVerdictPrompt off source.reviewGuidance (ADR-0022 Stage A2: the plugin that defines
@@ -33,6 +34,16 @@ const {
 // goes away in Stage G once this field is the only source.
 const ARCH_DISCOVERY_REVIEW_GUIDANCE = 'This is an architecture-discovery task: finding ZERO real issues in the given files is a valid, EXPECTED, and often correct outcome -- do not reject a draft merely for concluding there is nothing worth flagging. Only reject an empty result if the draft itself looks like it never actually engaged with the given file content (e.g. generic boilerplate with no reference to anything specific in the files).';
 const ARCH_IMPORT_REVIEW_GUIDANCE = "This is an architecture-import task (an idea from an external project, being checked against agent-manager's own code): the drafter was told to output nothing if the harness search found no real agent-manager files this idea concretely applies to -- do not reject an empty result on that basis alone. Reject only if the draft names a file the harness search results do NOT show, or proposes something contradicted by the real file content given.";
+
+// arch_import_review's own guidance (2026-09-04, AC-8 incident): a candidate imported from
+// an external project can make a claim about agent-manager's CURRENT code that is simply
+// false (AC-8 claimed review-task.js uses different verdict field names per domain -- it
+// doesn't, all its returns share the same small vocabulary). `premiseEvidence` in the
+// grounding is a deterministic check of that claim against the real fetched content --
+// see arch-import-premise-check.js. This is the review-time backstop for a non-split diff
+// that still reaches review; the split path itself is gated earlier, in
+// finalizeCandidateFulfillment (agent-manager core), before this review ever runs.
+const ARCH_IMPORT_REVIEW_PREMISE_GUIDANCE = 'The candidate\'s Problem statement makes a claim about agent-manager\'s CURRENT code. `premiseEvidence` in the grounding above is a deterministic check of that claim against the real fetched file content. If it lists a contradiction (a cited symbol that is not where the candidate says it is, or a claimed inconsistency the fetched code does not actually show), REJECT regardless of how well-formed the diff or split looks -- a correct fix for a false premise is still wrong. An empty premiseEvidence means nothing checkable was found there; judge normally.';
 
 // Tiny helpers duplicated from task-sources.js (which keeps them unexported) rather than
 // reached across a module boundary -- same convention the maintenance modules follow.
@@ -311,13 +322,27 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
   // arch_import_review -- the OTHER consumer of nextCandidateFulfillmentTask, against
   // arch_import's own candidates doc. Priority 71: every stage's own consumer outranks its
   // own generator. Shares arch_review's plan/implement prompt pair.
+  //
+  // 2026-09-04 (AC-8 incident): stamp promptContext.premiseEvidence at task-build time,
+  // deterministically, against content the candidate already fetched -- cheap, synchronous,
+  // no fresh grep. `groundingFields` threads it to the reviewer (review-time backstop for a
+  // plain diff); `premiseCheck` is the harder gate, consulted by agent-manager core's
+  // finalizeCandidateFulfillment right before a {"mode":"split"} response is honored, so a
+  // false premise never fans out into child candidates the way AC-8 did.
   registerTaskSource('arch_import_review', {
     priority: taskPriority('arch_import_review', 71),
-    next: () => nextCandidateFulfillmentTask(getConfig().archImportCandidatesPath, 'arch_import_review'),
+    next: () => {
+      const task = nextCandidateFulfillmentTask(getConfig().archImportCandidatesPath, 'arch_import_review');
+      if (task) task.promptContext.premiseEvidence = computePremiseEvidence(task);
+      return task;
+    },
     candidateFulfillment: true, // no emptyApproval -- see arch_review above
     candidatesPath: () => getConfig().archImportCandidatesPath,
     candidateDocTitle: '# Architecture Import Candidates',
     reasoningTier: 'high',
+    groundingFields: ['premiseEvidence'],
+    reviewGuidance: ARCH_IMPORT_REVIEW_PREMISE_GUIDANCE,
+    premiseCheck: runPremiseCheck,
   });
   updateTaskSource('arch_import_review', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
 
