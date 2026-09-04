@@ -240,6 +240,59 @@ test('full round-trip: nextArchImportTask -> applyArchImportCandidate -> arch_im
   assert.deepEqual(fulfillmentTask.promptContext.files, ['src/config.js']);
 });
 
+// --- premiseCheck wiring (AC-8 incident, 2026-09-04) ------------------------------------
+
+test('arch_import_review.next() stamps promptContext.premiseEvidence, deterministically, from a checkably-false Problem claim', () => {
+  const dir = makeFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  // Same shape as the real src/review-task.js: many return sites, a small shared field
+  // vocabulary -- contradicts an "each...own" claim.
+  fs.writeFileSync(path.join(dir, 'src', 'gate.js'), [
+    "function f1(){ return { succeeded: true, verdict: 'a' }; }",
+    "function f2(){ return { succeeded: true, verdict: 'b', reason: 'x' }; }",
+    "function f3(){ return { succeeded: true, verdict: 'c', reason: 'y' }; }",
+    "function f4(){ return { succeeded: true, verdict: 'd' }; }",
+    "function f5(){ return { succeeded: true, verdict: 'e', reason: 'z' }; }",
+  ].join('\n'));
+  fs.writeFileSync(
+    path.join(dir, 'analysis', 'ghost.md'),
+    '# ghost — Deep Dive\n\n' + analysisItem({ id: 'ghost-1', title: 'Adopt shared verdict vocabulary', rating: 'Use', files: 'src/gate.js' })
+  );
+  markRelevantToCurrentProject(dir, 'ghost');
+  const { nextArchImportTask, applyArchImportCandidate, getRegisteredSource } = freshPlugin(dir);
+  const importTask = nextArchImportTask();
+
+  const implementResponse = [
+    '### AC-1 · Adopt shared verdict vocabulary',
+    'Strength: Strong',
+    'Source: ghost — "Adopt shared verdict vocabulary"',
+    'Files: src/gate.js',
+    '',
+    'Problem:\nsrc/gate.js is ad hoc -- each call site decides its own field names for the verdict.\n\nSolution:\nStandardize the fields.\n\nBenefits:\nConsistency.',
+  ].join('\n');
+  applyArchImportCandidate({
+    implementResponse,
+    candidatesPath: process.env.AGENT_MANAGER_ARCH_IMPORT_CANDIDATES_PATH,
+    importCoveragePath: process.env.AGENT_MANAGER_IMPORT_COVERAGE_PATH,
+    task: importTask,
+  });
+
+  const fulfillmentTask = getRegisteredSource('arch_import_review').next();
+  assert.ok(fulfillmentTask);
+  assert.ok(fulfillmentTask.promptContext.premiseEvidence, 'premiseEvidence must be stamped');
+  assert.equal(fulfillmentTask.promptContext.premiseEvidence.contradictions.length, 1);
+  assert.equal(fulfillmentTask.promptContext.premiseEvidence.contradictions[0].kind, 'uniform-return');
+});
+
+test('arch_import_review registration carries groundingFields, reviewGuidance, and premiseCheck', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arch-test-'));
+  const { getRegisteredSource } = freshPlugin(dir);
+  const s = getRegisteredSource('arch_import_review');
+  assert.deepEqual(s.groundingFields, ['premiseEvidence']);
+  assert.match(s.reviewGuidance, /premiseEvidence/);
+  assert.equal(typeof s.premiseCheck, 'function');
+});
+
 // --- applyArchImportCandidate unit tests (moved from apply-group-a.test.js) -------------
 
 test('applyArchImportCandidate leaves promotedAt null (not stamped) on a skipped/empty implement response', () => {

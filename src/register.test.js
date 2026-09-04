@@ -100,7 +100,7 @@ test('directToMain is set on the candidate-doc-append review sources; deadcode_t
 // agent-manager's review-task.js buildVerdictPrompt reads it off the registry instead of a
 // hardcoded `if (task.source === 'arch_discovery')` chain. agent-manager keeps a byte-identical
 // fallback for when this plugin isn't loaded; this test pins the plugin side of that pair.
-test('arch_discovery / arch_import declare reviewGuidance; the review/fix consumers do not', () => {
+test('arch_discovery / arch_import declare reviewGuidance; arch_review and the fix consumers do not', () => {
   const registry = loadPluginFresh();
   const disc = registry.getRegisteredSource('arch_discovery').reviewGuidance;
   const imp = registry.getRegisteredSource('arch_import').reviewGuidance;
@@ -108,9 +108,23 @@ test('arch_discovery / arch_import declare reviewGuidance; the review/fix consum
   assert.match(disc, /architecture-discovery task: finding ZERO real issues/);
   assert.equal(typeof imp, 'string');
   assert.match(imp, /architecture-import task \(an idea from an external project/);
-  for (const name of ['arch_review', 'arch_import_review', 'observability_fix', 'performance_fix', 'function_length_fix']) {
+  for (const name of ['arch_review', 'observability_fix', 'performance_fix', 'function_length_fix']) {
     assert.equal(registry.getRegisteredSource(name).reviewGuidance, undefined, `${name} must not set reviewGuidance`);
   }
+});
+
+// 2026-09-04 (AC-8 incident): arch_import_review is the one candidate-fulfillment consumer
+// that DOES carry reviewGuidance + groundingFields -- an idea imported from an external
+// project can make a false claim about agent-manager's own code, and premiseEvidence
+// (arch-import-premise-check.js) is the deterministic check of that claim. arch_review
+// (internally-discovered candidates) has no comparable external-idea risk and stays plain.
+test('arch_import_review declares its own premise-check reviewGuidance + groundingFields', () => {
+  const registry = loadPluginFresh();
+  const s = registry.getRegisteredSource('arch_import_review');
+  assert.deepEqual(s.groundingFields, ['premiseEvidence']);
+  assert.equal(typeof s.reviewGuidance, 'string');
+  assert.match(s.reviewGuidance, /premiseEvidence/);
+  assert.equal(typeof s.premiseCheck, 'function');
 });
 
 // 2026-08-31: the three scanner-review sources hand the drafter promptContext.snippet (the
@@ -128,9 +142,10 @@ test('the scanner-review sources declare groundingFields: ["snippet"]; the fix c
   for (const name of ['performance_review', 'function_length_review']) {
     assert.deepEqual(registry.getRegisteredSource(name).groundingFields, ['snippet'], `${name} must ground review on its snippet`);
   }
-  for (const name of ['observability_fix', 'performance_fix', 'function_length_fix', 'arch_discovery', 'arch_import']) {
+  for (const name of ['observability_fix', 'performance_fix', 'function_length_fix', 'arch_discovery', 'arch_import', 'arch_review']) {
     assert.equal(registry.getRegisteredSource(name).groundingFields, undefined, `${name} must not set groundingFields`);
   }
+  // arch_import_review is the one exception -- see the dedicated premise-check test above.
 });
 
 // Stage A4 (2026-08-28): arch_import's plan pass proposes QUERY: terms only; agent-manager's
