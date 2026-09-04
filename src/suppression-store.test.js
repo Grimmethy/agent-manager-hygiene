@@ -156,3 +156,13 @@ test('recordSuppression defaults cause to false-positive; older rows without the
   fs.writeFileSync(suppressionsPath(dir), JSON.stringify([{ key: suppressionKey('r2', 'x y z'), rule: 'r2' }]));
   assert.equal(isSuppressed(dir, 'r2', 'x y z'), true);
 });
+
+test('classifyReviewOutcome: genuine / dismissed / inconclusive', () => {
+  const { classifyReviewOutcome } = require('./suppression-store.js');
+  assert.equal(classifyReviewOutcome({ applyResult: { skipped: false }, implementResponse: '### AC-1 ...' }), 'genuine');
+  assert.equal(classifyReviewOutcome({ applyResult: null, implementResponse: '### AC-7 · x\nStrength: Strong' }), 'genuine');
+  assert.equal(classifyReviewOutcome({ applyResult: { skipped: true }, implementResponse: 'FALSE POSITIVE. The except binds e and returns None by contract.' }), 'dismissed');
+  assert.equal(classifyReviewOutcome({ applyResult: { skipped: true }, implementResponse: 'false-positive: deliberate fallback' }), 'dismissed');
+  assert.equal(classifyReviewOutcome({ applyResult: { skipped: true }, implementResponse: 'GENUINE but I could not produce a safe candidate.' }), 'inconclusive');
+  assert.equal(classifyReviewOutcome({ applyResult: { skipped: true }, implementResponse: '' }), 'inconclusive');
+});

@@ -15,7 +15,7 @@ const path = require('path');
 const fs = require('fs');
 const {
   scanProject, findSilentCatchBlocks, findSilentExceptBlocks, findUnguardedLoops, findOtelNamingViolations,
-  findMissingReservedAttributes, hasOtelDependency, isValidOtelName,
+  findMissingReservedAttributes, hasOtelDependency, isValidOtelName, classifyCatchConfidence,
 } = require('./observability-scan.js');
 
 function makeTempRepo() {
@@ -73,6 +73,65 @@ test('findSilentCatchBlocks does NOT flag `catch { return <literal> }` (delibera
 
 test('findSilentCatchBlocks still flags `catch { return someFallbackVar }` (identifier, not a literal)', () => {
   assert.equal(findSilentCatchBlocks('try { a() } catch {\n  return cached;\n}\n', 'a.js').length, 1);
+});
+
+// --- confidence tier ---------------------------------------------------------------------
+
+test('silent-catch findings carry a confidence field; a truly empty body is HIGH', () => {
+  const f = findSilentCatchBlocks('try { a() } catch {}\n', 'a.js');
+  assert.equal(f[0].confidence, 'high');
+});
+
+test('classifyCatchConfidence: HIGH for empty / pass / a bare state mutation that just falls through', () => {
+  const hi = (s, opts = {}) => classifyCatchConfidence({ stripped: s, text: opts.text || `x\ncatch {\n${s}\n}\n`, headerIndex: opts.text ? opts.headerIndex : 2, closeIndex: 999, isPython: !!opts.py });
+  assert.equal(hi(''), 'high');
+  assert.equal(hi('pass', { py: true }), 'high');
+  assert.equal(hi('...', { py: true }), 'high');
+  assert.equal(hi('this.missed = this.missed + 1'), 'high');
+  assert.equal(hi('doNothing()'), 'high');
+});
+
+test('classifyCatchConfidence: LOW for a non-literal return / partial-result fallback', () => {
+  const lo = (s) => classifyCatchConfidence({ stripped: s, text: `x\ncatch {\n${s}\n}\n`, headerIndex: 2, closeIndex: 999, isPython: false });
+  assert.equal(lo('return this.cache'), 'low');
+  assert.equal(lo('logSomething(); return result'), 'low');
+  assert.equal(classifyCatchConfidence({ stripped: 'return partial', text: 'x', headerIndex: 1, closeIndex: 9, isPython: true }), 'low');
+});
+
+test('classifyCatchConfidence: LOW for a lone continue / break', () => {
+  const c = (s) => classifyCatchConfidence({ stripped: s, text: `for(;;){try{}catch{\n${s}\n}}`, headerIndex: 12, closeIndex: 999, isPython: false });
+  assert.equal(c('continue'), 'low');
+  assert.equal(c('break;'), 'low');
+});
+
+test('classifyCatchConfidence: LOW for a catch that is the terminal clause of try/catch/finally (JS)', () => {
+  const text = 'try {\n  a();\n} catch (e) {\n  state = null;\n} finally {\n  cleanup();\n}\n';
+  const openIdx = text.indexOf('{', text.indexOf('catch'));
+  const body = '\n  state = null;\n';
+  const closeIndex = openIdx + 1 + body.length;
+  assert.equal(classifyCatchConfidence({ stripped: 'state = null;', text, headerIndex: text.indexOf('catch'), closeIndex, isPython: false }), 'low');
+});
+
+test('classifyCatchConfidence: LOW when the enclosing name / a comment signals best-effort', () => {
+  const named = 'function safeParse(s) {\n  try { return JSON.parse(s) } catch {\n    x = 1;\n  }\n}\n';
+  assert.equal(classifyCatchConfidence({ stripped: 'x = 1;', text: named, headerIndex: named.indexOf('catch'), closeIndex: 999, isPython: false }), 'low');
+  const commented = '// best-effort cache warm\ntry { warm() } catch {\n  y = 2;\n}\n';
+  assert.equal(classifyCatchConfidence({ stripped: 'y = 2;', text: commented, headerIndex: commented.indexOf('catch'), closeIndex: 999, isPython: false }), 'low');
+});
+
+test('confidence tier kill switch: AGENT_MANAGER_OBSERVABILITY_CONFIDENCE_TIER=false -> everything HIGH', () => {
+  const prev = process.env.AGENT_MANAGER_OBSERVABILITY_CONFIDENCE_TIER;
+  process.env.AGENT_MANAGER_OBSERVABILITY_CONFIDENCE_TIER = 'false';
+  delete require.cache[require.resolve('./observability-scan.js')];
+  const scan = require('./observability-scan.js');
+  try {
+    const f = scan.findSilentCatchBlocks('try { a() } catch {\n  return cached;\n}\n', 'a.js');
+    assert.equal(f[0].confidence, 'high');
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_OBSERVABILITY_CONFIDENCE_TIER;
+    else process.env.AGENT_MANAGER_OBSERVABILITY_CONFIDENCE_TIER = prev;
+    delete require.cache[require.resolve('./observability-scan.js')];
+  }
 });
 
 test('findSilentCatchBlocks skips test / fixture files', () => {

@@ -66,6 +66,20 @@ function reconcileFlags({ flags, freshFindings, scanOk, projectTag, repoRoot, is
     keptKeys.add(key);
   }
 
+  // A surviving flag keeps its ORIGINAL object (for its scannedAt / FIFO place), but fields
+  // the scanner can recompute -- `confidence` (added later than most flags) and the
+  // human-readable `detail` -- must track the current scan, or a pre-tier flag never gets a
+  // confidence and every re-scan re-decides the same drift. Only on a clean scan.
+  if (scanOk) {
+    const freshByKey = new Map(fresh.map((f) => [flagKey(f), f]));
+    for (const f of kept) {
+      const g = freshByKey.get(flagKey(f));
+      if (!g) continue;
+      if (g.confidence && f.confidence !== g.confidence) f.confidence = g.confidence;
+      if (g.detail && f.detail !== g.detail) f.detail = g.detail;
+    }
+  }
+
   if (typeof isSuppressed === 'function') {
     kept = kept.filter((f) => !(f.projectSlug === projectTag && safeSuppressed(isSuppressed, f)));
   }

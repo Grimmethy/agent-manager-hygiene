@@ -27,7 +27,12 @@ const path = require('path');
 const { scanProject, findSilentCatchBlocks } = require('./observability-scan.js');
 const { isLikelyMinified, windowFromContent } = require('./scan-utils.js');
 const { reconcileFlags } = require('./flag-store.js');
-const { isSuppressed, recordFalsePositiveIfVerdict, recordInconclusiveReview } = require('./suppression-store.js');
+const {
+  isSuppressed, recordSuppression, recordFalsePositiveIfVerdict, recordInconclusiveReview, classifyReviewOutcome,
+} = require('./suppression-store.js');
+const { selectLowConfidenceBatch, parseDigestVerdicts, LOW_CONFIDENCE_CAP, LOW_CONFIDENCE_MODE } = require('./low-confidence-digest.js');
+
+const STAMP_REVIEW_DISPOSITION = process.env.AGENT_MANAGER_OBSERVABILITY_REVIEW_DISPOSITION !== 'false';
 
 // The -before / +after window that becomes promptContext.snippet AND the suppression key.
 const SNIPPET_BEFORE = 4;
@@ -200,6 +205,46 @@ function observabilityReviewImplementPrompt(task, planText) {
   ].join('\n');
 }
 
+// --- Prompts: low-confidence digest (batch triage of the recovery/fallback bucket) -------
+
+function digestItemsBlock(items) {
+  return (items || []).map((it) => [
+    `--- ${it.n}. ${it.file}:${it.line} ---`,
+    `Scanner detail: ${it.detail}`,
+    it.enclosingCode || it.snippet || '(no source)',
+  ].join('\n')).join('\n\n');
+}
+
+function observabilityReviewDigestPlanPrompt(task) {
+  const items = (task.promptContext && task.promptContext.items) || [];
+  const stable = [
+    'A deterministic scanner flagged the catch/except blocks below as possibly swallowing an error silently. Each was already tiered LOW confidence -- the body does deliberate control flow (returns a fallback, continues a loop) or sits in a best-effort context, so most of these are intentional graceful-recovery, NOT a vanished error. Your job is a fast batch triage.',
+    'For EACH numbered block, decide GENUINE (a real error is being lost with zero operator visibility and it matters) or FALSE POSITIVE (deliberate, documented, or harmless recovery). Lean FALSE POSITIVE unless the block clearly drops a meaningful error on the floor.',
+    'Write a numbered PLAN: one line per block -- "<n>. GENUINE|FALSE POSITIVE — <one clause citing the block>".',
+    '',
+    capabilityProfileBlock(),
+  ];
+  return assemblePrompt(stable, [
+    `Project: ${task.promptContext && task.promptContext.projectSlug}`,
+    `${items.length} block(s):`,
+    '',
+    digestItemsBlock(items),
+  ]);
+}
+
+function observabilityReviewDigestImplementPrompt(task, planText) {
+  const items = (task.promptContext && task.promptContext.items) || [];
+  return [
+    'Your plan above triaged each flagged block. Now emit the machine-readable verdict list.',
+    '',
+    planText,
+    '',
+    `Output EXACTLY ${items.length} line(s), nothing else -- no preamble, no summary. Each line:`,
+    '`<n>. GENUINE|FALSE POSITIVE — <=20 words citing that block`',
+    'Use the block numbers exactly as shown. One line per block, in order.',
+  ].join('\n');
+}
+
 // --- Prompts: fix stage (candidate already vetted -- implement the real diff) ----------
 // Same shape arch_review's own fix-stage prompt uses (prompts.js's archReviewPlanPrompt/
 // archReviewImplementPrompt, which stayed in core since arch_review isn't moving) --
@@ -294,7 +339,11 @@ function observabilityFixImplementPrompt(task, planText) {
 
 // --- Task source: observability_review (scans + judges + writes a candidate) -----------
 
-function nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue, coveragePath }) {
+// Shared setup for both the per-finding review flow and the low-confidence digest: read the
+// flags backlog, rescan+reconcile if the 24h window has elapsed, persist, and hand back a
+// FIFO-sorted list plus a per-poll file cache. Returns { sorted, getFile, projectTag, flags,
+// flagsPath }.
+function prepareObservabilityFlags({ repoRoot, pipelineDir, coveragePath }) {
   const projectTag = path.basename(repoRoot);
 
   let coverage;
@@ -320,8 +369,8 @@ function nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, tas
     }
 
     // Reconcile the persistent backlog against this fresh scan -- prune flags the scan no
-    // longer reproduces (issue fixed/moved/line-shifted), append genuinely new ones. See
-    // flag-store.js for why the old file-exists-only prune was not enough.
+    // longer reproduces (issue fixed/moved/line-shifted), append genuinely new ones, refresh
+    // `confidence` onto survivors. See flag-store.js.
     const reconciled = reconcileFlags({
       flags, freshFindings, scanOk, projectTag, repoRoot,
       isSuppressed: (f) => findingIsSuppressed(pipelineDir, repoRoot, f),
@@ -339,11 +388,13 @@ function nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, tas
   }
 
   const sorted = [...flags].sort((a, b) => new Date(a.scannedAt) - new Date(b.scannedAt));
-  const staleKeys = new Set(); // rule::file::line of flags whose construct is gone -- pruned
-  const getFile = makeFileCache(repoRoot); // read + re-scan each file at most once per poll
+  const getFile = makeFileCache(repoRoot);
+  return { sorted, getFile, projectTag, flags, flagsPath };
+}
 
-  // Rewrite the flags file without the stale entries this poll discovered, then return.
-  const persistStaleAnd = (result) => {
+// A persist-stale-flags-then-return closure, per caller (each collects its own staleKeys).
+function makePersistStaleAnd(flags, flagsPath, staleKeys) {
+  return (result) => {
     if (staleKeys.size > 0) {
       const kept = flags.filter((f) => !staleKeys.has(`${f.rule}::${f.file}::${f.line}`));
       try {
@@ -353,25 +404,44 @@ function nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, tas
     }
     return result;
   };
+}
+
+// Relocate a flag against the current file + read its code windows. Returns
+// { finding, content } or null (file gone / minified / construct removed). Mutates staleKeys.
+function resolveFinding(flag, getFile, staleKeys) {
+  if (!flag.file) return { finding: flag, content: null };
+  const cached = getFile(flag.file);
+  const content = cached.content;
+  if (!content) { staleKeys.add(`${flag.rule}::${flag.file}::${flag.line}`); return null; }
+  if (cached.minified) return null;
+
+  let finding = flag;
+  if (flag.rule === 'silent-catch-block') {
+    const fresh = relocateSilentCatchFlag(flag, cached.silentCatch);
+    if (!fresh) { staleKeys.add(`${flag.rule}::${flag.file}::${flag.line}`); return null; }
+    finding = {
+      ...flag,
+      line: fresh.line, detail: fresh.detail,
+      blockStartLine: fresh.blockStartLine, blockEndLine: fresh.blockEndLine,
+      bodyFingerprint: fresh.bodyFingerprint,
+      confidence: fresh.confidence || flag.confidence,
+    };
+  }
+  return { finding, content };
+}
+
+function nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue, coveragePath }) {
+  const { sorted, getFile, projectTag, flags, flagsPath } = prepareObservabilityFlags({ repoRoot, pipelineDir, coveragePath });
+  const staleKeys = new Set();
+  const persistStaleAnd = makePersistStaleAnd(flags, flagsPath, staleKeys);
 
   for (const flag of sorted) {
-    let finding = flag;
-    let content = null;
+    const resolved = resolveFinding(flag, getFile, staleKeys);
+    if (!resolved) continue;
+    const { finding, content } = resolved;
 
-    if (flag.file) {
-      const cached = getFile(flag.file);
-      content = cached.content;
-      if (!content) { staleKeys.add(`${flag.rule}::${flag.file}::${flag.line}`); continue; } // file gone
-      if (cached.minified) continue;
-
-      // silent-catch-block: re-locate against the CURRENT file so the task is never built
-      // from a drifted line (the whole "the model was shown the wrong 8 lines" failure).
-      if (flag.rule === 'silent-catch-block') {
-        const fresh = relocateSilentCatchFlag(flag, cached.silentCatch);
-        if (!fresh) { staleKeys.add(`${flag.rule}::${flag.file}::${flag.line}`); continue; } // construct fixed/removed
-        finding = { ...flag, line: fresh.line, detail: fresh.detail, blockStartLine: fresh.blockStartLine, blockEndLine: fresh.blockEndLine, bodyFingerprint: fresh.bodyFingerprint };
-      }
-    }
+    // Low-confidence silent-catch findings are batched into a digest task, not one each.
+    if (finding.confidence === 'low' && LOW_CONFIDENCE_MODE !== 'off') continue;
 
     const taskId = `observability-${slugifyForId(projectTag)}-${slugifyForId(finding.rule)}-${slugifyForId(finding.file || 'repo')}-${finding.line || 0}`;
     if (taskIdExistsInQueue(taskId)) continue;
@@ -412,6 +482,54 @@ function nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, tas
   return persistStaleAnd(null);
 }
 
+// --- Task source: observability_review_digest (batches the low-confidence backlog) --------
+
+function nextObservabilityReviewDigestTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue, coveragePath }) {
+  if (LOW_CONFIDENCE_MODE === 'off') return null;
+  const { sorted, getFile, projectTag, flags, flagsPath } = prepareObservabilityFlags({ repoRoot, pipelineDir, coveragePath });
+  const staleKeys = new Set();
+  const persistStaleAnd = makePersistStaleAnd(flags, flagsPath, staleKeys);
+
+  // One digest per project per day. Skip the (potentially large) walk if today's exists.
+  const digestId = `observability-digest-${slugifyForId(projectTag)}-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}`;
+  if (taskIdExistsInQueue(digestId)) return persistStaleAnd(null);
+
+  const low = [];
+  for (const flag of sorted) {
+    const resolved = resolveFinding(flag, getFile, staleKeys);
+    if (!resolved) continue;
+    const { finding, content } = resolved;
+    if (finding.confidence !== 'low') continue;
+    if (!content || !finding.file) continue;
+
+    const snippet = windowFromContent(content, finding.line, SNIPPET_BEFORE, SNIPPET_AFTER);
+    if (isSuppressed(pipelineDir, finding.rule, snippet)) continue;
+    low.push({
+      rule: finding.rule,
+      file: finding.file,
+      line: finding.line,
+      detail: finding.detail,
+      bodyFingerprint: finding.bodyFingerprint,
+      scannedAt: finding.scannedAt,
+      snippet,
+      enclosingCode: windowFromContent(content, finding.line, 8, 6),
+    });
+  }
+
+  if (low.length === 0) return persistStaleAnd(null);
+
+  const batch = selectLowConfidenceBatch(low, LOW_CONFIDENCE_CAP)
+    .map((item, i) => ({ n: i + 1, ...item }));
+
+  return persistStaleAnd({
+    id: digestId,
+    domain: defaultDomain,
+    source: 'observability_review_digest',
+    title: `Observability triage digest: ${batch.length} low-confidence silent-catch finding(s) — ${projectTag}`,
+    promptContext: { projectSlug: projectTag, items: batch },
+  });
+}
+
 function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
   registerTaskSource('observability_review', {
     priority: taskPriority('observability_review', 80),
@@ -437,6 +555,12 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       // A verdict that produced no candidate and is not an explicit false positive:
       // track it, and after a few such tries stop the scanner re-emitting this construct.
       recordInconclusiveReview({ applyResult: res, implementResponse, task, pipelineDir });
+      // Structured outcome for task-disposition.js (core): splits `dismissed` (a correct
+      // false-positive triage) out of the `noop` grab-bag. Mutating `task` here is
+      // persisted by apply-task.js after apply() returns.
+      if (STAMP_REVIEW_DISPOSITION && task) {
+        task.reviewDisposition = classifyReviewOutcome({ applyResult: res, implementResponse });
+      }
       return res;
     },
     // 2026-08-31: the reviewer must see the SAME code window the drafter was given.
@@ -474,6 +598,67 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
   });
   updateTaskSource('observability_review', { buildPlanPrompt: observabilityReviewPlanPrompt, buildImplementPrompt: observabilityReviewImplementPrompt });
 
+  registerTaskSource('observability_review_digest', {
+    priority: taskPriority('observability_review_digest', 78),
+    next: () => {
+      const { repoRoot, pipelineDir, defaultDomain, observabilityCoveragePath } = getConfig();
+      return nextObservabilityReviewDigestTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue, coveragePath: observabilityCoveragePath });
+    },
+    apply: ({ implementResponse, task }) => {
+      const { observabilityFixCandidatesPath, pipelineDir } = getConfig();
+      const items = (task && task.promptContext && task.promptContext.items) || [];
+      const verdicts = parseDigestVerdicts(implementResponse, items.length);
+      let filed = 0;
+      let dismissed = 0;
+      for (const item of items) {
+        const v = verdicts.get(item.n);
+        if (!v) continue; // unparsed -- leave it; the finding recurs next cycle
+        if (v.verdict === 'genuine') {
+          const one = [
+            `### AC-000 · silent-catch-block at ${item.file}:${item.line}`,
+            'Strength: Moderate',
+            `Files: ${item.file}`,
+            '', 'Problem:',
+            `A caught error is discarded with no operator visibility. ${item.detail} ${v.reason}`.trim(),
+            '', 'Solution:',
+            'Log the caught error (message + context) before the existing fallback/return; do not change control flow.',
+            '', 'Benefits:',
+            'An operator can tell a silent recovery from a real failure in the logs.',
+          ].join('\n');
+          const r = applyArchDiscoveryCandidates({
+            implementResponse: one, candidatesPath: observabilityFixCandidatesPath,
+            docTitle: '# Observability Fix Candidates', snippet: item.snippet,
+          });
+          if (r && !r.skipped) filed += 1;
+        } else {
+          const r = recordSuppression(pipelineDir, {
+            rule: item.rule, file: item.file, snippet: item.snippet,
+            taskId: task && task.id, cause: 'false-positive',
+          });
+          if (r && r.recorded) dismissed += 1;
+        }
+      }
+      const aggregate = filed > 0 ? 'genuine' : (dismissed > 0 ? 'dismissed' : 'inconclusive');
+      if (STAMP_REVIEW_DISPOSITION && task) task.reviewDisposition = aggregate;
+      if (filed > 0) {
+        return { skipped: false, reason: `observability digest: filed ${filed} candidate(s), dismissed ${dismissed}` };
+      }
+      return { skipped: true, reason: `observability digest: ${dismissed} finding(s) dismissed as FALSE POSITIVE, ${items.length - dismissed} unresolved` };
+    },
+    groundingFields: ['items'],
+    advisoryProse: true,
+    reviewGuidance: 'This is a BATCH observability triage. A valid draft is a list of exactly N lines, one per numbered block, each "<n>. GENUINE|FALSE POSITIVE — <short reason>". Approve if every block has a decisive verdict with a reason that is consistent with the block shown in the grounding `items`. Reject only if lines are missing, verdicts are absent/"uncertain", or a reason plainly contradicts its block.',
+    reviewCompletenessQuestion: 'Does the draft give a decisive GENUINE/FALSE-POSITIVE verdict for every numbered block, each consistent with that block\'s code in the grounding?',
+    directToMain: true,
+    reportClass: (task) => {
+      const text = (task.implementResponse || '').toLowerCase();
+      if (text.includes('genuine')) return 'benefit';
+      if (text.includes('false positive') || text.includes('false-positive')) return 'filtering';
+      return 'unclear';
+    },
+  });
+  updateTaskSource('observability_review_digest', { buildPlanPrompt: observabilityReviewDigestPlanPrompt, buildImplementPrompt: observabilityReviewDigestImplementPrompt });
+
   registerTaskSource('observability_fix', {
     priority: taskPriority('observability_fix', 72),
     next: () => {
@@ -494,8 +679,11 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
 module.exports = {
   register,
   nextObservabilityReviewTask,
+  nextObservabilityReviewDigestTask,
   observabilityReviewPlanPrompt,
   observabilityReviewImplementPrompt,
+  observabilityReviewDigestPlanPrompt,
+  observabilityReviewDigestImplementPrompt,
   observabilityFixPlanPrompt,
   observabilityFixImplementPrompt,
 };
