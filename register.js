@@ -24,6 +24,7 @@ require('./src/observability-review.js').register(deps);
 require('./src/performance-review.js').register(deps);
 require('./src/arch.js').register(deps);
 require('./src/unused-export.js').register(deps);
+require('./src/change-review.js').register(deps);
 
 // ADR-0022 Stage B: register how observability_review / performance_review scanner rules
 // are re-run against a file's current content, for agent-manager's staleness-fastpath.js
