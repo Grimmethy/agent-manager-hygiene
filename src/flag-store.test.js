@@ -152,3 +152,31 @@ test('reconcileFlags fails open: a throwing isSuppressed does not wipe the backl
   });
   assert.equal(flags.length, 1);
 });
+
+test('reconcileFlags refreshes confidence + detail onto a surviving flag from the fresh scan', () => {
+  // a pre-tier flag with no `confidence` at all
+  const old = flag('a.js', 5, { rule: 'silent-catch-block', detail: 'old detail' });
+  delete old.confidence;
+  const { flags, changed } = reconcileFlags({
+    flags: [old],
+    freshFindings: [{ ...flag('a.js', 5), rule: 'silent-catch-block', confidence: 'low', detail: 'new detail (low confidence: ...)' }],
+    scanOk: true, projectTag: 'proj', repoRoot: '/nope',
+  });
+  assert.equal(flags[0].confidence, 'low');
+  assert.equal(flags[0].detail, 'new detail (low confidence: ...)');
+  assert.equal(flags[0].scannedAt, '2026-01-01T00:00:00.000Z', 'FIFO position (scannedAt) is preserved');
+  assert.equal(changed, true);
+});
+
+test('reconcileFlags does not touch confidence when the scan threw (fresh is not ground truth)', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'flag-store-scanfail-'));
+  fs.writeFileSync(path.join(repo, 'a.js'), 'x');
+  const old = flag('a.js', 5, { rule: 'silent-catch-block', confidence: 'high' });
+  const { flags } = reconcileFlags({
+    flags: [old],
+    freshFindings: [{ ...flag('a.js', 5), rule: 'silent-catch-block', confidence: 'low' }], // ignored: scanOk false
+    scanOk: false, projectTag: 'proj', repoRoot: repo,
+  });
+  assert.equal(flags.length, 1);
+  assert.equal(flags[0].confidence, 'high');
+});

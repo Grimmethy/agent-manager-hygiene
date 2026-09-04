@@ -25,6 +25,62 @@ const path = require('path');
 const { listSourceFiles, isLikelyMinified, lineOfIndex, extractBraceBody, extractIndentedBlock, stripNonCode, isTestFile } = require('./scan-utils.js');
 
 const SCAN_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.py', '.go'];
+
+// A `silent-catch-block` finding whose body is *genuinely* silent (empty / `pass` / a bare
+// state mutation that just falls through) is HIGH confidence -- worth a full triage task.
+// One whose body does deliberate control flow (returns a fallback, `continue`s a loop) or
+// sits in a `try/…/finally` or a `safe*/try_*/best-effort` context is LOW confidence: it is
+// almost always an intentional graceful-recovery pattern, not a vanished error. PR #12
+// (commit f7c101a) already drops literal-only-return bodies entirely; this tiers what's
+// left. LOW findings are batched into one digest task instead of one task each -- see
+// observability-review.js. Kill switch: AGENT_MANAGER_OBSERVABILITY_CONFIDENCE_TIER=false
+// forces every finding HIGH (identical to pre-tier behaviour).
+const CONFIDENCE_TIER_ON = (() => process.env.AGENT_MANAGER_OBSERVABILITY_CONFIDENCE_TIER !== 'false')();
+
+const CTRL_FLOW_RE = /(^|[\s;{(])(return|continue|break|yield|raise|throw)\b/;
+const RETURN_RE = /(^|[\s;{(])return\b/;
+const LOOP_CTRL_RE = /^(?:[^;\n]*;\s*)?(continue|break)\s*;?$/;
+const BEST_EFFORT_COMMENT_RE = /\bbest[\s_-]?effort\b|\bgracefully?\b|\bignore(?:d|s)?\b|\bswallow\b/i;
+const BEST_EFFORT_NAME_RE = /\b[A-Za-z0-9_$]*(?:safe|try_|maybe|best_?effort|probe|peek|attempt|opt(?:ional)?)[A-Za-z0-9_$]*\s*[(=:]/i;
+
+// stripped: stripComments(body).trim(). text: whole file. headerIndex: m.index of the
+// catch/except header. closeIndex: index of the closing `}` (JS) / last char of the block
+// (Python). Returns 'high' | 'low'. Pure string work, no AST.
+function classifyCatchConfidence({ stripped, text, headerIndex, closeIndex, isPython }) {
+  if (!CONFIDENCE_TIER_ON) return 'high';
+
+  // Genuinely silent -> HIGH.
+  if (stripped.length === 0) return 'high';
+  if (isPython && PY_EMPTY_EXCEPT_RE.test(stripped)) return 'high';
+
+  // Deliberate control flow in the body -> LOW.
+  if (RETURN_RE.test(stripped)) return 'low';
+  if (LOOP_CTRL_RE.test(stripped)) return 'low';
+
+  // Terminal clause of a try/…/finally whose finally is non-empty -> LOW (JS best-effort;
+  // a Python miss just stays HIGH).
+  if (!isPython && typeof closeIndex === 'number') {
+    const after = text.slice(closeIndex + 1, closeIndex + 400);
+    const fin = after.match(/^\s*finally\s*\{/);
+    if (fin) {
+      const finBody = extractBraceBody(text, closeIndex + 1 + fin[0].length - 1);
+      if (finBody !== null && stripComments(finBody).trim().length > 0) return 'low';
+    }
+  }
+
+  // Best-effort signal in the 12 lines above the header (a comment, or a `safe*`/`try_*`
+  // enclosing name). Loose on purpose -- a wrong LOW only reroutes to the digest, never
+  // drops the finding.
+  const upTo = text.slice(0, headerIndex);
+  const preWindow = upTo.split('\n').slice(-13).join('\n');
+  if (BEST_EFFORT_COMMENT_RE.test(preWindow) || BEST_EFFORT_NAME_RE.test(preWindow)) return 'low';
+
+  // Body has content but no control flow at all (bare assignment / lone call) -> genuinely
+  // silent, HIGH.
+  if (!CTRL_FLOW_RE.test(stripped)) return 'high';
+
+  return 'high';
+}
 const LOOP_CONTEXT_WINDOW_LINES = 40;
 const HEALTH_SIGNAL_RE = /heartbeat|health.?check|liveness|readiness/i;
 
@@ -93,6 +149,12 @@ function findSilentCatchBlocks(text, relPath) {
     if (JS_SIMPLE_RETURN_RE.test(stripped)) continue;
     if (stripped.length === 0 || !SURFACES_ERROR_RE.test(stripped)) {
       const startLine = lineOfIndex(text, m.index);
+      const confidence = classifyCatchConfidence({
+        stripped, text, headerIndex: m.index, closeIndex: openIndex + 1 + body.length, isPython: false,
+      });
+      const baseDetail = stripped.length === 0
+        ? 'catch block is empty -- the error is silently discarded with no log/rethrow/metric'
+        : 'catch block does not appear to log, rethrow, or otherwise surface the error';
       findings.push({
         rule: 'silent-catch-block',
         file: relPath,
@@ -100,9 +162,10 @@ function findSilentCatchBlocks(text, relPath) {
         blockStartLine: startLine,
         blockEndLine: lineOfIndex(text, openIndex + 1 + body.length),
         bodyFingerprint: bodyFingerprint(stripped),
-        detail: stripped.length === 0
-          ? 'catch block is empty -- the error is silently discarded with no log/rethrow/metric'
-          : 'catch block does not appear to log, rethrow, or otherwise surface the error',
+        confidence,
+        detail: confidence === 'low'
+          ? `${baseDetail} (low confidence: appears to be deliberate recovery/fallback -- verify)`
+          : baseDetail,
       });
     }
   }
@@ -127,6 +190,12 @@ function findSilentExceptBlocks(text, relPath) {
     const isEmpty = stripped.length === 0 || PY_EMPTY_EXCEPT_RE.test(stripped);
     if (isEmpty || !SURFACES_ERROR_RE.test(stripped)) {
       const startLine = lineOfIndex(text, m.index);
+      const confidence = classifyCatchConfidence({
+        stripped, text, headerIndex: m.index, closeIndex: block.endIndex, isPython: true,
+      });
+      const baseDetail = isEmpty
+        ? 'except block is empty (only pass/.../a comment) -- the exception is silently discarded with no log/re-raise/metric'
+        : 'except block does not appear to log, re-raise, or otherwise surface the exception';
       findings.push({
         rule: 'silent-catch-block',
         file: relPath,
@@ -134,9 +203,10 @@ function findSilentExceptBlocks(text, relPath) {
         blockStartLine: startLine,
         blockEndLine: startLine + Math.max(0, (block.lineCount || 1) - 1),
         bodyFingerprint: bodyFingerprint(stripped),
-        detail: isEmpty
-          ? 'except block is empty (only pass/.../a comment) -- the exception is silently discarded with no log/re-raise/metric'
-          : 'except block does not appear to log, re-raise, or otherwise surface the exception',
+        confidence,
+        detail: confidence === 'low'
+          ? `${baseDetail} (low confidence: appears to be deliberate recovery/fallback -- verify)`
+          : baseDetail,
       });
     }
   }
@@ -293,6 +363,7 @@ function scanProject(clonePath, projectSlug) {
 module.exports = {
   scanProject,
   bodyFingerprint,
+  classifyCatchConfidence,
   findSilentCatchBlocks,
   findSilentExceptBlocks,
   findUnguardedLoops,

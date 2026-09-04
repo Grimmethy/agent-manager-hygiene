@@ -224,8 +224,25 @@ function recordInconclusiveReview({ applyResult, implementResponse, task, pipeli
   return { promoted: false, count, key };
 }
 
+// Classifies a completed _review's outcome for task-disposition.js (core). The review
+// source's apply() stamps the result on `task.reviewDisposition`; the core reconcile reads
+// it to split `dismissed` (a correct false-positive triage) out of the `noop` grab-bag.
+// Same predicates the two recorders above already use, kept in one place.
+//   genuine       -- a fix candidate was written (or, for a backfill with only text, an
+//                    `### AC-NNN` header is present)
+//   dismissed     -- explicit FALSE POSITIVE verdict, no candidate: the scanner was wrong
+//   inconclusive  -- reached a verdict but produced nothing usable
+function classifyReviewOutcome({ applyResult, implementResponse } = {}) {
+  const txt = implementResponse || '';
+  if (applyResult && !applyResult.skipped) return 'genuine';
+  if (/^\s*#{2,3}\s*AC-\d+\b/m.test(txt)) return 'genuine';
+  if (/false[\s-]*positive/i.test(txt)) return 'dismissed';
+  return 'inconclusive';
+}
+
 module.exports = {
   MAX_INCONCLUSIVE_REVIEW_ATTEMPTS,
+  classifyReviewOutcome,
   suppressionsPath,
   attemptsPath,
   normalizeSnippet,

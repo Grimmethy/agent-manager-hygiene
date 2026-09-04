@@ -32,7 +32,12 @@ function freshPlugin(repoRoot) {
   const deps = { getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority };
   const mod = require('./observability-review.js');
   mod.register(deps);
-  return { ...deps, nextObservabilityReviewTask: mod.nextObservabilityReviewTask, getRegisteredSource: registry.getRegisteredSource };
+  return {
+    ...deps,
+    nextObservabilityReviewTask: mod.nextObservabilityReviewTask,
+    nextObservabilityReviewDigestTask: mod.nextObservabilityReviewDigestTask,
+    getRegisteredSource: registry.getRegisteredSource,
+  };
 }
 
 // Back-compat alias: the direct-call tests below were written against a freshDeps() that
@@ -367,7 +372,7 @@ test('nextObservabilityReviewTask relocates several drifted flags in ONE big fil
     '    try:', '        y()', '    except ValueError:', '        ...',        // except @ line 10, body "..."
     '',
     'def c():',
-    '    try:', '        z()', '    except KeyError:', '        return None if False else None',  // not simple-return literal -> flagged, line 16
+    '    try:', '        z()', '    except KeyError:', '        self._missed = self._missed + 1',  // bare state mutation, no surfacing -> flagged HIGH, line 16
     '',
   ].join('\n');
   writeObservabilityFinding(dir, 'big.py', py);
@@ -467,4 +472,83 @@ test('observabilityFixImplementPrompt import status tells the model to ADD when 
   } };
   const p = m.observabilityFixImplementPrompt(task, 'PLAN');
   assert.match(p, /no `import logging` yet -- add it with the other top-level imports/);
+});
+
+// --- confidence routing + low-confidence digest ---------------------------------------
+
+function digestNext(dir, deps, exists) {
+  return deps.nextObservabilityReviewDigestTask({
+    repoRoot: dir, pipelineDir: dir, defaultDomain: 'default',
+    taskIdExistsInQueue: exists || deps.taskIdExistsInQueue, coveragePath: path.join(dir, 'observability-coverage.json'),
+  });
+}
+
+test('a LOW-confidence silent-catch is NOT returned as an observability_review task; a HIGH one is', () => {
+  const dir = makeObservabilityFixtureRepo();
+  // low: returns a non-literal fallback. high: truly empty.
+  writeObservabilityFinding(dir, 'low.js', 'function safeGet(k) {\n  try { return cache.get(k) } catch {\n    return fallbackValue;\n  }\n}\n');
+  writeObservabilityFinding(dir, 'high.js', 'try {\n  risky();\n} catch {}\n');
+  const deps = freshDeps(dir);
+  const t = callNext(dir, deps).result;
+  assert.ok(t);
+  assert.equal(t.promptContext.file, 'high.js', 'review flow only surfaces the HIGH-confidence finding');
+});
+
+test('nextObservabilityReviewDigestTask batches LOW findings into one dated task with items[]', () => {
+  const dir = makeObservabilityFixtureRepo();
+  writeObservabilityFinding(dir, 'a.js', 'try { a() } catch {\n  return this.cacheA;\n}\n');
+  writeObservabilityFinding(dir, 'b.js', 'try { b() } catch {\n  return this.cacheB;\n}\n');
+  const deps = freshDeps(dir);
+  callNext(dir, deps); // establish the flags backlog
+
+  const seen = new Set();
+  const digest = deps.nextObservabilityReviewDigestTask({
+    repoRoot: dir, pipelineDir: dir, defaultDomain: 'default',
+    taskIdExistsInQueue: (id) => seen.has(id), coveragePath: path.join(dir, 'observability-coverage.json'),
+  });
+  assert.ok(digest);
+  assert.equal(digest.source, 'observability_review_digest');
+  assert.match(digest.id, /^observability-digest-.*-\d{8}$/);
+  assert.equal(digest.promptContext.items.length, 2);
+  assert.deepEqual(digest.promptContext.items.map((i) => i.n), [1, 2]);
+  assert.ok(digest.promptContext.items[0].snippet);
+
+  // one per day: if it is already queued, next() returns null
+  seen.add(digest.id);
+  assert.equal(digestNext(dir, deps, (id) => seen.has(id)), null);
+});
+
+test('observability_review_digest apply: parses verdicts -> M candidates + (N-M) suppressions + reviewDisposition', () => {
+  const dir = makeObservabilityFixtureRepo();
+  const candidatesPath = path.join(dir, 'OBSERVABILITY_FIX_CANDIDATES.md');
+  process.env.AGENT_MANAGER_OBSERVABILITY_FIX_CANDIDATES_PATH = candidatesPath;
+  writeObservabilityFinding(dir, 'a.js', 'try { a() } catch {\n  return this.cacheA;\n}\n');
+  writeObservabilityFinding(dir, 'b.js', 'try { b() } catch {\n  return this.cacheB;\n}\n');
+  const deps = freshDeps(dir);
+  callNext(dir, deps);
+  const digest = digestNext(dir, deps);
+  assert.equal(digest.promptContext.items.length, 2);
+
+  const src = deps.getRegisteredSource('observability_review_digest');
+  const task = { id: digest.id, promptContext: digest.promptContext };
+  const res = src.apply({
+    implementResponse: '1. GENUINE — partial cache returned with no log\n2. FALSE POSITIVE — documented best-effort fallback',
+    task,
+  });
+  assert.equal(res.skipped, false);
+  assert.match(res.reason, /filed 1 candidate/);
+  assert.equal(task.reviewDisposition, 'genuine');
+  assert.ok(fs.existsSync(candidatesPath), 'a candidate doc was written for the GENUINE item');
+  const supp = JSON.parse(fs.readFileSync(path.join(dir, 'scanner-suppressions.json'), 'utf8'));
+  assert.equal(supp.length, 1, 'the FALSE POSITIVE item was suppressed');
+});
+
+test('observability_review apply stamps task.reviewDisposition (dismissed on a FALSE POSITIVE verdict)', () => {
+  const dir = makeObservabilityFixtureRepo();
+  process.env.AGENT_MANAGER_OBSERVABILITY_FIX_CANDIDATES_PATH = path.join(dir, 'CAND.md');
+  const deps = freshDeps(dir);
+  const src = deps.getRegisteredSource('observability_review');
+  const task = { id: 'obs-x', promptContext: { rule: 'silent-catch-block', file: 'a.js', line: 3, snippet: 'try { a() } catch {}' } };
+  src.apply({ implementResponse: 'FALSE POSITIVE. The block is not silent — the caller handles the None return.', task });
+  assert.equal(task.reviewDisposition, 'dismissed');
 });
