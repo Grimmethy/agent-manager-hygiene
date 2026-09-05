@@ -26,6 +26,7 @@ const {
   archImportPlanPrompt, archImportImplementPrompt,
 } = require('agent-manager/src/prompts.js');
 const { computePremiseEvidence, runPremiseCheck } = require('./arch-import-premise-check.js');
+const { runGroundingCheck: runArchImportGroundingCheck } = require('./arch-import-grounding-check.js');
 
 // Review-gate guidance for the two arch generators, read by agent-manager's review-task.js
 // buildVerdictPrompt off source.reviewGuidance (ADR-0022 Stage A2: the plugin that defines
@@ -382,6 +383,12 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     // "output nothing" instruction) -- an empty draft here auto-approves via emptyApproval.
     harnessSearch: 'archImport',
     skipImplementWhenNoHarnessHits: true,
+    // 2026-09-05: 3 of 7 blocked arch_import tasks shared the exact shape
+    // arch-import-premise-check.js already catches for its sibling arch_import_review --
+    // a fabricated premise/file/line-number contradicting the real harness-fetched content
+    // -- but that gate only runs at arch_import_review's split point, never here at
+    // arch_import's own initial write-up. See arch-import-grounding-check.js's own header.
+    postImplementCheck: runArchImportGroundingCheck,
   });
   updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });
 }
