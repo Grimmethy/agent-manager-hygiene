@@ -23,6 +23,7 @@ const { scanProject } = require('./function-length-scan.js');
 const { reconcileFlags } = require('./flag-store.js');
 const { windowFromContent } = require('./scan-utils.js');
 const { isSuppressed, recordFalsePositiveIfVerdict, recordInconclusiveReview } = require('./suppression-store.js');
+const { runGroundingCheck } = require('./function-length-grounding-check.js');
 
 // Judging a function's real shape needs its WHOLE body, not just its start line. A fixed
 // +30-line window (the old value) cut off mid-body on any function meaningfully over the
@@ -318,6 +319,12 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     // the reviewer exactly as observability_review already does.
     reviewGuidance: 'This is a function-length triage verdict for a function in OUR OWN project, NOT a code change. A valid draft is EXACTLY ONE of: (a) "GENUINE" + a correctly-formatted `### AC-NNN` candidate block (Strength: Strong / Files / Problem / Solution / Benefits) sketching which logical pieces to extract, scoped to exactly this one function; or (b) "FALSE POSITIVE" / "UNCERTAIN" + one short paragraph (2-4 sentences) explaining why, grounded in the function snippet shown. There is deliberately NO diff, no code, and no "steps" here -- do NOT reject the draft for lacking them, and do NOT reject a Solution paragraph for "describing an extraction refactor rather than the actual code" (describing the decomposition IS the deliverable). REJECT only if: the draft refuses to reach a verdict ("a human should look", "cannot determine"); a GENUINE verdict\'s candidate block is malformed or missing a required section; a GENUINE verdict\'s Solution proposes something broader than this one function; or a FALSE POSITIVE verdict\'s stated reason actually contradicts the snippet shown (e.g. claims the function is short when the snippet clearly runs past the threshold).',
     reviewCompletenessQuestion: 'Does the draft reach a decisive GENUINE-or-FALSE-POSITIVE verdict (not "uncertain"/"needs a human") and, if GENUINE, is it followed by a well-formed `### AC-NNN` candidate block whose Solution is a decomposition scoped to exactly this one function?',
+    // 2026-09-05: catches a Solution paragraph that invents a helper name/signature/call
+    // relationship contradicting the real flagged-function snippet -- see
+    // function-length-grounding-check.js's own header for the incident (8 of 9 blocked
+    // tasks shared this exact shape). Routes into the same blockedStage:'review' path a
+    // real review rejection takes, before a doomed draft burns a full vote round.
+    postImplementCheck: runGroundingCheck,
     // 2026-08-31: the apply is a low-risk additive candidate-doc append, not real code --
     // commit straight to main, no throwaway agent/<id> branch to hand-merge. Matches the
     // sibling candidate-generating review sources (observability_review, performance_review,
