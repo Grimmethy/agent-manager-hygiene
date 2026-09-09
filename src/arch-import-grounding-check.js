@@ -32,6 +32,8 @@
 // Kill switch: AGENT_MANAGER_ARCH_IMPORT_GROUNDING_CHECK=false.
 
 const { call: localCall } = require('agent-manager/src/local-client.js');
+const { getConfig } = require('agent-manager/src/config.js');
+const { extractFilesLine, checkCitedPaths, formatFabricatedReason } = require('agent-manager/src/candidate-path-grounding.js');
 
 const GROUNDING_CHECK_MODEL = process.env.AGENT_MANAGER_ARCH_IMPORT_GROUNDING_MODEL || 'qwen2.5:3b';
 const GROUNDING_CHECK_NUM_CTX = 8192;
@@ -117,6 +119,18 @@ async function runGroundingCheck(task, implementResponse, { call = localCall, ma
   if (!isEnabled()) return { verdict: 'ok' };
   const text = String(implementResponse || '');
   if (!text.trim()) return { verdict: 'ok' }; // a legitimate "nothing applies" empty draft -- nothing to check
+
+  // Check 0 (concept-candidate-grounding-gate-3e9bec): the candidate's `Files:` line names
+  // a path that resolves NOWHERE in agent-manager (arch_import cites this repo's own files,
+  // so getConfig().repoRoot is the right target). Distinct "fabricated file path(s)" reason
+  // -> blocked-task-classifiers.js's `fabricated-file-path` classifier makes it
+  // NON-retryable (a blind redraft only re-invents it). Advisory: a getConfig() failure
+  // just skips it and falls through to the citation/semantic checks below.
+  try {
+    const { repoRoot, grepAllowedDirs } = getConfig();
+    const { fabricated: badPaths } = checkCitedPaths(extractFilesLine(text), repoRoot, grepAllowedDirs || []);
+    if (badPaths.length) return { verdict: 'ungrounded', reason: formatFabricatedReason(badPaths) };
+  } catch { /* can't resolve the repo -- fall through */ }
 
   const fabricated = checkFabricatedCitations(task, text);
   if (fabricated.length) return { verdict: 'ungrounded', reason: fabricated[0].detail };

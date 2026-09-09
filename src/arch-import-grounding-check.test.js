@@ -2,10 +2,32 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const {
   runGroundingCheck, checkFabricatedCitations, parseGroundingVerdict,
 } = require('./arch-import-grounding-check.js');
+
+// A throwaway repo + env so Check 0's getConfig()/checkFilePaths runs deterministically
+// regardless of how the suite was invoked. getConfig() reads process.env fresh each call.
+function withTmpRepo(fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aigc-'));
+  fs.mkdirSync(path.join(dir, 'src'));
+  fs.writeFileSync(path.join(dir, 'src', 'task-sources.js'), '// real\n');
+  const saved = {
+    root: process.env.AGENT_MANAGER_REPO_ROOT,
+    dirs: process.env.AGENT_MANAGER_GREP_DIRS,
+  };
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  process.env.AGENT_MANAGER_GREP_DIRS = 'src';
+  return Promise.resolve(fn(dir)).finally(() => {
+    if (saved.root === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = saved.root;
+    if (saved.dirs === undefined) delete process.env.AGENT_MANAGER_GREP_DIRS; else process.env.AGENT_MANAGER_GREP_DIRS = saved.dirs;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+}
 
 const REAL_FILE = {
   path: 'docs/adr/0019-deep-dive-pipeline.md',
@@ -67,6 +89,33 @@ test('parseGroundingVerdict parses GROUNDED and NOT_GROUNDED, treats noise as ok
 });
 
 // --- runGroundingCheck end-to-end (mocked model call) ------------------------------------
+
+test('Check 0: a Files: line naming a path that resolves nowhere -> "fabricated file path(s)" verdict, no model call', async () => {
+  await withTmpRepo(async () => {
+    let calls = 0;
+    const call = async () => { calls += 1; return { response: 'GROUNDED' }; };
+    const writeUp = [
+      '### AC-001 · Something',
+      'Strength: Strong',
+      'Files: src/task-sources.js, src/agent-manager/task-queue.js',
+      '',
+      'Problem: ...',
+    ].join('\n');
+    const r = await runGroundingCheck(task(), writeUp, { call });
+    assert.equal(r.verdict, 'ungrounded');
+    assert.match(r.reason, /^fabricated file path\(s\): src\/agent-manager\/task-queue\.js\b/);
+    assert.doesNotMatch(r.reason, /task-sources\.js/); // the real one is not named
+    assert.equal(calls, 0);
+  });
+});
+
+test('Check 0: a Files: line naming only real repo files does not fire (falls through)', async () => {
+  await withTmpRepo(async () => {
+    const call = async () => ({ response: 'GROUNDED' });
+    const r = await runGroundingCheck(task(), 'Files: src/task-sources.js\n\nProblem: real.', { call });
+    assert.deepEqual(r, { verdict: 'ok' });
+  });
+});
 
 test('runGroundingCheck catches a fabricated file path deterministically, no model call', async () => {
   let calls = 0;
