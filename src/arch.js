@@ -27,6 +27,7 @@ const {
 } = require('agent-manager/src/prompts.js');
 const { computePremiseEvidence, runPremiseCheck } = require('./arch-import-premise-check.js');
 const { runGroundingCheck: runArchImportGroundingCheck } = require('./arch-import-grounding-check.js');
+const { runGroundingCheck: runArchDiscoveryGroundingCheck } = require('./arch-discovery-grounding-check.js');
 
 // Review-gate guidance for the two arch generators, read by agent-manager's review-task.js
 // buildVerdictPrompt off source.reviewGuidance (ADR-0022 Stage A2: the plugin that defines
@@ -361,6 +362,10 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     directToMain: true, // low-risk additive candidate-doc append -- commit straight to main, no throwaway branch
     reviewGuidance: ARCH_DISCOVERY_REVIEW_GUIDANCE,
     reportClass: 'benefit', // a surfaced, human-reviewed architecture candidate is a real outcome (system-report.js)
+    // concept-candidate-grounding-gate-3e9bec: deterministic Check 0 on the write-up's
+    // Files: line -- a path that resolves nowhere in this repo is a fabrication a blind
+    // redraft only re-invents. arch_discovery had no post-implement check before this.
+    postImplementCheck: runArchDiscoveryGroundingCheck,
   });
   updateTaskSource('arch_discovery', { buildPlanPrompt: archDiscoveryPlanPrompt, buildImplementPrompt: archDiscoveryImplementPrompt });
 
