@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {
-  normalizeSnippet, suppressionKey, isSuppressed, recordSuppression, recordFalsePositiveIfVerdict, readRows, suppressionsPath,
+  normalizeSnippet, suppressionKey, isSuppressed, isClusterSuppressed, recordSuppression, recordFalsePositiveIfVerdict, readRows, suppressionsPath,
   recordInconclusiveReview, readAttemptRows, attemptsPath, MAX_INCONCLUSIVE_REVIEW_ATTEMPTS,
 } = require('./suppression-store.js');
 
@@ -21,6 +21,38 @@ test('record -> isSuppressed round-trips for the same construct', () => {
   const r = recordSuppression(dir, { rule: 'sync-io-in-loop', file: 'src/x.js', snippet, taskId: 't1' });
   assert.equal(r.recorded, true);
   assert.equal(isSuppressed(dir, 'sync-io-in-loop', snippet), true);
+});
+
+// isClusterSuppressed: coarser sibling of isSuppressed (2026-09-15, bd-1788764340728) --
+// catches a DIFFERENT finding, same rule, same directory as one already dismissed, which
+// isSuppressed's exact-snippet keying can never match.
+test('isClusterSuppressed is true for a different snippet in the same rule+directory once one sibling is suppressed', () => {
+  const dir = tmpDir();
+  recordSuppression(dir, { rule: 'silent-catch-block', file: 'src/a.js', snippet: 'try { x() } catch (e) {}', taskId: 't1' });
+
+  assert.equal(isClusterSuppressed(dir, 'silent-catch-block', 'src'), true);
+  // The individual finding is NOT suppressed by exact-snippet matching -- proves this is a
+  // genuinely different, additional signal, not a duplicate of isSuppressed.
+  assert.equal(isSuppressed(dir, 'silent-catch-block', 'try { y() } catch (e) {}'), false);
+});
+
+test('isClusterSuppressed is false for a different rule in the same directory', () => {
+  const dir = tmpDir();
+  recordSuppression(dir, { rule: 'silent-catch-block', file: 'src/a.js', snippet: 'try { x() } catch (e) {}', taskId: 't1' });
+  assert.equal(isClusterSuppressed(dir, 'sync-io-in-loop', 'src'), false);
+});
+
+test('isClusterSuppressed is false for the same rule in a different directory', () => {
+  const dir = tmpDir();
+  recordSuppression(dir, { rule: 'silent-catch-block', file: 'src/a.js', snippet: 'try { x() } catch (e) {}', taskId: 't1' });
+  assert.equal(isClusterSuppressed(dir, 'silent-catch-block', 'lib'), false);
+});
+
+test('isClusterSuppressed returns false (not throw) with no rule, no directory, or no suppression file yet', () => {
+  const dir = tmpDir();
+  assert.equal(isClusterSuppressed(dir, '', 'src'), false);
+  assert.equal(isClusterSuppressed(dir, 'silent-catch-block', ''), false);
+  assert.equal(isClusterSuppressed(dir, 'silent-catch-block', 'src'), false, 'no suppressions recorded yet');
 });
 
 test('suppression survives line-number drift and reindentation (key is content-hashed, not file:line)', () => {

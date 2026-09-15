@@ -80,6 +80,22 @@ function readSuppressionKeys(pipelineDir) {
   return new Set(readRows(pipelineDir).map((r) => r && r.key).filter(Boolean));
 }
 
+// Coarser sibling of isSuppressed (2026-09-15, brain-dump bd-1788764340728: "25
+// independent plan+implement+review cycles all converged on the identical false-positive
+// dismissal outcome"): isSuppressed only catches an EXACT snippet repeat, which does
+// nothing for 25 *different* catch blocks scattered across the same directory that are
+// all destined to get the same false-positive verdict for the same structural reason --
+// each one's own snippet is unique, so isSuppressed never matches until every single one
+// has separately burned its own review cycle. This asks a coarser question first: has ANY
+// finding for this rule anywhere in this directory already been dismissed? If so, treat a
+// fresh finding in the same (rule, directory) as very likely the same story rather than
+// spending a full cycle to re-confirm it. Reuses the existing suppression rows (keyed by
+// `file`, already recorded) -- no new storage, no new write path.
+function isClusterSuppressed(pipelineDir, rule, directory) {
+  if (!rule || !directory) return false;
+  return readRows(pipelineDir).some((r) => r && r.rule === rule && r.file && path.dirname(r.file) === directory);
+}
+
 // A finding with no snippet text (e.g. a repo-wide rule with no file/line) is never
 // suppressed through this path -- an all-whitespace key would match everything.
 function isSuppressed(pipelineDir, rule, snippet) {
@@ -251,6 +267,7 @@ module.exports = {
   readSuppressionKeys,
   readAttemptRows,
   isSuppressed,
+  isClusterSuppressed,
   recordSuppression,
   recordFalsePositiveIfVerdict,
   recordInconclusiveReview,
