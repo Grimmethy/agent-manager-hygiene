@@ -128,6 +128,31 @@ test('nextObservabilityReviewTask does not regenerate a duplicate for a task sit
   }
 });
 
+// 2026-09-15 (bd-1788764340728): isClusterSuppressed wiring -- a DIFFERENT finding, same
+// rule, same directory as one already dismissed as a false positive, is skipped even
+// though its own exact snippet was never itself suppressed (isSuppressed alone would not
+// catch this -- proven directly in suppression-store.test.js; this proves the real
+// generator actually applies it).
+test('nextObservabilityReviewTask skips a finding whose (rule, directory) cluster was already dismissed as a false positive elsewhere', () => {
+  const dir = makeObservabilityFixtureRepo();
+  writeObservabilityFinding(dir, 'a.js', 'try {\n  riskyA();\n} catch {}\n');
+  writeObservabilityFinding(dir, 'b.js', 'try {\n  riskyB();\n} catch {}\n');
+  const deps = freshDeps(dir);
+
+  const { result: first } = callNext(dir, deps);
+  assert.ok(first, 'first finding (a.js) produces a real task');
+  assert.equal(first.promptContext.file, 'a.js');
+
+  // Simulate a.js's review completing with a false-positive dismissal.
+  const { recordSuppression } = require('./suppression-store.js');
+  recordSuppression(dir, {
+    rule: 'silent-catch-block', file: 'a.js', snippet: first.promptContext.snippet, taskId: first.id,
+  });
+
+  const { result: second } = callNext(dir, deps);
+  assert.equal(second, null, 'b.js is a different snippet (never itself suppressed) but shares (rule, directory) with a.js -- must be skipped, not independently re-reviewed');
+});
+
 test('nextObservabilityReviewTask does not rescan within the rescan interval', () => {
   const dir = makeObservabilityFixtureRepo();
   writeObservabilityFinding(dir);

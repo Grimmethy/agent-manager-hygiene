@@ -28,7 +28,7 @@ const { scanProject, findSilentCatchBlocks } = require('./observability-scan.js'
 const { isLikelyMinified, windowFromContent } = require('./scan-utils.js');
 const { reconcileFlags } = require('./flag-store.js');
 const {
-  isSuppressed, recordSuppression, recordFalsePositiveIfVerdict, recordInconclusiveReview, classifyReviewOutcome,
+  isSuppressed, isClusterSuppressed, recordSuppression, recordFalsePositiveIfVerdict, recordInconclusiveReview, classifyReviewOutcome,
 } = require('./suppression-store.js');
 const { selectLowConfidenceBatch, parseDigestVerdicts, LOW_CONFIDENCE_CAP, LOW_CONFIDENCE_MODE } = require('./low-confidence-digest.js');
 
@@ -459,6 +459,15 @@ function nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, tas
 
     // A prior review already ruled this exact construct a false positive -- never re-ask.
     if (isSuppressed(pipelineDir, finding.rule, snippet)) continue;
+
+    // Coarser sibling (2026-09-15, bd-1788764340728): a prior review already dismissed
+    // SOME finding for this same rule in this same directory as a false positive, even
+    // though THIS finding's own exact snippet differs (a different catch block, same
+    // structural reason it's a non-issue) -- the isSuppressed check above can never catch
+    // this since it's keyed on exact snippet text. Skips the finding rather than paying
+    // for a full plan+implement+review cycle to re-derive a verdict the cluster has
+    // already, very likely, settled.
+    if (finding.file && isClusterSuppressed(pipelineDir, finding.rule, path.dirname(finding.file))) continue;
 
     return persistStaleAnd({
       id: taskId,
