@@ -64,14 +64,22 @@ test('findSilentCatchBlocks does NOT flag a catch with a block-comment-only body
   assert.equal(findSilentCatchBlocks(text, 'a.js').length, 0);
 });
 
-test('findSilentCatchBlocks does NOT flag `catch { return <literal> }` (deliberate fallback value)', () => {
-  assert.equal(findSilentCatchBlocks('try { a() } catch (e) {\n  return null;\n}\n', 'a.js').length, 0);
-  assert.equal(findSilentCatchBlocks('try { a() } catch {\n  return [];\n}\n', 'a.js').length, 0);
-  assert.equal(findSilentCatchBlocks('try { a() } catch {\n  return;\n}\n', 'a.js').length, 0);
-  assert.equal(findSilentCatchBlocks('try { a() } catch {\n  return false\n}\n', 'a.js').length, 0);
+test('findSilentCatchBlocks flags `catch { return <literal> }` at LOW confidence, not skipped entirely (2026-09-15)', () => {
+  // Previously hard-skipped as "a deliberate on-failure-default convention" -- that is
+  // exactly the shape of a real, confirmed bug (countRecentCompletions's
+  // `catch { return 0; }` masked a genuine unreadable-directory error as "0
+  // completions"). Still routed to LOW confidence (the same digest-batched triage
+  // `return someFallbackVar` already used), not full-priority -- see the confidence-tier
+  // tests below for that assertion; this test only confirms the finding now exists.
+  assert.equal(findSilentCatchBlocks('try { a() } catch (e) {\n  return null;\n}\n', 'a.js').length, 1);
+  assert.equal(findSilentCatchBlocks('try { a() } catch {\n  return [];\n}\n', 'a.js').length, 1);
+  assert.equal(findSilentCatchBlocks('try { a() } catch {\n  return;\n}\n', 'a.js').length, 1);
+  const f = findSilentCatchBlocks('try { a() } catch {\n  return false\n}\n', 'a.js');
+  assert.equal(f.length, 1);
+  assert.equal(f[0].confidence, 'low');
 });
 
-test('findSilentCatchBlocks still flags `catch { return someFallbackVar }` (identifier, not a literal)', () => {
+test('findSilentCatchBlocks flags `catch { return someFallbackVar }` (identifier, not a literal) -- unchanged', () => {
   assert.equal(findSilentCatchBlocks('try { a() } catch {\n  return cached;\n}\n', 'a.js').length, 1);
 });
 
@@ -148,9 +156,13 @@ test('findSilentCatchBlocks recognises widened error-surfacing tokens', () => {
   assert.equal(findSilentCatchBlocks("try { a() } catch (e) {\n  toast('failed: ' + e.message);\n}\n", 'a.js').length, 0);
 });
 
-test('findSilentExceptBlocks does NOT flag `except: return None` (deliberate fallback value)', () => {
-  assert.equal(findSilentExceptBlocks('try:\n    x()\nexcept Exception:\n    return None\n', 'a.py').length, 0);
-  assert.equal(findSilentExceptBlocks('try:\n    x()\nexcept Exception:\n    return\n', 'a.py').length, 0);
+test('findSilentExceptBlocks flags `except: return None` at LOW confidence, not skipped entirely (2026-09-15)', () => {
+  // Same reasoning as the JS-side test above -- this shape is a real, confirmed bug
+  // class, not a convention to hard-skip.
+  const f = findSilentExceptBlocks('try:\n    x()\nexcept Exception:\n    return None\n', 'a.py');
+  assert.equal(f.length, 1);
+  assert.equal(f[0].confidence, 'low');
+  assert.equal(findSilentExceptBlocks('try:\n    x()\nexcept Exception:\n    return\n', 'a.py').length, 1);
 });
 
 test('findSilentCatchBlocks does not flag a catch that logs the error', () => {
