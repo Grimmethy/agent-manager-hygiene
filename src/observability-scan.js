@@ -22,7 +22,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { listSourceFiles, isLikelyMinified, lineOfIndex, extractBraceBody, extractIndentedBlock, stripNonCode, isTestFile } = require('./scan-utils.js');
+const { listSourceFiles, isLikelyMinified, lineOfIndex, extractBraceBody, extractIndentedBlock, stripNonCode, isTestFile, isFindingInChangedRanges } = require('./scan-utils.js');
 
 const SCAN_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.py', '.go'];
 
@@ -326,8 +326,21 @@ function findMissingReservedAttributes(repoRoot, files) {
 // Scans one project (a clonePath, already onboarded elsewhere -- this script never
 // clones anything itself). Returns findings with projectSlug/scannedAt attached, ready
 // to append to queue/observability-flags.json.
-function scanProject(clonePath, projectSlug) {
-  const allFiles = listSourceFiles(clonePath, SCAN_EXTENSIONS);
+//
+// `changedRanges` (docs/diff-scoped-scan-proposal.md) is optional and default-off: when
+// omitted, this is byte-for-byte the same full-tree scan as before. When passed (a
+// scan-utils.js changedLineRanges() result), only files the diff touched are read at all,
+// and only findings inside the diff's own line ranges are kept -- everything else about
+// the rule logic is unchanged. findMissingReservedAttributes is a repo-wide existence
+// check with no single line to scope to a diff (a required attribute could live in a file
+// the diff never touched), so it's skipped entirely in changed-mode rather than run
+// against a partial file set, which could wrongly report "still missing."
+function scanProject(clonePath, projectSlug, { changedRanges } = {}) {
+  const allFiles = changedRanges
+    ? Object.keys(changedRanges)
+        .map((rel) => path.join(clonePath, rel))
+        .filter((f) => SCAN_EXTENSIONS.some((ext) => f.endsWith(ext)))
+    : listSourceFiles(clonePath, SCAN_EXTENSIONS);
   // One read+check per file, up front, so every rule below (silent-catch-block,
   // unguarded-loop, OTel naming, reserved-attribute) skips minified/bundled files the
   // same way instead of each needing its own guard -- see isLikelyMinified's own comment.
@@ -338,13 +351,14 @@ function scanProject(clonePath, projectSlug) {
   });
   const scannedAt = new Date().toISOString();
   const findings = [];
+  const keep = (f) => isFindingInChangedRanges(f, changedRanges);
 
   for (const file of files) {
     let text;
     try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
     const relPath = path.relative(clonePath, file).replace(/\\/g, '/');
-    findings.push(...findSilentCatchBlocks(text, relPath));
-    findings.push(...findUnguardedLoops(text, relPath));
+    findings.push(...findSilentCatchBlocks(text, relPath).filter(keep));
+    findings.push(...findUnguardedLoops(text, relPath).filter(keep));
   }
 
   if (hasOtelDependency(clonePath)) {
@@ -352,9 +366,9 @@ function scanProject(clonePath, projectSlug) {
       let text;
       try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
       const relPath = path.relative(clonePath, file).replace(/\\/g, '/');
-      findings.push(...findOtelNamingViolations(text, relPath));
+      findings.push(...findOtelNamingViolations(text, relPath).filter(keep));
     }
-    findings.push(...findMissingReservedAttributes(clonePath, files));
+    if (!changedRanges) findings.push(...findMissingReservedAttributes(clonePath, files));
   }
 
   return findings.map((f) => ({ ...f, projectSlug, scannedAt }));

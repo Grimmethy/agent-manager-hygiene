@@ -11,7 +11,8 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { extractBraceBody, extractIndentedBlock, leadingWhitespace, listSourceFiles, isLikelyMinified, lineOfIndex } = require('./scan-utils.js');
+const { execFileSync } = require('child_process');
+const { extractBraceBody, extractIndentedBlock, leadingWhitespace, listSourceFiles, isLikelyMinified, lineOfIndex, changedLineRanges, isFindingInChangedRanges } = require('./scan-utils.js');
 
 test('extractBraceBody returns the body between matching braces', () => {
   const text = 'function f() { return 1; }';
@@ -195,4 +196,88 @@ test('stripNonCode: real division is left alone', () => {
   const s = stripNonCode('const rate = total / count;\nfor (const x of xs) { await y(x); }');
   assert.ok(s.includes('total / count'), 'a / after an identifier stays as division');
   assert.ok(s.includes('for (const x of xs) { await y(x); }'), 'the following real loop is untouched');
+});
+
+// --- changedLineRanges / isFindingInChangedRanges (docs/diff-scoped-scan-proposal.md) --
+
+function makeGitRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scan-utils-diff-'));
+  const run = (args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' });
+  run(['init', '-q']);
+  run(['config', 'user.email', 'a@b.c']);
+  run(['config', 'user.name', 'a']);
+  return { dir, run };
+}
+
+test('changedLineRanges parses added lines from a real git diff into per-file ranges', () => {
+  const { dir, run } = makeGitRepo();
+  try {
+    fs.writeFileSync(path.join(dir, 'a.js'), 'line1\nline2\nline3\n');
+    run(['add', '.']);
+    run(['commit', '-q', '-m', 'base']);
+    const baseSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir }).toString().trim();
+
+    fs.writeFileSync(path.join(dir, 'a.js'), 'line1\nCHANGED\nline3\nnew4\n');
+    run(['add', '.']);
+    run(['commit', '-q', '-m', 'edit']);
+
+    const ranges = changedLineRanges(dir, `${baseSha}..HEAD`);
+    assert.ok(ranges, 'ranges should not be null for a real diff');
+    assert.ok(ranges['a.js'], 'a.js should be present');
+    // line2 changed (now line2) and line4 added -- both should be covered by some range.
+    const covers = (line) => ranges['a.js'].some(([s, e]) => line >= s && line <= e);
+    assert.ok(covers(2), 'the changed line is covered');
+    assert.ok(covers(4), 'the added line is covered');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('changedLineRanges returns null for a bogus range instead of throwing', () => {
+  const { dir, run } = makeGitRepo();
+  try {
+    fs.writeFileSync(path.join(dir, 'a.js'), 'x\n');
+    run(['add', '.']);
+    run(['commit', '-q', '-m', 'base']);
+    assert.equal(changedLineRanges(dir, 'not-a-real-sha..also-not-real'), null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('changedLineRanges returns null for a missing repoRoot or range', () => {
+  assert.equal(changedLineRanges(null, 'HEAD~1..HEAD'), null);
+  assert.equal(changedLineRanges('/tmp/whatever', null), null);
+});
+
+test('isFindingInChangedRanges: no changedRanges means unscoped -- always kept', () => {
+  assert.equal(isFindingInChangedRanges({ file: 'a.js', line: 5 }, null), true);
+});
+
+test('isFindingInChangedRanges: a repo-wide finding (line == null) is never diff-scopable', () => {
+  assert.equal(isFindingInChangedRanges({ file: 'a.js', line: null }, { 'a.js': [[1, 10]] }), false);
+});
+
+test('isFindingInChangedRanges: a finding in an untouched file is dropped', () => {
+  assert.equal(isFindingInChangedRanges({ file: 'b.js', line: 3 }, { 'a.js': [[1, 10]] }), false);
+});
+
+test('isFindingInChangedRanges: a finding line inside a changed range is kept', () => {
+  assert.equal(isFindingInChangedRanges({ file: 'a.js', line: 5 }, { 'a.js': [[1, 10]] }), true);
+});
+
+test('isFindingInChangedRanges: a finding line outside every changed range is dropped', () => {
+  assert.equal(isFindingInChangedRanges({ file: 'a.js', line: 50 }, { 'a.js': [[1, 10]] }), false);
+});
+
+test('isFindingInChangedRanges: lengthLines widens the check to the whole span (function-length-scan.js)', () => {
+  // Declaration line (1) predates the diff, but the diff touched line 20, inside the
+  // function's measured 30-line body -- should still count as "in the diff."
+  const finding = { file: 'a.js', line: 1, lengthLines: 30 };
+  assert.equal(isFindingInChangedRanges(finding, { 'a.js': [[20, 20]] }), true);
+});
+
+test('isFindingInChangedRanges: a finding whose whole span misses every changed range is dropped', () => {
+  const finding = { file: 'a.js', line: 1, lengthLines: 5 }; // spans lines 1-5
+  assert.equal(isFindingInChangedRanges(finding, { 'a.js': [[20, 20]] }), false);
 });

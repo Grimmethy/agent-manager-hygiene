@@ -12,6 +12,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('child_process');
 
 const SKIP_DIRS = new Set(['node_modules', '.git', 'queue', 'instances', 'dist', 'build', 'coverage', 'venv', '.venv', '__pycache__', 'vendor']);
 
@@ -307,6 +308,81 @@ function extractIndentedBlock(text, headerStartIndex) {
   return { body, endIndex: endIndex - 1, lineCount: lastRealLine - headerLineIdx + 1 };
 }
 
+// --- Diff-scoped scanning (docs/diff-scoped-scan-proposal.md) -------------------------
+//
+// change-review.js already solved git-diff-since-a-cursor plumbing for a different
+// purpose (LLM correctness review of each merged commit); this is the second consumer,
+// for the deterministic scanners' optional "only findings inside what actually changed"
+// mode. Kept minimal on purpose -- no cursor/branch-resolution logic here, callers pass an
+// already-resolved `sinceSha`/`mainBranch` (change-review.js's own resolveMainBranch /
+// cursor store already exist for that and are not duplicated here).
+
+function gitCapture(repoRoot, args) {
+  try {
+    return execFileSync('git', ['-C', repoRoot, ...args], {
+      encoding: 'utf8',
+      timeout: 15000,
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    });
+  } catch {
+    return '';
+  }
+}
+
+// Parses `git diff --unified=0` output into { relPath: [[startLine, endLine], ...] },
+// one entry per hunk, covering only lines present on the POST-diff (+) side -- a pure
+// deletion (`+0,0` / no `+` count) has no line number in the new file to scope a finding
+// to and is skipped. `git diff --unified=0` is used (not the default 3-line context) so a
+// hunk's line numbers describe exactly what changed, nothing either side of it.
+function parseUnifiedZeroDiff(diffText) {
+  const ranges = {};
+  let currentFile = null;
+  for (const line of diffText.split('\n')) {
+    const fileMatch = line.match(/^\+\+\+ b\/(.+)$/);
+    if (fileMatch) { currentFile = fileMatch[1]; continue; }
+    const hunkMatch = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/);
+    if (hunkMatch && currentFile) {
+      const start = Number(hunkMatch[1]);
+      const count = hunkMatch[2] !== undefined ? Number(hunkMatch[2]) : 1;
+      if (count === 0) continue; // pure deletion on this side -- nothing to scope to
+      if (!ranges[currentFile]) ranges[currentFile] = [];
+      ranges[currentFile].push([start, start + count - 1]);
+    }
+  }
+  return ranges;
+}
+
+// `range` is a plain git revision range (e.g. "abc123..origin/main"). Returns null on any
+// git failure or an empty diff, so a caller can tell "nothing changed / git failed" (null,
+// meaning "don't scope, or skip" -- caller's choice) apart from "changed but touched no
+// scannable file" ({}, meaning "scope to nothing").
+function changedLineRanges(repoRoot, range) {
+  if (!repoRoot || !range) return null;
+  const diffText = gitCapture(repoRoot, ['diff', '--unified=0', '--no-color', range, '--']);
+  if (!diffText) return null;
+  return parseUnifiedZeroDiff(diffText);
+}
+
+// True when `finding` (a { file, line, lengthLines? } shape every scanner's findings
+// already have) falls inside `changedRanges`. `lengthLines` (function-length-scan.js's
+// measured body span) widens the check to the finding's whole span, not just its start
+// line, so a function whose DECLARATION line predates the diff but whose BODY grew past
+// the threshold because of an edit inside it still counts as "in the diff." A finding with
+// `line == null` (a repo-wide check with no single line to scope, e.g.
+// observability-scan.js's findMissingReservedAttributes) is never diff-scopable and
+// returns false -- callers that produce such findings must skip them entirely in
+// changed-mode rather than rely on this to filter them out.
+function isFindingInChangedRanges(finding, changedRanges) {
+  if (!changedRanges) return true; // not scoped -- caller isn't running in diff mode
+  if (finding.line == null) return false;
+  const fileRanges = changedRanges[finding.file];
+  if (!fileRanges) return false;
+  const endLine = finding.line + (finding.lengthLines ? finding.lengthLines - 1 : 0);
+  return fileRanges.some(([s, e]) => finding.line <= e && endLine >= s);
+}
+
 module.exports = {
   listSourceFiles,
   isLikelyMinified,
@@ -319,4 +395,6 @@ module.exports = {
   windowFromContent,
   MINIFIED_LINE_LENGTH_THRESHOLD,
   SKIP_DIRS,
+  changedLineRanges,
+  isFindingInChangedRanges,
 };

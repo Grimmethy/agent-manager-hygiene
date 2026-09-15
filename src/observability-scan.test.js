@@ -297,3 +297,46 @@ test('scanProject runs the OTel-only rules when the project depends on an OpenTe
   assert.ok(rules.includes('otel-naming-convention'));
   assert.ok(rules.includes('missing-reserved-attribute'));
 });
+
+// --- changedRanges (docs/diff-scoped-scan-proposal.md) ---------------------------------
+
+test('scanProject with changedRanges only scans files present in the ranges', () => {
+  const repoRoot = makeTempRepo();
+  writeFixture(repoRoot, 'package.json', JSON.stringify({ dependencies: {} }));
+  writeFixture(repoRoot, 'touched.js', 'try {\n  risky();\n} catch {}\n');
+  writeFixture(repoRoot, 'untouched.js', 'try {\n  risky();\n} catch {}\n');
+
+  const findings = scanProject(repoRoot, 'test-project', { changedRanges: { 'touched.js': [[1, 5]] } });
+  assert.deepEqual(findings.map((f) => f.file), ['touched.js']);
+});
+
+test('scanProject with changedRanges drops a finding outside the diff even in a scanned file', () => {
+  const repoRoot = makeTempRepo();
+  writeFixture(repoRoot, 'package.json', JSON.stringify({ dependencies: {} }));
+  // silent-catch-block is on line 5; the "changed" range only covers lines 1-2.
+  writeFixture(repoRoot, 'a.js', 'const x = 1;\nconst y = 2;\ntry {\n  risky();\n} catch {}\n');
+
+  const findings = scanProject(repoRoot, 'test-project', { changedRanges: { 'a.js': [[1, 2]] } });
+  assert.equal(findings.length, 0);
+});
+
+test('scanProject with changedRanges skips the repo-wide missing-reserved-attribute check entirely', () => {
+  const repoRoot = makeTempRepo();
+  writeFixture(repoRoot, 'package.json', JSON.stringify({ dependencies: { '@opentelemetry/api': '^1.0.0' } }));
+  writeFixture(repoRoot, 'app.js', "span.setAttribute('Bad.Name', 1);\n");
+
+  const findings = scanProject(repoRoot, 'test-project', { changedRanges: { 'app.js': [[1, 1]] } });
+  const rules = findings.map((f) => f.rule);
+  assert.ok(rules.includes('otel-naming-convention'), 'per-line OTel rule still runs, scoped to the diff');
+  assert.equal(rules.includes('missing-reserved-attribute'), false, 'repo-wide check is skipped in changed-mode');
+});
+
+test('scanProject with no changedRanges is unchanged (byte-for-byte the full-tree scan)', () => {
+  const repoRoot = makeTempRepo();
+  writeFixture(repoRoot, 'package.json', JSON.stringify({ dependencies: {} }));
+  writeFixture(repoRoot, 'a.js', 'try {\n  risky();\n} catch {}\n');
+
+  const withoutOpt = scanProject(repoRoot, 'test-project');
+  const withEmptyOpt = scanProject(repoRoot, 'test-project', {});
+  assert.deepEqual(withoutOpt.map((f) => f.rule), withEmptyOpt.map((f) => f.rule));
+});

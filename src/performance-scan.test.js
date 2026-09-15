@@ -68,6 +68,32 @@ test('scanProject combines loop and clone findings across scanned files', () => 
   }
 });
 
+// --- changedRanges (docs/diff-scoped-scan-proposal.md) ---------------------------------
+
+test('scanProject with changedRanges only scans files present in the ranges', () => {
+  const os = require('os');
+  const path = require('path');
+  const fs = require('fs');
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'performance-scan-diff-test-'));
+  fs.writeFileSync(path.join(repoRoot, 'touched.js'), 'for (const f of files) {\n  fs.readFileSync(f);\n}\n');
+  fs.writeFileSync(path.join(repoRoot, 'untouched.js'), 'for (const f of files) {\n  fs.readFileSync(f);\n}\n');
+
+  const findings = scanProject(repoRoot, 'test-project', { changedRanges: { 'touched.js': [[1, 3]] } });
+  assert.deepEqual(findings.map((f) => f.file), ['touched.js']);
+});
+
+test('scanProject with changedRanges drops a finding outside the diff even in a scanned file', () => {
+  const os = require('os');
+  const path = require('path');
+  const fs = require('fs');
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'performance-scan-diff-test-'));
+  // the loop (and its finding) sits on lines 3-5; the "changed" range only covers 1-2.
+  fs.writeFileSync(path.join(repoRoot, 'a.js'), 'const x = 1;\nconst y = 2;\nfor (const f of files) {\n  fs.readFileSync(f);\n}\n');
+
+  const findings = scanProject(repoRoot, 'test-project', { changedRanges: { 'a.js': [[1, 2]] } });
+  assert.equal(findings.length, 0);
+});
+
 // --- Python -------------------------------------------------------------------------
 
 test('findPyLoopBodyIssues flags a blocking subprocess call inside a for loop', () => {

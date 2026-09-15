@@ -157,3 +157,35 @@ test('scanProject walks real files, skips minified ones, and attaches projectSlu
   assert.equal(findings[0].projectSlug, 'test-project');
   assert.ok(findings[0].scannedAt);
 });
+
+// --- changedRanges (docs/diff-scoped-scan-proposal.md) ---------------------------------
+
+test('scanProject with changedRanges keeps a finding whose body (not declaration line) overlaps the diff', () => {
+  const prevThreshold = process.env.AGENT_MANAGER_MAX_FUNCTION_LINES;
+  process.env.AGENT_MANAGER_MAX_FUNCTION_LINES = '10';
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'function-length-scan-diff-test-'));
+  // function declared on line 1, body runs long -- the "changed" range only covers a line
+  // deep inside the body, nowhere near the declaration line itself.
+  fs.writeFileSync(path.join(dir, 'real.js'), `function tooLong() {\n${makeBody(12)}\n}\n`);
+
+  const findings = scanProject(dir, 'test-project', { changedRanges: { 'real.js': [[8, 8]] } });
+  if (prevThreshold == null) delete process.env.AGENT_MANAGER_MAX_FUNCTION_LINES;
+  else process.env.AGENT_MANAGER_MAX_FUNCTION_LINES = prevThreshold;
+
+  assert.equal(findings.length, 1, 'lengthLines widening should still catch this as in-diff');
+  assert.equal(findings[0].file, 'real.js');
+});
+
+test('scanProject with changedRanges drops a long function entirely outside the diff', () => {
+  const prevThreshold = process.env.AGENT_MANAGER_MAX_FUNCTION_LINES;
+  process.env.AGENT_MANAGER_MAX_FUNCTION_LINES = '10';
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'function-length-scan-diff-test-'));
+  fs.writeFileSync(path.join(dir, 'real.js'), `function tooLong() {\n${makeBody(12)}\n}\n`);
+  fs.writeFileSync(path.join(dir, 'other.js'), `function short() {\n${makeBody(2)}\n}\n`);
+
+  const findings = scanProject(dir, 'test-project', { changedRanges: { 'other.js': [[1, 4]] } });
+  if (prevThreshold == null) delete process.env.AGENT_MANAGER_MAX_FUNCTION_LINES;
+  else process.env.AGENT_MANAGER_MAX_FUNCTION_LINES = prevThreshold;
+
+  assert.equal(findings.length, 0, 'real.js was not in changedRanges at all, so it is never even read');
+});

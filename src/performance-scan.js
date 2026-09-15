@@ -16,7 +16,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { extractBraceBody, extractIndentedBlock, listSourceFiles, lineOfIndex, isLikelyMinified, stripNonCode, isTestFile } = require('./scan-utils.js');
+const { extractBraceBody, extractIndentedBlock, listSourceFiles, lineOfIndex, isLikelyMinified, stripNonCode, isTestFile, isFindingInChangedRanges } = require('./scan-utils.js');
 
 const SCAN_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.py'];
 const LOOP_START_RE = /\bfor\s*\([^)]*\)\s*\{|\bwhile\s*\([^)]*\)\s*\{/g;
@@ -143,11 +143,17 @@ function findJsonDeepCloneAntipattern(text, relPath) {
 // clones anything itself). Returns findings with projectSlug/scannedAt attached, ready
 // to append to queue/performance-flags.json. Same shape as observability-scan.js's
 // scanProject on purpose -- task-sources.js's nextPerformanceReviewTask consumes it
-// identically to nextObservabilityReviewTask's own scanProject call.
-function scanProject(clonePath, projectSlug) {
-  const files = listSourceFiles(clonePath, SCAN_EXTENSIONS);
+// identically to nextObservabilityReviewTask's own scanProject call, changedRanges
+// (docs/diff-scoped-scan-proposal.md) included: optional, default-off, same contract.
+function scanProject(clonePath, projectSlug, { changedRanges } = {}) {
+  const files = changedRanges
+    ? Object.keys(changedRanges)
+        .map((rel) => path.join(clonePath, rel))
+        .filter((f) => SCAN_EXTENSIONS.some((ext) => f.endsWith(ext)))
+    : listSourceFiles(clonePath, SCAN_EXTENSIONS);
   const scannedAt = new Date().toISOString();
   const findings = [];
+  const keep = (f) => isFindingInChangedRanges(f, changedRanges);
 
   for (const file of files) {
     let text;
@@ -158,8 +164,8 @@ function scanProject(clonePath, projectSlug) {
     // comment for the live-confirmed repeat-offender queue/blocked/ backlog this fixes).
     if (isLikelyMinified(text)) continue;
     const relPath = path.relative(clonePath, file).replace(/\\/g, '/');
-    findings.push(...findLoopBodyIssues(text, relPath));
-    findings.push(...findJsonDeepCloneAntipattern(text, relPath));
+    findings.push(...findLoopBodyIssues(text, relPath).filter(keep));
+    findings.push(...findJsonDeepCloneAntipattern(text, relPath).filter(keep));
   }
 
   return findings.map((f) => ({ ...f, projectSlug, scannedAt }));

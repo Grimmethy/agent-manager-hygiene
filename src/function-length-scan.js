@@ -25,7 +25,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { extractBraceBody, extractIndentedBlock, listSourceFiles, isLikelyMinified, lineOfIndex } = require('./scan-utils.js');
+const { extractBraceBody, extractIndentedBlock, listSourceFiles, isLikelyMinified, lineOfIndex, isFindingInChangedRanges } = require('./scan-utils.js');
 
 const SCAN_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.py'];
 
@@ -130,12 +130,22 @@ function findLongPythonFunctions(text, relPath, threshold = maxFunctionLines()) 
 // mutates anything). Returns findings with projectSlug/scannedAt attached, ready to
 // append to a persistent flags file, same shape observability-scan.js's own scanProject
 // returns. JS/TS files go through findLongFunctions (brace-matched), .py files through
-// findLongPythonFunctions (indentation-matched).
-function scanProject(clonePath, projectSlug) {
-  const allFiles = listSourceFiles(clonePath, SCAN_EXTENSIONS);
+// findLongPythonFunctions (indentation-matched). `changedRanges`
+// (docs/diff-scoped-scan-proposal.md) is optional and default-off; when passed, a
+// finding's whole measured span (`lengthLines`) is checked against the diff, not just its
+// declaration line -- a function whose body grew past the threshold because of an edit
+// inside it still counts as "in the diff" even if the `function`/`def` line itself
+// predates it (see isFindingInChangedRanges's own comment).
+function scanProject(clonePath, projectSlug, { changedRanges } = {}) {
+  const allFiles = changedRanges
+    ? Object.keys(changedRanges)
+        .map((rel) => path.join(clonePath, rel))
+        .filter((f) => SCAN_EXTENSIONS.some((ext) => f.endsWith(ext)))
+    : listSourceFiles(clonePath, SCAN_EXTENSIONS);
   const scannedAt = new Date().toISOString();
   const findings = [];
   const threshold = maxFunctionLines();
+  const keep = (f) => isFindingInChangedRanges(f, changedRanges);
 
   for (const file of allFiles) {
     let text;
@@ -143,7 +153,7 @@ function scanProject(clonePath, projectSlug) {
     if (isLikelyMinified(text)) continue;
     const relPath = path.relative(clonePath, file).replace(/\\/g, '/');
     const finder = file.endsWith('.py') ? findLongPythonFunctions : findLongFunctions;
-    findings.push(...finder(text, relPath, threshold));
+    findings.push(...finder(text, relPath, threshold).filter(keep));
   }
 
   return findings.map((f) => ({ ...f, projectSlug, scannedAt }));
