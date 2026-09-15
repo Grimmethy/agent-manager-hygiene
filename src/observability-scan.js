@@ -107,12 +107,6 @@ const SURFACES_ERROR_RE = /throw|console\.|log(ger|ging)?\.|\.error\(|Error\(|ra
 // an empty JS catch block.
 const PY_EMPTY_EXCEPT_RE = /^(?:pass|\.\.\.)$/;
 
-// A catch/except body that is exactly `return <simple literal>` (or a bare `return`) is a
-// deliberate "on failure, produce this default value" convention -- not an error that
-// silently vanished. Scoped to LITERALS only: `return someFallbackVar` is a judgement
-// call this scanner deliberately leaves to the review stage.
-const JS_SIMPLE_RETURN_RE = /^return(\s+(null|undefined|false|true|\[\s*\]|\{\s*\}|0|-1|''|""|``))?\s*;?$/;
-const PY_SIMPLE_RETURN_RE = /^return(\s+(None|False|True|\[\s*\]|\{\s*\}|0|-1|''|""))?$/;
 
 // The RAW body (before stripComments) is non-empty but strips to nothing -> it is
 // exclusively comment(s): a documented, deliberate no-op, not a silent swallow. (JS only;
@@ -144,9 +138,17 @@ function findSilentCatchBlocks(text, relPath) {
     const stripped = stripComments(body);
     // A body that is exclusively comment(s) is a documented, deliberate no-op.
     if (isCommentOnlyBody(body, stripped)) continue;
-    // `catch { return null }` / bare `return;` etc. -- a deliberate "failure -> default
-    // value" convention, not a vanished error.
-    if (JS_SIMPLE_RETURN_RE.test(stripped)) continue;
+    // `catch { return <literal>; }` / bare `return;` etc. used to be skipped entirely
+    // here as "a deliberate on-failure-default convention, not a vanished error" -- but
+    // that convention is exactly the shape of a real, repeatedly-confirmed bug class
+    // (2026-09-15: countRecentCompletions's `catch { return 0; }` masked a genuine
+    // unreadable-directory error as "0 completions," identical to the healthy-quiet-
+    // pipeline case; its sibling countPending had the same shape before AC-57 fixed it).
+    // classifyCatchConfidence's own RETURN_RE branch already exists to route ANY
+    // return-shaped body (this literal case included) to LOW confidence -- the same
+    // digest-batched triage low-confidence-digest.js already runs for `return
+    // someFallbackVar` -- so no new noise-control mechanism is needed; this was just
+    // unreachable dead code sitting in front of it. Falls through to that classification.
     if (stripped.length === 0 || !SURFACES_ERROR_RE.test(stripped)) {
       const startLine = lineOfIndex(text, m.index);
       const confidence = classifyCatchConfidence({
@@ -185,8 +187,10 @@ function findSilentExceptBlocks(text, relPath) {
     // body's first line is the `except ...:` header itself -- judge only the block body.
     const bodyOnly = block.body.split('\n').slice(1).join('\n');
     const stripped = stripComments(bodyOnly);
-    // `except X: return None` / bare `return` -- deliberate "failure -> default value".
-    if (PY_SIMPLE_RETURN_RE.test(stripped)) continue;
+    // `except X: return None` / bare `return` -- same reasoning as the JS side above:
+    // this used to skip the finding outright, but that convention is exactly the shape
+    // of a real, confirmed bug class. Falls through to classifyCatchConfidence's
+    // RETURN_RE branch, which already routes any return-shaped body to LOW confidence.
     const isEmpty = stripped.length === 0 || PY_EMPTY_EXCEPT_RE.test(stripped);
     if (isEmpty || !SURFACES_ERROR_RE.test(stripped)) {
       const startLine = lineOfIndex(text, m.index);
