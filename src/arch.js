@@ -359,6 +359,15 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       return applyArchDiscoveryCandidates({ implementResponse, candidatesPath: archReviewCandidatesPath });
     },
     emptyApproval: true,
+    // 2026-09-17 (agent-manager's empty-approval-decision.js, needs-clarification
+    // bd-1788787323412): explicit opt-in marking that this source's real implement
+    // response is the shared "### AC-NNN" candidate-doc format (applyArchDiscoveryCandidates
+    // just above parses exactly this), so a non-empty response that still parses to zero
+    // candidates can be treated the same as an effectively-empty one -- deterministic
+    // approve/block, no wasted majority vote on a draft whose apply outcome is already
+    // knowable. Deliberately a SEPARATE flag from emptyApproval, not inferred from it --
+    // deep_dive/project_search are also emptyApproval but do NOT use this format.
+    candidateDocFormat: true,
     directToMain: true, // low-risk additive candidate-doc append -- commit straight to main, no throwaway branch
     reviewGuidance: ARCH_DISCOVERY_REVIEW_GUIDANCE,
     reportClass: 'benefit', // a surfaced, human-reviewed architecture candidate is a real outcome (system-report.js)
@@ -378,6 +387,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       return applyArchImportCandidate({ implementResponse, candidatesPath: archImportCandidatesPath, importCoveragePath, task });
     },
     emptyApproval: true,
+    candidateDocFormat: true, // see arch_discovery's own comment on this flag
     directToMain: true, // see arch_discovery
     reviewGuidance: ARCH_IMPORT_REVIEW_GUIDANCE,
     reportClass: 'benefit', // see arch_discovery
