@@ -182,3 +182,20 @@ test('reportClass: arch generators are benefit; observability/performance review
     assert.equal(fn({ implementResponse: 'nothing conclusive' }), 'unclear');
   }
 });
+
+// 2026-09-18 (brain-dump bd-1789602379616): observability_fix/performance_fix declare
+// premiseRecheckSource pointing back at their own sibling *_review source, and that
+// source must actually have deterministic-recheck rules registered (deterministic-
+// recheck.js's own register() call) -- a dangling pointer to an unregistered source would
+// make agent-manager's premise-recheck-decision.js silently no-op forever.
+test('observability_fix/performance_fix declare premiseRecheckSource pointing at a source with real deterministic-recheck rules', () => {
+  const registry = loadPluginFresh();
+  const { getDeterministicRecheck } = require('agent-manager/src/deterministic-recheck-registry.js');
+  for (const [fixName, reviewName] of [['observability_fix', 'observability_review'], ['performance_fix', 'performance_review']]) {
+    const fixEntry = registry.getRegisteredSource(fixName);
+    assert.equal(fixEntry.premiseRecheckSource, reviewName, `${fixName} must point premiseRecheckSource at ${reviewName}`);
+    const recheck = getDeterministicRecheck(reviewName);
+    assert.ok(recheck && recheck.perFileRules && Object.keys(recheck.perFileRules).length > 0,
+      `${reviewName} must have real perFileRules registered, or ${fixName}'s premiseRecheckSource is a dangling pointer`);
+  }
+});

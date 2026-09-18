@@ -679,6 +679,17 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     // and no human. Without it, an empty draft is rejected -> retried -> blocked for a
     // human. See agent-manager's retired AC-25.
     candidateFulfillment: true,
+    // 2026-09-18 (brain-dump bd-1789602379616): every observability_fix candidate is, by
+    // construction, sourced from one of observability_review's own deterministic scanner
+    // rules -- so when a draft answers with the documented "FALSE POSITIVE" refusal (the
+    // finding no longer applies), re-running THAT rule set against the cited file's
+    // current content answers "is this refusal correct" deterministically, no model call.
+    // See agent-manager/src/premise-recheck-decision.js's own header for the full
+    // mechanism and why this needed an explicit opt-in field rather than being derived
+    // from the "_fix" source's own name (pipeline_forensics_fix/change_review_fix don't
+    // follow a "_fix" -> "_review" naming pattern). The rules themselves are already
+    // registered below via deterministic-recheck.js's own register() call.
+    premiseRecheckSource: 'observability_review',
     candidatesPath: () => getConfig().observabilityFixCandidatesPath,
     candidateDocTitle: '# Observability Fix Candidates',
   });

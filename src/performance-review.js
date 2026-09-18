@@ -326,6 +326,11 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       return nextCandidateFulfillmentTask(performanceFixCandidatesPath, 'performance_fix');
     },
     candidateFulfillment: true, // no emptyApproval -- see observability_fix
+    // 2026-09-18: same deterministic FALSE POSITIVE re-validation as observability_fix
+    // (see that source's own registration comment) -- performance_fix candidates are
+    // sourced from performance_review's own deterministic-recheck rules, registered
+    // below via deterministic-recheck.js's own register() call.
+    premiseRecheckSource: 'performance_review',
     candidatesPath: () => getConfig().performanceFixCandidatesPath,
     candidateDocTitle: '# Performance Fix Candidates',
   });
