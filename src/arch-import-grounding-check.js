@@ -33,7 +33,10 @@
 
 const { call: localCall } = require('agent-manager/src/local-client.js');
 const { getConfig } = require('agent-manager/src/config.js');
-const { extractFilesLine, checkCitedPaths, formatFabricatedReason } = require('agent-manager/src/candidate-path-grounding.js');
+const {
+  extractFilesLine, checkCitedPaths, formatFabricatedReason,
+  checkCitedSymbols, formatFabricatedSymbolsReason,
+} = require('agent-manager/src/candidate-path-grounding.js');
 
 const GROUNDING_CHECK_MODEL = process.env.AGENT_MANAGER_ARCH_IMPORT_GROUNDING_MODEL || 'qwen2.5:3b';
 const GROUNDING_CHECK_NUM_CTX = 8192;
@@ -128,8 +131,14 @@ async function runGroundingCheck(task, implementResponse, { call = localCall, ma
   // just skips it and falls through to the citation/semantic checks below.
   try {
     const { repoRoot, grepAllowedDirs } = getConfig();
-    const { fabricated: badPaths } = checkCitedPaths(extractFilesLine(text), repoRoot, grepAllowedDirs || []);
+    const { fabricated: badPaths, checked } = checkCitedPaths(extractFilesLine(text), repoRoot, grepAllowedDirs || []);
     if (badPaths.length) return { verdict: 'ungrounded', reason: formatFabricatedReason(badPaths) };
+    // Check 0b (same needs-clarification bd-1788994211702 as candidate-path-grounding.js's
+    // own header): the Files: line resolved to a real file, but does a backtick-quoted
+    // symbol the write-up cites actually appear in it? Deterministic grep, same
+    // non-retryable treatment as Check 0 above -- see checkCitedSymbols' own header.
+    const { fabricated: badSymbols } = checkCitedSymbols(text, checked);
+    if (badSymbols.length) return { verdict: 'ungrounded', reason: formatFabricatedSymbolsReason(badSymbols) };
   } catch { /* can't resolve the repo -- fall through */ }
 
   const fabricated = checkFabricatedCitations(task, text);

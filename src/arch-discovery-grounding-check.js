@@ -19,7 +19,10 @@
 // Kill switch: AGENT_MANAGER_ARCH_DISCOVERY_GROUNDING_CHECK=false.
 
 const { getConfig } = require('agent-manager/src/config.js');
-const { extractFilesLine, checkCitedPaths, formatFabricatedReason } = require('agent-manager/src/candidate-path-grounding.js');
+const {
+  extractFilesLine, checkCitedPaths, formatFabricatedReason,
+  checkCitedSymbols, formatFabricatedSymbolsReason,
+} = require('agent-manager/src/candidate-path-grounding.js');
 
 function isEnabled() {
   return process.env.AGENT_MANAGER_ARCH_DISCOVERY_GROUNDING_CHECK !== 'false';
@@ -34,8 +37,12 @@ async function runGroundingCheck(task, implementResponse) {
 
   try {
     const { repoRoot, grepAllowedDirs } = getConfig();
-    const { fabricated } = checkCitedPaths(extractFilesLine(text), repoRoot, grepAllowedDirs || []);
+    const { fabricated, checked } = checkCitedPaths(extractFilesLine(text), repoRoot, grepAllowedDirs || []);
     if (fabricated.length) return { verdict: 'ungrounded', reason: formatFabricatedReason(fabricated) };
+    // Check 0b -- see arch-import-grounding-check.js's own comment / candidate-path-
+    // grounding.js's checkCitedSymbols header for the full rationale.
+    const { fabricated: badSymbols } = checkCitedSymbols(text, checked);
+    if (badSymbols.length) return { verdict: 'ungrounded', reason: formatFabricatedSymbolsReason(badSymbols) };
   } catch { /* can't resolve the repo -- advisory, skip */ }
 
   return { verdict: 'ok' };

@@ -39,6 +39,25 @@ test('passes an all-real Files: line', async () => {
   });
 });
 
+test('flags a backtick-quoted symbol absent from the cited (real) file', async () => {
+  await withTmpRepo(async (dir) => {
+    fs.writeFileSync(path.join(dir, 'src', 'real.js'), 'function realFn() {}\n');
+    const text = [`### AC-007 · x`, `Strength: Strong`, `Files: src/real.js`, ``, 'Problem: `realFn` never calls `fakeHelper`.'].join('\n');
+    const r = await runGroundingCheck({ source: 'arch_discovery' }, text);
+    assert.equal(r.verdict, 'ungrounded');
+    assert.match(r.reason, /^fabricated symbol citation\(s\): `fakeHelper`/);
+  });
+});
+
+test('a create-mode symbol mention ("add a `newHelper`") is not flagged', async () => {
+  await withTmpRepo(async (dir) => {
+    fs.writeFileSync(path.join(dir, 'src', 'real.js'), 'function realFn() {}\n');
+    const text = [`### AC-007 · x`, `Strength: Strong`, `Files: src/real.js`, ``, 'Solution: add a `newHelper` function.'].join('\n');
+    const r = await runGroundingCheck({ source: 'arch_discovery' }, text);
+    assert.deepEqual(r, { verdict: 'ok' });
+  });
+});
+
 test('an empty ("no friction found") draft is ok', async () => {
   await withTmpRepo(async () => {
     assert.deepEqual(await runGroundingCheck({ source: 'arch_discovery' }, ''), { verdict: 'ok' });
