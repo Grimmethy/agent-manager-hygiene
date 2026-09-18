@@ -570,6 +570,66 @@ const CHANGE_REVIEW_COMPLETENESS_QUESTION = [
   'with per-hunk reasons)?',
 ].join('\n');
 
+// 2026-09-18 (brain-dump bd-1789601881616, "large blast radius" -- 6 of 12 currently-
+// blocked change-review-* tasks): capHunks() (this file's own function, above) truncates
+// an oversized diff by WHOLE hunks and appends a deterministic
+// "...[diff truncated: showing N of M hunks]" marker to the diff text itself -- which
+// flows into BOTH the plan prompt (PART 1's own "say UNKNOWN rather than guessing at code
+// you were not shown" instruction already tells the drafter to stop at hunk N) and this
+// review-gate's own unitDiff. But CHANGE_REVIEW_REVIEW_GUIDANCE/COMPLETENESS_QUESTION
+// above were static strings demanding coverage of "every changed hunk" unconditionally --
+// a bar that is structurally unsatisfiable once the diff itself is too big for one
+// context window, no matter how many times the task is redrafted. Confirmed live
+// (change-review-0289728, 5 draft attempts, all eventually blocked): the plan honestly
+// flagged hunks 7-13 as UNKNOWN/unreadable (never shown, not skipped), the implement
+// draft correctly reported a real, substantive finding for hunk 2 and said nothing about
+// the unreadable hunks (there was nothing TO say), and both reviewer votes rejected it
+// for lacking per-hunk reasoning on hunks it was structurally never given.
+//
+// Fix: read the SAME deterministic truncation marker capHunks() writes, directly off
+// task.promptContext.unitDiff (the real diff text review-task.js's buildVerdictPrompt
+// feeds the reviewer) -- not relying on the model to correctly transcribe or remember it
+// -- and when present, scope the coverage bar to the hunks actually shown (1..N), making
+// coverage of hunk N+1..M an explicit non-requirement instead of a silent, unsatisfiable
+// one. Returns the ORIGINAL, stricter guidance unchanged when the diff was never
+// truncated, so a normal-sized diff's existing "every hunk" bar is untouched.
+const DIFF_TRUNCATED_RE = /\[diff truncated: showing (\d+) of (\d+) hunks\]/;
+
+function truncatedHunkCounts(task) {
+  const unitDiff = (task && task.promptContext && task.promptContext.unitDiff) || '';
+  const m = DIFF_TRUNCATED_RE.exec(unitDiff);
+  return m ? { shown: Number(m[1]), total: Number(m[2]) } : null;
+}
+
+function changeReviewGuidanceFor(task) {
+  const counts = truncatedHunkCounts(task);
+  if (!counts) return CHANGE_REVIEW_REVIEW_GUIDANCE;
+  const { shown, total } = counts;
+  return `${CHANGE_REVIEW_REVIEW_GUIDANCE}\n\n${[
+    `TRUNCATION EXCEPTION: this diff was too large for one context window -- only hunks`,
+    `1 through ${shown} of ${total} total were ever shown to the drafter (the diff text itself`,
+    `ends with "...[diff truncated: showing ${shown} of ${total} hunks]"). The drafter cannot`,
+    `walk, and must NOT be rejected for failing to walk, hunk ${shown + 1} through ${total} --`,
+    'those hunks were never shown to it, not silently skipped. ACCEPT a verdict that covers',
+    `every hunk from 1 through ${shown} (per-hunk reasoning, or a clean "NO CORRECTNESS ISSUES"`,
+    `backed by per-hunk reasoning for hunks 1-${shown}). REJECT only for the same reasons listed`,
+    `above, scoped to hunks 1-${shown} -- never for lacking coverage of a hunk beyond ${shown}.`,
+  ].join('\n')}`;
+}
+
+function changeReviewCompletenessQuestionFor(task) {
+  const counts = truncatedHunkCounts(task);
+  if (!counts) return CHANGE_REVIEW_COMPLETENESS_QUESTION;
+  const { shown, total } = counts;
+  return [
+    `Does the draft show every hunk from 1 through ${shown} was walked (this diff was truncated`,
+    `to ${shown} of ${total} total hunks -- coverage beyond hunk ${shown} was never possible and`,
+    'must not be required), and is each reported finding backed by a concrete failing input',
+    `traceable in the given diff (or is "NO CORRECTNESS ISSUES" stated with per-hunk reasons`,
+    `for hunks 1-${shown})?`,
+  ].join('\n');
+}
+
 const CHANGE_REVIEW_FIX_REVIEW_GUIDANCE = [
   'This task implements ONE correctness-regression fix from a change_review finding (candidate',
   'body: Problem = Regression + Failure scenario; Solution = Fix sketch; Snippet = the',
@@ -594,8 +654,8 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     harnessSearch: 'archImport',
     reasoningTier: 'low',
     reportClass: 'housekeeping',
-    reviewGuidance: CHANGE_REVIEW_REVIEW_GUIDANCE,
-    reviewCompletenessQuestion: CHANGE_REVIEW_COMPLETENESS_QUESTION,
+    reviewGuidance: changeReviewGuidanceFor,
+    reviewCompletenessQuestion: changeReviewCompletenessQuestionFor,
   });
   updateTaskSource('change_review', {
     buildPlanPrompt: changeReviewPlanPrompt,
@@ -631,4 +691,8 @@ module.exports = {
   CHANGE_REVIEW_CONTEXT_BUDGET_CHARS,
   DIFF_LINE_CAP,
   DIFF_FILE_CAP,
+  changeReviewGuidanceFor,
+  changeReviewCompletenessQuestionFor,
+  CHANGE_REVIEW_REVIEW_GUIDANCE,
+  CHANGE_REVIEW_COMPLETENESS_QUESTION,
 };
