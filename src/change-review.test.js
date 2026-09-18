@@ -342,3 +342,56 @@ test('prompt builders carry the required scaffolding', () => {
   assert.match(impl, /NO CORRECTNESS ISSUES/);
   assert.match(impl, /Failure scenario:/);
 });
+
+// --- Truncated-diff review-gate exception (2026-09-18, bd-1789601881616) ---------------
+// capHunks() (used building task.promptContext.unitDiff when the real diff exceeds
+// budget) appends a deterministic "...[diff truncated: showing N of M hunks]" marker.
+// changeReviewGuidanceFor/changeReviewCompletenessQuestionFor read that marker straight
+// off the SAME unitDiff review-task.js's buildVerdictPrompt feeds the reviewer, and scope
+// the "every hunk" coverage bar down to the hunks actually shown.
+
+const {
+  changeReviewGuidanceFor, changeReviewCompletenessQuestionFor,
+  CHANGE_REVIEW_REVIEW_GUIDANCE, CHANGE_REVIEW_COMPLETENESS_QUESTION,
+} = require('./change-review.js');
+
+test('changeReviewGuidanceFor: a normal, non-truncated diff gets the ORIGINAL guidance, unchanged', () => {
+  const task = { promptContext: { unitDiff: '@@ -1 +1 @@\n-a\n+b\n' } };
+  assert.equal(changeReviewGuidanceFor(task), CHANGE_REVIEW_REVIEW_GUIDANCE);
+});
+
+test('changeReviewGuidanceFor: a truncated diff appends a scoped exception naming the exact shown/total hunk counts', () => {
+  const task = { promptContext: { unitDiff: '@@ -1 +1 @@\n-a\n+b\n...[diff truncated: showing 6 of 13 hunks]' } };
+  const g = changeReviewGuidanceFor(task);
+  assert.match(g, new RegExp(CHANGE_REVIEW_REVIEW_GUIDANCE.split('\n')[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'original guidance text must still be present, not replaced');
+  assert.match(g, /TRUNCATION EXCEPTION/);
+  assert.match(g, /hunks?\s*\n?\s*1 through 6/);
+  assert.match(g, /hunk 7 through 13/);
+  assert.match(g, /must NOT be rejected for failing to walk/i);
+});
+
+test('changeReviewGuidanceFor: no promptContext / no unitDiff at all -> falls back to the original guidance, no throw', () => {
+  assert.equal(changeReviewGuidanceFor({}), CHANGE_REVIEW_REVIEW_GUIDANCE);
+  assert.equal(changeReviewGuidanceFor({ promptContext: {} }), CHANGE_REVIEW_REVIEW_GUIDANCE);
+});
+
+test('changeReviewCompletenessQuestionFor: mirrors the same truncation-aware scoping as the guidance', () => {
+  const clean = { promptContext: { unitDiff: '@@ -1 +1 @@\n-a\n+b\n' } };
+  assert.equal(changeReviewCompletenessQuestionFor(clean), CHANGE_REVIEW_COMPLETENESS_QUESTION);
+
+  const truncated = { promptContext: { unitDiff: '...[diff truncated: showing 2 of 5 hunks]' } };
+  const q = changeReviewCompletenessQuestionFor(truncated);
+  assert.match(q, /1 through 2/);
+  assert.match(q, /truncated\s*\n?\s*to 2 of 5 total hunks/);
+  assert.match(q, /must not be required/i);
+});
+
+test('register smoke: change_review reviewGuidance/reviewCompletenessQuestion are truncation-aware functions, not static strings', () => {
+  const { getRegisteredSource } = freshPlugin(fs.mkdtempSync(path.join(os.tmpdir(), 'cr-trunc-reg-')));
+  const cr = getRegisteredSource('change_review');
+  assert.equal(typeof cr.reviewGuidance, 'function');
+  assert.equal(typeof cr.reviewCompletenessQuestion, 'function');
+  const truncatedTask = { promptContext: { unitDiff: '...[diff truncated: showing 1 of 9 hunks]' } };
+  assert.match(cr.reviewGuidance(truncatedTask), /TRUNCATION EXCEPTION/);
+  assert.match(cr.reviewCompletenessQuestion(truncatedTask), /1 through 1/);
+});
