@@ -117,6 +117,41 @@ test('Check 0: a Files: line naming only real repo files does not fire (falls th
   });
 });
 
+test('Check 0b: a Files: line resolving to a real file, but citing a symbol absent from it -> "fabricated symbol citation(s)" verdict, no model call', async () => {
+  await withTmpRepo(async (dir) => {
+    fs.writeFileSync(path.join(dir, 'src', 'task-sources.js'), 'function realFn() {}\n');
+    let calls = 0;
+    const call = async () => { calls += 1; return { response: 'GROUNDED' }; };
+    const writeUp = [
+      '### AC-001 · Something',
+      'Strength: Strong',
+      'Files: src/task-sources.js',
+      '',
+      'Problem: `realFn` never calls `ghostHelper` before returning.',
+    ].join('\n');
+    const r = await runGroundingCheck(task(), writeUp, { call });
+    assert.equal(r.verdict, 'ungrounded');
+    assert.match(r.reason, /^fabricated symbol citation\(s\): `ghostHelper`/);
+    assert.equal(calls, 0);
+  });
+});
+
+test('Check 0b: a create-mode symbol mention ("add a `newHelper`") does not fire', async () => {
+  await withTmpRepo(async (dir) => {
+    fs.writeFileSync(path.join(dir, 'src', 'task-sources.js'), 'function realFn() {}\n');
+    const call = async () => ({ response: 'GROUNDED' });
+    const writeUp = [
+      '### AC-001 · Something',
+      'Strength: Strong',
+      'Files: src/task-sources.js',
+      '',
+      'Solution: add a `newHelper` function alongside `realFn`.',
+    ].join('\n');
+    const r = await runGroundingCheck(task(), writeUp, { call });
+    assert.deepEqual(r, { verdict: 'ok' });
+  });
+});
+
 test('runGroundingCheck catches a fabricated file path deterministically, no model call', async () => {
   let calls = 0;
   const call = async () => { calls += 1; return { response: 'GROUNDED' }; };
