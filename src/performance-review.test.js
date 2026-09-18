@@ -209,6 +209,58 @@ test('performance_review genuine verdict -> apply writes a candidate -> performa
   assert.deepEqual(fixTask.promptContext.files, ['worker.js']);
 });
 
+// 2026-09-17 (agent-manager needs-clarification bd-1788740326297, defensive hardening):
+// mirrors observability_review's own STAMP_REVIEW_DISPOSITION tests exactly -- see that
+// file's tests of the same name/shape.
+test('performance_review apply stamps task.reviewDisposition (genuine on a real candidate)', () => {
+  const dir = makePerformanceFixtureRepo();
+  const candidatesPath = path.join(dir, 'PERFORMANCE_FIX_CANDIDATES.md');
+  process.env.AGENT_MANAGER_PERFORMANCE_FIX_CANDIDATES_PATH = candidatesPath;
+  const { getRegisteredSource } = freshPlugin(dir);
+  const task = { id: 'perf-x' };
+  const genuineImplementResponse = [
+    '### AC-002 · A real finding',
+    'Strength: Strong',
+    'Files: worker.js',
+    '',
+    'Problem:',
+    'p',
+    '',
+    'Solution:',
+    's',
+    '',
+    'Benefits:',
+    'b',
+  ].join('\n');
+  getRegisteredSource('performance_review').apply({ implementResponse: genuineImplementResponse, task });
+  assert.equal(task.reviewDisposition, 'genuine');
+});
+
+test('performance_review apply stamps task.reviewDisposition (dismissed on a FALSE POSITIVE verdict)', () => {
+  const dir = makePerformanceFixtureRepo();
+  const candidatesPath = path.join(dir, 'PERFORMANCE_FIX_CANDIDATES.md');
+  process.env.AGENT_MANAGER_PERFORMANCE_FIX_CANDIDATES_PATH = candidatesPath;
+  const { getRegisteredSource } = freshPlugin(dir);
+  const task = { id: 'perf-y', promptContext: { rule: 'sync-io-in-loop', file: 'a.js', line: 3, snippet: 'for (...) fs.readFileSync(f)' } };
+  getRegisteredSource('performance_review').apply({ implementResponse: 'FALSE POSITIVE. This is a one-time startup read, not a per-iteration cost.', task });
+  assert.equal(task.reviewDisposition, 'dismissed');
+});
+
+test('performance_review apply does not stamp reviewDisposition when AGENT_MANAGER_PERFORMANCE_REVIEW_DISPOSITION=false', () => {
+  const dir = makePerformanceFixtureRepo();
+  const candidatesPath = path.join(dir, 'PERFORMANCE_FIX_CANDIDATES.md');
+  process.env.AGENT_MANAGER_PERFORMANCE_FIX_CANDIDATES_PATH = candidatesPath;
+  process.env.AGENT_MANAGER_PERFORMANCE_REVIEW_DISPOSITION = 'false';
+  try {
+    const { getRegisteredSource } = freshPlugin(dir);
+    const task = { id: 'perf-z' };
+    getRegisteredSource('performance_review').apply({ implementResponse: 'FALSE POSITIVE. Not actually a problem.', task });
+    assert.equal(task.reviewDisposition, undefined);
+  } finally {
+    delete process.env.AGENT_MANAGER_PERFORMANCE_REVIEW_DISPOSITION;
+  }
+});
+
 // 2026-08-27, Grimmethy: "we should be looking for code content instead of the line
 // itself." The review task already carries the real code text it judged as
 // promptContext.snippet; apply must thread it through to applyArchDiscoveryCandidates so

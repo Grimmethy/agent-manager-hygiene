@@ -17,7 +17,17 @@ const path = require('path');
 const { scanProject } = require('./performance-scan.js');
 const { isLikelyMinified, windowFromContent } = require('./scan-utils.js');
 const { reconcileFlags } = require('./flag-store.js');
-const { isSuppressed, recordFalsePositiveIfVerdict, recordInconclusiveReview } = require('./suppression-store.js');
+const { isSuppressed, recordFalsePositiveIfVerdict, recordInconclusiveReview, classifyReviewOutcome } = require('./suppression-store.js');
+
+// 2026-09-17 (agent-manager needs-clarification bd-1788740326297, defensive hardening):
+// mirrors observability_review's own STAMP_REVIEW_DISPOSITION pattern -- performance_review
+// never stamped task.reviewDisposition at all, so task-disposition.js's structured step 0
+// (dismissed/inconclusive) could never fire for it; a false-positive dismissal only ever
+// got caught by that file's older, regex-based verdict-text fallback (step 4b). No live
+// incident of a genuine fix actually mis-showing as noop was found investigating this (git-
+// state fall-through already handles a real, unmerged fix correctly via pending-merge) --
+// this closes the gap for parity/precision with observability_review, not an active bug.
+const STAMP_REVIEW_DISPOSITION = process.env.AGENT_MANAGER_PERFORMANCE_REVIEW_DISPOSITION !== 'false';
 
 // The -before / +after window that becomes promptContext.snippet AND the suppression key.
 const SNIPPET_BEFORE = 4;
@@ -280,6 +290,11 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       // A verdict that produced no candidate and is not an explicit false positive:
       // track it, and after a few such tries stop the scanner re-emitting this construct.
       recordInconclusiveReview({ applyResult: res, implementResponse, task, pipelineDir });
+      // Structured outcome for task-disposition.js (see STAMP_REVIEW_DISPOSITION's own
+      // header) -- mutating `task` here is persisted by apply-task.js after apply() returns.
+      if (STAMP_REVIEW_DISPOSITION && task) {
+        task.reviewDisposition = classifyReviewOutcome({ applyResult: res, implementResponse });
+      }
       return res;
     },
     // 2026-08-31: thread the flagged code window into review grounding -- see
