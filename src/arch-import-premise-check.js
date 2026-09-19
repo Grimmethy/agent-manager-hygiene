@@ -21,6 +21,9 @@
 //
 // Kill switch: AGENT_MANAGER_ARCH_IMPORT_PREMISE_CHECK=false.
 
+const fs = require('fs');
+const path = require('path');
+
 const { call: localCall } = require('agent-manager/src/local-client.js');
 
 const PREMISE_CHECK_MODEL = process.env.AGENT_MANAGER_ARCH_IMPORT_PREMISE_MODEL || 'qwen2.5:3b';
@@ -44,6 +47,44 @@ function fetchedContentFor(task, relPath) {
   return hit ? String(hit.content || '') : null;
 }
 
+// --- Full-file verification of a "not found" verdict -------------------------------------
+// 2026-09-18 (AC-13 incident): fetchedFiles is a WINDOWED, truncated slice of each file,
+// not the whole file. A symbol absent from that window is NOT evidence it is absent from
+// the file -- AC-13 cited `arch_discovery` in python/dashboard/app.py (4,229 lines, 7 real
+// occurrences), the ~14KB window missed them, and this check declared a real citation
+// fabricated, blocked the task, and stamped the false verdict into promptContext.
+// premiseEvidence (which arch_import_review's reviewer prompt treats as "REJECT
+// regardless"). Same fix as agent-manager core's candidate-premise-check.js, kept as a
+// self-contained copy for the same reason this file exists at all: no cross-repo coupling.
+//   present on disk        -> not a contradiction (the snapshot window was the problem)
+//   absent from disk       -> a real contradiction
+//   unreadable + snapshot was truncated -> no verdict (cannot verify; never guess)
+//   unreadable + snapshot was complete  -> the original snapshot verdict stands
+const TRUNCATION_MARKER_RE = /\[truncated\]/;
+
+function isTruncatedSnapshot(content) {
+  return TRUNCATION_MARKER_RE.test(String(content || ''));
+}
+
+function defaultRepoRoots() {
+  try {
+    return require('agent-manager/src/accessible-roots.js').resolveAccessibleRoots();
+  } catch {
+    return [];
+  }
+}
+
+// -> full current text of relPath from the first root that has it, or null.
+function readCurrentFile(relPath, repoRoots) {
+  for (const root of repoRoots) {
+    try {
+      const full = path.join(root, relPath);
+      if (fs.existsSync(full)) return fs.readFileSync(full, 'utf8');
+    } catch { /* unreadable in this root -- try the next */ }
+  }
+  return null;
+}
+
 // --- Check 1: citation existence ---------------------------------------------------------
 // "cites `src/local-agentic-draft.js:63` as a location referencing `INFRA_FAILURE_PATTERN`,
 // but--" (arch-import-omnigent-ai-omnigent-28). A path citation followed, within the same
@@ -54,8 +95,9 @@ const CITED_PATH_RE = /`((?:src|python|scripts|lib|docs)\/[\w./-]+\.\w{1,5})(?::
 const CITATION_WINDOW_CHARS = 220;
 const CITED_SYMBOL_RE = /`([A-Za-z_][A-Za-z0-9_]{3,}\(?)`/g;
 
-function checkCitations(task, body) {
+function checkCitations(task, body, { repoRoots } = {}) {
   const contradictions = [];
+  const roots = repoRoots || defaultRepoRoots();
   if (!fetchedFilesOf(task).length) return contradictions;
   let pm;
   CITED_PATH_RE.lastIndex = 0;
@@ -70,6 +112,8 @@ function checkCitations(task, body) {
       const symbol = sm[1].replace(/\($/, '');
       if (symbol === relPath || relPath.endsWith(`/${symbol}`)) continue; // the path token itself
       if (!content.includes(symbol)) {
+        const onDisk = readCurrentFile(relPath, roots);
+        if (onDisk !== null ? onDisk.includes(symbol) : isTruncatedSnapshot(content)) continue;
         contradictions.push({
           kind: 'missing-citation',
           detail: `candidate cites \`${symbol}\` in ${relPath}, but that name does not appear anywhere in the real fetched content of ${relPath}`,
@@ -122,9 +166,9 @@ function checkUniformityClaim(task, body) {
 
 // { contradictions: [{kind, detail}] }. Pure, deterministic, no model, no I/O beyond
 // what's already in promptContext.fetchedFiles.
-function computePremiseEvidence(task) {
+function computePremiseEvidence(task, opts = {}) {
   const body = String((task.promptContext && task.promptContext.body) || '');
-  return { contradictions: [...checkCitations(task, body), ...checkUniformityClaim(task, body)] };
+  return { contradictions: [...checkCitations(task, body, opts), ...checkUniformityClaim(task, body)] };
 }
 
 // Whether the candidate makes ANY claim shape this module knows how to check at all --
@@ -167,10 +211,17 @@ function parsePremiseVerdict(text) {
 }
 
 // task, { call?, maybeLockedOn } -> { verdict: 'ok'|'invalid-premise', reason? }
-async function runPremiseCheck(task, { call = localCall, maybeLockedOn } = {}) {
+async function runPremiseCheck(task, { call = localCall, maybeLockedOn, repoRoots } = {}) {
   if (!isEnabled()) return { verdict: 'ok' };
   const pc = task.promptContext || {};
-  const evidence = pc.premiseEvidence || computePremiseEvidence(task);
+  // A persisted CLEAN result stands (nothing to refute). A persisted CONTRADICTION is
+  // re-verified rather than trusted: pc.premiseEvidence is stamped once at task-build time
+  // from the truncated snapshot (see the full-file verification note above), so a false
+  // contradiction there would otherwise be replayed on every retry forever.
+  const persisted = pc.premiseEvidence;
+  const evidence = persisted && persisted.contradictions && persisted.contradictions.length === 0
+    ? persisted
+    : computePremiseEvidence(task, { repoRoots });
   if (evidence.contradictions.length) {
     return { verdict: 'invalid-premise', reason: evidence.contradictions[0].detail };
   }
