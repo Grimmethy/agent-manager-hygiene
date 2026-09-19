@@ -152,6 +152,33 @@ function classifyUnit(nameStatus) {
 
 // --- prompt context -----------------------------------------------------------------
 
+// Bulk/generated data in a diff (2026-09-19, PF-Client-Portal a747d62): a commit added a 1.8 MB
+// single-line GeoJSON file plus a small real change to PropertyMap.tsx. capHunks() keeps WHOLE hunks
+// in order, so the giant JSON hunk (first in the diff) consumed the entire budget and the TSX hunks
+// never reached the model -- 8 drafts all said "no hunks visible", the review correctly rejected
+// them, and the task escalated to a human. sanitizeDiff() runs BEFORE the cap: it stubs out bulk data
+// files and truncates absurdly long lines, so the code that actually changed is always what's shown.
+const BULK_DATA_FILE_RE = /\.(?:json|geojson|ndjson|csv|tsv|svg|lock|map|snap|min\.[a-z]+)$/i;
+const BULK_SECTION_CHARS = 6000;   // a data-file diff section bigger than this is elided whole
+const MAX_DIFF_LINE_CHARS = 600;   // any single diff line longer than this (minified code, inline data) is cut
+
+function sanitizeDiff(diffText) {
+  if (!diffText) return diffText;
+  const sections = diffText.split(/^(?=diff --git )/m);
+  const out = [];
+  for (const sec of sections) {
+    const header = sec.match(/^diff --git a\/(.+?) b\/(.+)$/m);
+    const file = header ? header[2] : null;
+    if (file && BULK_DATA_FILE_RE.test(file) && sec.length > BULK_SECTION_CHARS) {
+      const lines = sec.split('\n').length;
+      out.push(`diff --git a/${file} b/${file}\n[bulk data file elided from review -- not a code change: ${file} (${sec.length.toLocaleString('en-US')} chars, ${lines} diff lines). Do not treat this as an unread hunk.]\n`);
+      continue;
+    }
+    out.push(sec.split('\n').map((l) => (l.length > MAX_DIFF_LINE_CHARS ? `${l.slice(0, MAX_DIFF_LINE_CHARS)} ...[+${l.length - MAX_DIFF_LINE_CHARS} chars cut]` : l)).join('\n'));
+  }
+  return out.join('');
+}
+
 function capHunks(diffText, budget) {
   if (diffText.length <= budget) return diffText;
   // Keep whole hunks (a hunk starts at a line beginning with "@@ " or a "diff --git" header)
@@ -170,7 +197,10 @@ function capHunks(diffText, budget) {
     kept.push(line);
     used += line.length + 1;
   }
-  return `${kept.join('\n')}\n...[diff truncated: showing ${hunks} of ${total} hunks]`;
+  let body = kept.join('\n');
+  // A single hunk larger than the whole budget is kept whole by the loop above; never let it through.
+  if (body.length > budget * 1.25) body = body.slice(0, budget);
+  return `${body}\n...[diff truncated: showing ${hunks} of ${total} hunks]`;
 }
 
 function smallFileContents(repoRoot, nameStatus) {
@@ -193,6 +223,7 @@ function smallFileContents(repoRoot, nameStatus) {
 
 function buildPromptContext(repoRoot, meta, nameStatus, diffText, mainBranch) {
   const files = nameStatus.map((f) => `${f.status}\t${f.path}`);
+  diffText = sanitizeDiff(diffText);
   let cappedDiff = capHunks(diffText, DIFF_BUDGET_CHARS);
   let small = smallFileContents(repoRoot, nameStatus);
   // Keep the whole promptContext under the deep_dive-style budget.
@@ -681,6 +712,9 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
 
 module.exports = {
   register,
+  sanitizeDiff,
+  capHunks,
+  buildPromptContext,
   nextChangeReviewTask,
   applyChangeReview,
   classifyUnit,
