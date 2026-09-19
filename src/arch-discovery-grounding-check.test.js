@@ -93,3 +93,21 @@ test('advisory: an unresolvable repo root is skipped, not thrown', async () => {
     if (saved !== undefined) process.env.AGENT_MANAGER_REPO_ROOT = saved;
   }
 });
+
+// Regression (2026-09-19): a multi-entry draft's later entry cites a symbol that is real in
+// ITS Files: file but not in the first entry's; the gate used to check every entry against the
+// first Files: line only and blocked the whole draft.
+test('multi-entry draft: each entry\'s symbols are checked against that entry\'s own Files:', async () => {
+  await withTmpRepo(async (dir) => {
+    fs.writeFileSync(path.join(dir, 'src', 'app.js'), 'function goToLogin() {}\n');
+    const text = [
+      '### AC-001 · a', 'Strength: Strong', 'Files: src/real.js', '', 'Problem: real.js is fine.', '',
+      '### AC-002 · b', 'Strength: Strong', 'Files: src/app.js', '', 'Problem: `goToLogin` is duplicated.',
+    ].join('\n');
+    assert.deepEqual(await runGroundingCheck({ source: 'arch_discovery' }, text), { verdict: 'ok' });
+    const bad = text.replace('`goToLogin` is', '`goToInvented` is');
+    const r = await runGroundingCheck({ source: 'arch_discovery' }, bad);
+    assert.equal(r.verdict, 'ungrounded');
+    assert.match(r.reason, /goToInvented/);
+  });
+});
