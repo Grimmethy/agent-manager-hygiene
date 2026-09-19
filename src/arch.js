@@ -120,14 +120,28 @@ function nextArchDiscoveryTask({ getConfig, taskIdExistsInQueue }) {
   }
   const rankedFiles = Object.entries(degreeByFile).sort((a, b) => b[1] - a[1]);
 
+  // A file that does not fit is SKIPPED, not a stop signal: the loop used to `break`, so a
+  // community whose top-ranked file alone exceeded the budget was handed zero files and the
+  // model correctly reported "nothing to review" (confirmed live 2026-09-19, PropertyForager
+  // community 2: PropertyDetailPanel.tsx, 24379 chars vs the 24000 budget). If NOTHING fits,
+  // fall back to the top-ranked readable file truncated to the budget rather than sending an
+  // empty list.
   const files = [];
   let budgetUsed = 0;
+  let topReadable = null;
   for (const [sourceFile, degree] of rankedFiles) {
     const content = readIfExists(path.join(repoRoot, sourceFile));
     if (content == null) continue; // skip unreadable/missing files, never throw
-    if (budgetUsed + content.length > ARCH_DISCOVERY_CONTEXT_BUDGET_CHARS) break;
+    if (!topReadable) topReadable = { path: sourceFile, degree, content };
+    if (budgetUsed + content.length > ARCH_DISCOVERY_CONTEXT_BUDGET_CHARS) continue;
     files.push({ path: sourceFile, degree, content });
     budgetUsed += content.length;
+  }
+  if (files.length === 0 && topReadable) {
+    files.push({
+      ...topReadable,
+      content: topReadable.content.slice(0, ARCH_DISCOVERY_CONTEXT_BUDGET_CHARS) + '\n/* ...truncated to fit the context budget... */\n',
+    });
   }
 
   const candidatesTail = readIfExists(archReviewCandidatesPath);
