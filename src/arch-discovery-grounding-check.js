@@ -21,7 +21,7 @@
 const { getConfig } = require('agent-manager/src/config.js');
 const {
   extractFilesLine, checkCitedPaths, formatFabricatedReason,
-  checkCitedSymbolsPerEntry, formatFabricatedSymbolsReason,
+  checkCitedSymbolsPerEntry, formatFabricatedSymbolsReason, symbolCheckBlocks, formatSymbolWarnings,
 } = require('agent-manager/src/candidate-path-grounding.js');
 
 function isEnabled() {
@@ -43,7 +43,12 @@ async function runGroundingCheck(task, implementResponse) {
     // grounding.js's checkCitedSymbols header for the full rationale.
     // Per entry: a draft holds several AC-NNN entries, each with its own Files: line.
     const { fabricated: badSymbols } = checkCitedSymbolsPerEntry(text, repoRoot, grepAllowedDirs || []);
-    if (badSymbols.length) return { verdict: 'ungrounded', reason: formatFabricatedSymbolsReason(badSymbols) };
+    if (badSymbols.length) {
+      // Warn, don't block (see candidate-path-grounding.js symbolCheckBlocks): a literal-text
+      // heuristic ended too many real drafts. The warning reaches the review votes.
+      if (symbolCheckBlocks()) return { verdict: 'ungrounded', reason: formatFabricatedSymbolsReason(badSymbols) };
+      return { verdict: 'ok', warnings: formatSymbolWarnings(badSymbols) };
+    }
   } catch { /* can't resolve the repo -- advisory, skip */ }
 
   return { verdict: 'ok' };

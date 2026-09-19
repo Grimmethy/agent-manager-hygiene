@@ -8,6 +8,14 @@ const path = require('path');
 
 const { runGroundingCheck } = require('./arch-discovery-grounding-check.js');
 
+async function withSymbolBlocking(value, fn) {
+  const saved = process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING;
+  if (value === undefined) delete process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING; else process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING = value;
+  try { return await fn(); } finally {
+    if (saved === undefined) delete process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING; else process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING = saved;
+  }
+}
+
 function withTmpRepo(fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'adgc-'));
   fs.mkdirSync(path.join(dir, 'src'));
@@ -39,14 +47,33 @@ test('passes an all-real Files: line', async () => {
   });
 });
 
-test('flags a backtick-quoted symbol absent from the cited (real) file', async () => {
-  await withTmpRepo(async (dir) => {
+test('a backtick-quoted symbol absent from the cited (real) file WARNS by default (verdict ok + warnings)', async () => {
+  await withSymbolBlocking(undefined, () => withTmpRepo(async (dir) => {
+    fs.writeFileSync(path.join(dir, 'src', 'real.js'), 'function realFn() {}\n');
+    const text = [`### AC-007 · x`, `Strength: Strong`, `Files: src/real.js`, ``, 'Problem: `realFn` never calls `fakeHelper`.'].join('\n');
+    const r = await runGroundingCheck({ source: 'arch_discovery' }, text);
+    assert.equal(r.verdict, 'ok');
+    assert.equal(r.warnings.length, 1);
+    assert.match(r.warnings[0], /`fakeHelper`/);
+  }));
+});
+
+test('the same absent symbol BLOCKS when AGENT_MANAGER_SYMBOL_CHECK_BLOCKING=true', async () => {
+  await withSymbolBlocking('true', () => withTmpRepo(async (dir) => {
     fs.writeFileSync(path.join(dir, 'src', 'real.js'), 'function realFn() {}\n');
     const text = [`### AC-007 · x`, `Strength: Strong`, `Files: src/real.js`, ``, 'Problem: `realFn` never calls `fakeHelper`.'].join('\n');
     const r = await runGroundingCheck({ source: 'arch_discovery' }, text);
     assert.equal(r.verdict, 'ungrounded');
     assert.match(r.reason, /^fabricated symbol citation\(s\): `fakeHelper`/);
-  });
+  }));
+});
+
+test('a fabricated FILE PATH still blocks in the default (warn) mode', async () => {
+  await withSymbolBlocking(undefined, () => withTmpRepo(async () => {
+    const r = await runGroundingCheck({ source: 'arch_discovery' }, wu('src/invented.js'));
+    assert.equal(r.verdict, 'ungrounded');
+    assert.match(r.reason, /^fabricated file path\(s\)/);
+  }));
 });
 
 test('a create-mode symbol mention ("add a `newHelper`") is not flagged', async () => {
@@ -104,10 +131,12 @@ test('multi-entry draft: each entry\'s symbols are checked against that entry\'s
       '### AC-001 · a', 'Strength: Strong', 'Files: src/real.js', '', 'Problem: real.js is fine.', '',
       '### AC-002 · b', 'Strength: Strong', 'Files: src/app.js', '', 'Problem: `goToLogin` is duplicated.',
     ].join('\n');
-    assert.deepEqual(await runGroundingCheck({ source: 'arch_discovery' }, text), { verdict: 'ok' });
-    const bad = text.replace('`goToLogin` is', '`goToInvented` is');
-    const r = await runGroundingCheck({ source: 'arch_discovery' }, bad);
-    assert.equal(r.verdict, 'ungrounded');
-    assert.match(r.reason, /goToInvented/);
+    await withSymbolBlocking('true', async () => {
+      assert.deepEqual(await runGroundingCheck({ source: 'arch_discovery' }, text), { verdict: 'ok' });
+      const bad = text.replace('`goToLogin` is', '`goToInvented` is');
+      const r = await runGroundingCheck({ source: 'arch_discovery' }, bad);
+      assert.equal(r.verdict, 'ungrounded');
+      assert.match(r.reason, /goToInvented/);
+    });
   });
 });
