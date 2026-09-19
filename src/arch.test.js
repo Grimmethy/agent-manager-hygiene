@@ -366,3 +366,43 @@ test('nextArchDiscoveryTask returns null when there is no community-coverage fil
   const { nextArchDiscoveryTask } = freshPlugin(dir);
   assert.equal(nextArchDiscoveryTask(), null);
 });
+
+// Regression (2026-09-19): the budget loop `break`-ed on the first file that did not fit, so a
+// community whose top-ranked file exceeded the budget got an empty file list.
+function discoveryFixture(fileSizes) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arch-test-'));
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  const nodes = [];
+  const links = [];
+  fileSizes.forEach((size, i) => {
+    const rel = `src/f${i}.js`;
+    fs.writeFileSync(path.join(dir, rel), 'x'.repeat(size));
+    nodes.push({ id: rel, community: 0, source_file: rel });
+    // f0 gets the highest degree, then f1, ... so ranking follows array order.
+    for (let k = 0; k < fileSizes.length - i; k++) links.push({ source: rel, target: 'other' + k });
+  });
+  const graphPath = path.join(dir, 'graph.json');
+  fs.writeFileSync(graphPath, JSON.stringify({ nodes, links }));
+  const coveragePath = path.join(dir, 'community-coverage.json');
+  fs.writeFileSync(coveragePath, JSON.stringify({ communities: [{ id: 0, name: 'c0', lastReviewedAt: null }] }));
+  process.env.AGENT_MANAGER_COMMUNITY_COVERAGE_PATH = coveragePath;
+  process.env.AGENT_MANAGER_GRAPH_PATH = graphPath;
+  return dir;
+}
+
+test('nextArchDiscoveryTask skips an over-budget top-ranked file and still sends the rest', () => {
+  const dir = discoveryFixture([30000, 5000, 4000]);
+  const { nextArchDiscoveryTask } = freshPlugin(dir);
+  const task = nextArchDiscoveryTask();
+  assert.deepEqual(task.promptContext.files.map((f) => f.path), ['src/f1.js', 'src/f2.js']);
+});
+
+test('nextArchDiscoveryTask sends the top file truncated when nothing fits the budget', () => {
+  const dir = discoveryFixture([30000]);
+  const { nextArchDiscoveryTask } = freshPlugin(dir);
+  const task = nextArchDiscoveryTask();
+  assert.equal(task.promptContext.files.length, 1);
+  assert.equal(task.promptContext.files[0].path, 'src/f0.js');
+  assert.ok(task.promptContext.files[0].content.length < 25000);
+  assert.match(task.promptContext.files[0].content, /truncated/);
+});
