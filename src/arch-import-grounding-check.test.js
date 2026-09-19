@@ -10,6 +10,14 @@ const {
   runGroundingCheck, checkFabricatedCitations, parseGroundingVerdict,
 } = require('./arch-import-grounding-check.js');
 
+async function withSymbolBlocking(value, fn) {
+  const saved = process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING;
+  if (value === undefined) delete process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING; else process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING = value;
+  try { return await fn(); } finally {
+    if (saved === undefined) delete process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING; else process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING = saved;
+  }
+}
+
 // A throwaway repo + env so Check 0's getConfig()/checkFilePaths runs deterministically
 // regardless of how the suite was invoked. getConfig() reads process.env fresh each call.
 function withTmpRepo(fn) {
@@ -117,23 +125,28 @@ test('Check 0: a Files: line naming only real repo files does not fire (falls th
   });
 });
 
-test('Check 0b: a Files: line resolving to a real file, but citing a symbol absent from it -> "fabricated symbol citation(s)" verdict, no model call', async () => {
-  await withTmpRepo(async (dir) => {
+test('Check 0b: a real file citing a symbol absent from it WARNS by default (verdict ok + warnings), and BLOCKS with no model call when AGENT_MANAGER_SYMBOL_CHECK_BLOCKING=true', async () => {
+  const writeUp = [
+    '### AC-001 · Something',
+    'Strength: Strong',
+    'Files: src/task-sources.js',
+    '',
+    'Problem: `realFn` never calls `ghostHelper` before returning.',
+  ].join('\n');
+  await withSymbolBlocking(undefined, () => withTmpRepo(async (dir) => {
+    fs.writeFileSync(path.join(dir, 'src', 'task-sources.js'), 'function realFn() {}\n');
+    const r = await runGroundingCheck(task(), writeUp, { call: async () => ({ response: 'GROUNDED' }) });
+    assert.equal(r.verdict, 'ok');
+    assert.match(r.warnings[0], /`ghostHelper`/);
+  }));
+  await withSymbolBlocking('true', () => withTmpRepo(async (dir) => {
     fs.writeFileSync(path.join(dir, 'src', 'task-sources.js'), 'function realFn() {}\n');
     let calls = 0;
-    const call = async () => { calls += 1; return { response: 'GROUNDED' }; };
-    const writeUp = [
-      '### AC-001 · Something',
-      'Strength: Strong',
-      'Files: src/task-sources.js',
-      '',
-      'Problem: `realFn` never calls `ghostHelper` before returning.',
-    ].join('\n');
-    const r = await runGroundingCheck(task(), writeUp, { call });
+    const r = await runGroundingCheck(task(), writeUp, { call: async () => { calls += 1; return { response: 'GROUNDED' }; } });
     assert.equal(r.verdict, 'ungrounded');
     assert.match(r.reason, /^fabricated symbol citation\(s\): `ghostHelper`/);
     assert.equal(calls, 0);
-  });
+  }));
 });
 
 test('Check 0b: a create-mode symbol mention ("add a `newHelper`") does not fire', async () => {

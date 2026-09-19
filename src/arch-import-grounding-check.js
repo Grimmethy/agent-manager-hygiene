@@ -35,7 +35,7 @@ const { call: localCall } = require('agent-manager/src/local-client.js');
 const { getConfig } = require('agent-manager/src/config.js');
 const {
   extractFilesLine, checkCitedPaths, formatFabricatedReason,
-  checkCitedSymbols, formatFabricatedSymbolsReason,
+  checkCitedSymbolsPerEntry, formatFabricatedSymbolsReason, symbolCheckBlocks, formatSymbolWarnings,
 } = require('agent-manager/src/candidate-path-grounding.js');
 
 const GROUNDING_CHECK_MODEL = process.env.AGENT_MANAGER_ARCH_IMPORT_GROUNDING_MODEL || 'qwen2.5:3b';
@@ -118,7 +118,15 @@ function parseGroundingVerdict(text) {
 }
 
 // task, implementResponse, { call?, maybeLockedOn } -> { verdict: 'ok'|'ungrounded', reason? }
-async function runGroundingCheck(task, implementResponse, { call = localCall, maybeLockedOn } = {}) {
+async function runGroundingCheck(task, implementResponse, opts = {}) {
+  const warnings = [];
+  const verdict = await runChecks(task, implementResponse, opts, warnings);
+  // Symbol findings are advisory (see candidate-path-grounding.js symbolCheckBlocks): carried
+  // to the review votes on an otherwise-ok draft, never on a blocked one.
+  return warnings.length && verdict.verdict === 'ok' ? { ...verdict, warnings } : verdict;
+}
+
+async function runChecks(task, implementResponse, { call = localCall, maybeLockedOn } = {}, warnings) {
   if (!isEnabled()) return { verdict: 'ok' };
   const text = String(implementResponse || '');
   if (!text.trim()) return { verdict: 'ok' }; // a legitimate "nothing applies" empty draft -- nothing to check
@@ -131,14 +139,18 @@ async function runGroundingCheck(task, implementResponse, { call = localCall, ma
   // just skips it and falls through to the citation/semantic checks below.
   try {
     const { repoRoot, grepAllowedDirs } = getConfig();
-    const { fabricated: badPaths, checked } = checkCitedPaths(extractFilesLine(text), repoRoot, grepAllowedDirs || []);
+    const { fabricated: badPaths } = checkCitedPaths(extractFilesLine(text), repoRoot, grepAllowedDirs || []);
     if (badPaths.length) return { verdict: 'ungrounded', reason: formatFabricatedReason(badPaths) };
     // Check 0b (same needs-clarification bd-1788994211702 as candidate-path-grounding.js's
     // own header): the Files: line resolved to a real file, but does a backtick-quoted
     // symbol the write-up cites actually appear in it? Deterministic grep, same
-    // non-retryable treatment as Check 0 above -- see checkCitedSymbols' own header.
-    const { fabricated: badSymbols } = checkCitedSymbols(text, checked);
-    if (badSymbols.length) return { verdict: 'ungrounded', reason: formatFabricatedSymbolsReason(badSymbols) };
+    // non-retryable treatment as Check 0 above WHEN AGENT_MANAGER_SYMBOL_CHECK_BLOCKING=true; by
+    // default it only WARNS (see candidate-path-grounding.js symbolCheckBlocks).
+    const { fabricated: badSymbols } = checkCitedSymbolsPerEntry(text, repoRoot, grepAllowedDirs || []);
+    if (badSymbols.length) {
+      if (symbolCheckBlocks()) return { verdict: 'ungrounded', reason: formatFabricatedSymbolsReason(badSymbols) };
+      warnings.push(...formatSymbolWarnings(badSymbols));
+    }
   } catch { /* can't resolve the repo -- fall through */ }
 
   const fabricated = checkFabricatedCitations(task, text);
