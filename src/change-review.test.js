@@ -395,3 +395,47 @@ test('register smoke: change_review reviewGuidance/reviewCompletenessQuestion ar
   assert.match(cr.reviewGuidance(truncatedTask), /TRUNCATION EXCEPTION/);
   assert.match(cr.reviewCompletenessQuestion(truncatedTask), /1 through 1/);
 });
+
+// --- sanitizeDiff / capHunks: bulk data must never crowd out the real code hunks -------------------
+// 2026-09-19 (PF-Client-Portal a747d62): a 1.8 MB single-line GeoJSON file came first in the diff, was kept
+// whole as "hunk 1", consumed the whole budget, and the small PropertyMap.tsx hunks after it were cut --
+// every draft said "no hunks visible" and the task escalated to a human after 8 attempts.
+{
+  const { sanitizeDiff, capHunks, buildPromptContext } = require('./change-review.js');
+  const bigJson = `diff --git a/public/geo/us-counties.json b/public/geo/us-counties.json\nnew file mode 100644\n--- /dev/null\n+++ b/public/geo/us-counties.json\n@@ -0,0 +1 @@\n+{"type":"FeatureCollection","features":[${'[-86.497,32.344],'.repeat(120000)}]}\n`;
+  const tsx = 'diff --git a/src/components/PropertyMap.tsx b/src/components/PropertyMap.tsx\n--- a/src/components/PropertyMap.tsx\n+++ b/src/components/PropertyMap.tsx\n@@ -10,3 +10,5 @@ function strengthen()\n-  const z = 5;\n+  const z = 6;\n+  addCountyLayer(map, z);\n';
+
+  test('sanitizeDiff stubs a bulk data file and keeps the real code hunks intact', () => {
+    const out = sanitizeDiff(bigJson + tsx);
+    assert.ok(out.length < 2000, `expected a small diff, got ${out.length}`);
+    assert.match(out, /bulk data file elided from review -- not a code change: public\/geo\/us-counties\.json/);
+    assert.ok(out.includes('+  addCountyLayer(map, z);'), 'the real TSX hunk survives');
+  });
+
+  test('sanitizeDiff leaves a small JSON change alone (only BULK data is elided)', () => {
+    const small = 'diff --git a/package.json b/package.json\n--- a/package.json\n+++ b/package.json\n@@ -1,3 +1,3 @@\n-  "version": "1.0.0",\n+  "version": "1.0.1",\n';
+    assert.equal(sanitizeDiff(small), small);
+  });
+
+  test('sanitizeDiff truncates an absurdly long line in a code file (minified/inline data)', () => {
+    const long = `diff --git a/src/a.js b/src/a.js\n--- a/src/a.js\n+++ b/src/a.js\n@@ -1 +1 @@\n+${'x'.repeat(5000)}\n`;
+    const out = sanitizeDiff(long);
+    assert.ok(out.length < 1200);
+    assert.match(out, /\.\.\.\[\+4401 chars cut\]/);
+  });
+
+  test('capHunks never lets a single oversized hunk through the budget', () => {
+    const one = `diff --git a/x b/x\n@@ -0,0 +1 @@\n+${'y'.repeat(200000)}\n@@ -5,1 +5,1 @@\n-a\n+b\n`;
+    const out = capHunks(one, 16000);
+    assert.ok(out.length < 16000 * 1.25 + 200, `got ${out.length}`);
+    assert.match(out, /\[diff truncated: showing \d+ of \d+ hunks\]/);
+  });
+
+  test('buildPromptContext: a commit with a huge data file still shows the code change, within budget', () => {
+    const ctx = buildPromptContext('/nonexistent', { sha7: 'a747d62', subject: 's', author: 'a', dateISO: 'd' },
+      [{ status: 'A', path: 'public/geo/us-counties.json' }, { status: 'M', path: 'src/components/PropertyMap.tsx' }], bigJson + tsx, 'main');
+    assert.ok(ctx.unitDiff.length < 3000, `unitDiff should be small, got ${ctx.unitDiff.length}`);
+    assert.ok(ctx.unitDiff.includes('+  addCountyLayer(map, z);'));
+    assert.match(ctx.unitDiff, /bulk data file elided/);
+  });
+}
