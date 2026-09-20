@@ -22,3 +22,26 @@ Replace the parameterless `catch` with a `catch (err)` that first checks `err.co
 
 Benefits:
 Once applied, the only path that returns `null` from the `readdirSync` call is the genuinely benign "directory does not exist yet" case. Any real I/O failure—permission denied, path is a file, disk error—produces a log line that names the directory, the OS error code, and the message, giving an operator an immediate, greppable signal. The rethrow ensures the failure propagates to a caller that can decide whether to abort the promotion run or degrade gracefully, rather than being silently absorbed and misreported as "nothing to promote." This closes the observability gap without adding any new dependency or altering the function's public contract for the legitimate empty case.
+
+### AC-2 · Silent JSON.parse catch swallows corrupt coverage file
+Strength: Strong
+Files: src/arch.js
+Snippet:
+```
+  let coverage;
+  try {
+    coverage = JSON.parse(readIfExists(importCoveragePath) || '{"items":{}}');
+  } catch {
+    coverage = { items: {} };
+  }
+  if (!coverage.items) coverage.items = {};
+```
+
+Problem:
+In `src/arch.js`, the block that loads the import-coverage map does `coverage = JSON.parse(readIfExists(importCoveragePath) || '{"items":{}}')` inside a `try`, and the corresponding `catch` simply assigns `coverage = { items: {} }` with no logging, rethrow, or other surfacing of the exception. The same pattern appears one block earlier for `deepDiveCoverage`. Because the fallback object is structurally identical to a legitimately empty coverage file, a truncated, hand-edited, or otherwise corrupt JSON file on disk is indistinguishable from "no coverage yet." Downstream code then iterates `entries`, mutates `coverage.items`, and writes the result back—silently discarding whatever prior coverage data the corrupt file held—while no operator-visible signal is ever emitted to explain why coverage "reset" to empty.
+
+Solution:
+Replace the bare `catch { coverage = { items: {} }; }` with a `catch (err)` that first calls `console.error` with a message naming the file path (`importCoveragePath`) and the underlying parse error (`err.message`), then assigns the same `{ items: {} }` fallback so the function's return contract is unchanged. Apply the identical treatment to the `deepDiveCoverage` catch immediately above it for consistency. No rethrow is added because the caller's contract is to continue with a default coverage map; no metrics or telemetry primitive is introduced because the project has none.
+
+Benefits:
+An operator running the build or test pipeline will see a single, identifiable stderr line (e.g. `arch: failed to parse import coverage file "…"; falling back to empty coverage. Error: Unexpected token …`) the moment a coverage file becomes corrupt, making the root cause of a silent data-loss reset immediately diagnosable instead of requiring a forensic diff of the written-back file. The fix is a two-line change per catch block, introduces no new dependency, and preserves the existing fallback behavior so no caller contract changes.
