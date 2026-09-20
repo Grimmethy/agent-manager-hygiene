@@ -107,6 +107,7 @@ function findingIsSuppressed(pipelineDir, repoRoot, finding) {
   return isSuppressed(pipelineDir, finding.rule, windowFromContent(content, finding.line, SNIPPET_BEFORE, SNIPPET_AFTER));
 }
 const { registerTaskSource, updateTaskSource } = require('agent-manager/src/task-source-registry.js');
+const { buildFlagInventory } = require('./flag-inventory.js');
 const { applyArchDiscoveryCandidates } = require('agent-manager/src/candidate-docs.js');
 const { projectCapabilityProfile } = require('./project-capabilities.js');
 
@@ -539,12 +540,33 @@ function nextObservabilityReviewDigestTask({ repoRoot, pipelineDir, defaultDomai
   });
 }
 
+// Read-only inventory of the flags backlog for the dashboard's Hygiene tab (see flag-inventory.js). Same task-id
+// formula and skip rules as nextObservabilityReviewTask, minus its rescan/relocation side effects.
+function observabilityInventory({ repoRoot, pipelineDir, taskState }) {
+  const projectTag = path.basename(repoRoot);
+  let flags;
+  try { flags = JSON.parse(readIfExists(path.join(pipelineDir, 'queue', 'observability-flags.json')) || '[]'); } catch { flags = []; }
+  return buildFlagInventory({
+    flags, projectTag, repoRoot, taskState,
+    idFor: (f) => `observability-${slugifyForId(projectTag)}-${slugifyForId(f.rule)}-${slugifyForId(f.file || 'repo')}-${f.line || 0}`,
+    snippetFor: (f, content) => windowFromContent(content, f.line, SNIPPET_BEFORE, SNIPPET_AFTER),
+    isSuppressed: (rule, snippet) => isSuppressed(pipelineDir, rule, snippet),
+    isClusterSuppressed: (rule, dir) => isClusterSuppressed(pipelineDir, rule, dir),
+    // Low-confidence silent-catch findings are batched into a digest task, not one each.
+    isDigestBatched: (f) => f.confidence === 'low' && LOW_CONFIDENCE_MODE !== 'off',
+  });
+}
+
 function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
   registerTaskSource('observability_review', {
     priority: taskPriority('observability_review', 80),
     next: () => {
       const { repoRoot, pipelineDir, defaultDomain, observabilityCoveragePath } = getConfig();
       return nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue, coveragePath: observabilityCoveragePath });
+    },
+    inventory: ({ taskState }) => {
+      const { repoRoot, pipelineDir } = getConfig();
+      return observabilityInventory({ repoRoot, pipelineDir, taskState });
     },
     apply: ({ implementResponse, task }) => {
       const { observabilityFixCandidatesPath, pipelineDir } = getConfig();

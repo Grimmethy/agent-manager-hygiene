@@ -18,6 +18,7 @@ const fs = require('fs');
 const { registerTaskSource, updateTaskSource, registerSourceAlias } = require('agent-manager/src/task-source-registry.js');
 const { applyVerdictOnly } = require('agent-manager/src/apply-group-a.js');
 const { unusedExportPlanPrompt } = require('agent-manager/src/prompts.js');
+const { buildFlagInventory } = require('./flag-inventory.js');
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -65,10 +66,28 @@ function nextUnusedExportTask({ getConfig, taskIdExistsInQueue }) {
   return null;
 }
 
+// Read-only inventory for the dashboard's Hygiene tab (see flag-inventory.js). Same id formula as nextUnusedExportTask.
+function unusedExportInventory({ pipelineDir, repoRoot, taskState }) {
+  let entries;
+  try { entries = JSON.parse(readIfExists(path.join(pipelineDir, 'queue', 'dead-code-flags.json')) || '[]'); } catch { entries = []; }
+  const flags = (Array.isArray(entries) ? entries : []).map((e) => ({
+    rule: 'unused-export', file: e.definedIn, line: 0, scannedAt: e.scannedAt,
+    detail: `${e.symbol} -- ${(e.callSites || []).length} call site(s)`, _symbol: e.symbol,
+  }));
+  return buildFlagInventory({
+    flags, projectTag: null, repoRoot, taskState,
+    idFor: (f) => `deadcode-${slugifyForId(f._symbol)}-${slugifyForId(f.file)}`,
+  });
+}
+
 function register({ getConfig, taskIdExistsInQueue, taskPriority }) {
   registerTaskSource('unused_export', {
     priority: taskPriority('unused_export', 90),
     next: () => nextUnusedExportTask({ getConfig, taskIdExistsInQueue }),
+    inventory: ({ taskState }) => {
+      const { repoRoot, pipelineDir } = getConfig();
+      return unusedExportInventory({ repoRoot, pipelineDir, taskState });
+    },
     apply: applyVerdictOnly,
   });
   updateTaskSource('unused_export', { buildPlanPrompt: unusedExportPlanPrompt });
