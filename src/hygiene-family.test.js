@@ -19,7 +19,9 @@ const EXPECTED = {
   change_review: 'change_review', change_review_fix: 'change_review',
 };
 
+let registered = null; // registering twice re-requires core's task-sources.js, whose model-profile registrations are not idempotent
 function registerAll() {
+  if (registered) return registered;
   process.env.AGENT_MANAGER_REPO_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'hygfam-'));
   process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
   const registry = require('agent-manager/src/task-source-registry.js');
@@ -29,6 +31,7 @@ function registerAll() {
     try { delete require.cache[require.resolve(p)]; } catch { /* not loaded yet */ }
   }
   require('../register.js');
+  registered = registry;
   return registry;
 }
 
@@ -62,4 +65,17 @@ test('every hygiene source registers with its family; core groups them from the 
   assert.equal(by.arch.flagSource, null);
   assert.deepEqual(by.unused_export.prefixes, ['deadcode-']);
   assert.equal(by.unused_export.docSources.length, 0);
+});
+
+// Core's review gates are driven by these registration flags (ADR-0022: core names no plugin source). If a flag is dropped the
+// gate silently turns off in production, so pin them here.
+test('registration flags core reads: groundedPromptFiles, preValidateCitedPaths, requireCodeShapeInCandidate', () => {
+  const registry = registerAll();
+  assert.equal(registry.getRegisteredSource('arch_discovery').groundedPromptFiles, true, 'needs-clarification-triage bucket L');
+  assert.equal(registry.getRegisteredSource('arch_import').preValidateCitedPaths, true, 'review-task cited-path pre-validation');
+  assert.equal(registry.getRegisteredSource('function_length_review').requireCodeShapeInCandidate, true, 'review-task code-shape gate');
+  for (const name of ['arch_review', 'arch_import_review', 'observability_review', 'performance_review', 'function_length_fix', 'change_review']) {
+    const s = registry.getRegisteredSource(name);
+    assert.ok(!s.groundedPromptFiles && !s.preValidateCitedPaths && !s.requireCodeShapeInCandidate, `${name} opts into none of them`);
+  }
 });

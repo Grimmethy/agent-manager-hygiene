@@ -369,6 +369,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
   // candidate write-ups, not Group B JSON, so without this apply-task.js's writeArtifact()
   // falls through to the generic JSON parser and every approved task fails apply.
   registerTaskSource('arch_discovery', {
+    groundedPromptFiles: true,
     hygieneFamily: hygieneFamily('arch'),
     priority: taskPriority('arch_discovery', 80),
     next: () => nextArchDiscoveryTask({ getConfig, taskIdExistsInQueue }),
@@ -398,6 +399,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
 
   // arch_import -- generator. Same raw-markdown apply, plus the import-coverage.json stamp.
   registerTaskSource('arch_import', {
+    preValidateCitedPaths: true,
     hygieneFamily: hygieneFamily('arch'),
     priority: taskPriority('arch_import', 81),
     next: () => nextArchImportTask({ getConfig, taskIdExistsInQueue }),
