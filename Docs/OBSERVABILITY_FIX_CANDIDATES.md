@@ -45,3 +45,26 @@ Replace the bare `catch { coverage = { items: {} }; }` with a `catch (err)` that
 
 Benefits:
 An operator running the build or test pipeline will see a single, identifiable stderr line (e.g. `arch: failed to parse import coverage file "…"; falling back to empty coverage. Error: Unexpected token …`) the moment a coverage file becomes corrupt, making the root cause of a silent data-loss reset immediately diagnosable instead of requiring a forensic diff of the written-back file. The fix is a two-line change per catch block, introduces no new dependency, and preserves the existing fallback behavior so no caller contract changes.
+
+### AC-3 · Silent catch swallows coverage-file parse failure and wipes prior item history
+Strength: Strong
+Files: src/arch.js
+Snippet:
+```
+  let coverage;
+  try {
+    coverage = JSON.parse(fs.existsSync(importCoveragePath) ? fs.readFileSync(importCoveragePath, 'utf8') : '{"items":{}}');
+  } catch {
+    coverage = { items: {} };
+  }
+  if (!coverage.items) coverage.items = {};
+```
+
+Problem:
+In `applyArchImportCandidate`, the `try` block reads and `JSON.parse`s the file at `importCoveragePath`. If that file is corrupt, truncated, or otherwise unreadable (partial write, disk error, manual edit), the bare `catch` discards the exception entirely and substitutes `coverage = { items: {} }`. The very next lines then assign `coverage.items[itemId]` with fresh `promotedAt` and `candidateId` values, silently discarding any prior coverage history for that item. No `console.error`, `console.warn`, `process.stderr.write`, or rethrow appears inside the catch, so the operator receives zero signal that the coverage file was unreadable and that prior state was lost.
+
+Solution:
+Capture the exception in the catch binding and emit a `console.error` that names the function, the offending path, the `itemId`, the `sourceProject`, and the error message, before falling back to `{ items: {} }`. Concretely, change the bare `catch {` to `catch (err) {`, add a single `console.error(\`applyArchImportCandidate: failed to read/parse import coverage at ${importCoveragePath} (item ${itemId}, source ${sourceProject}); falling back to empty coverage. ${err && err.message ? err.message : err}\`)` line, and keep the existing `coverage = { items: {} }` fallback so the task can still record the real candidate. Do not rethrow — the caller's intent is best-effort coverage recording and a rethrow would abort the task over a recoverable read failure. Do not add any metric or counter; this project has no metrics system.
+
+Benefits:
+Once fixed, a corrupt or unreadable coverage file produces an immediate, identifiable stderr line that names the file path, the affected item, and the source project, so an operator can locate and repair the file before the next run silently overwrites it again. The best-effort fallback behavior is preserved (the task still records the candidate), but the silent data loss of prior `promotedAt`/`candidateId` history is no longer invisible — it is logged at the moment it happens, giving the operator a concrete, time-stamped signal to investigate.
