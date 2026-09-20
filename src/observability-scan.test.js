@@ -309,3 +309,38 @@ test('scanProject runs the OTel-only rules when the project depends on an OpenTe
   assert.ok(rules.includes('otel-naming-convention'));
   assert.ok(rules.includes('missing-reserved-attribute'));
 });
+
+// State-setter error surfacing (2026-09-19, PF-Client-Portal): React handlers report a caught error by writing it to state the UI
+// renders. Landing.tsx:209 and two digest findings were exactly this and each cost a review call to dismiss.
+test('silent-catch-block: a state setter that reports the error counts as surfacing it', () => {
+  const ok = [
+    'try { a(); } catch (e) { setErrorMsg(e.message); setStatus("error"); }',   // Landing.tsx:209 shape
+    'try { a(); } catch (e) { setErr(String(e)); }',
+    'try { a(); } catch { setBulkMsg("could not save"); }',                       // error-ish name, literal message
+    'try { a(); } catch (err) { setDetail(err.message); }',                       // handed the caught error
+    'try { a(); } catch { setStatus("error"); }',                                 // error-status literal
+    'try { a(); } catch (e) { setErr(fmt(e)); }',                                 // nested call args
+    'try { a(); } catch (e) { setItems(prev => [...prev, e]); }',                 // caught error inside an arrow arg
+    'try { a(); } catch (err: unknown) { setToast(String(err)); }',               // TS-annotated catch param
+  ];
+  for (const code of ok) assert.equal(findSilentCatchBlocks(code, 'src/x.tsx').length, 0, code);
+});
+
+test('silent-catch-block: a state RESET with no message, or a setter unrelated to the error, is still flagged', () => {
+  const flagged = [
+    'try { a(); } catch { setData(null); }',                                      // reset on failure, user told nothing
+    'try { a(); } catch (e) { setResult(null); }',
+    'try { a(); } catch (e) { client.logout(); setMe(null); }',
+    'try { a(); } catch (e) { setErr(null); }',                                   // CLEARING an error is not reporting one
+    'try { a(); } catch (e) { setErrors({}); }',
+    'try { a(); } catch (e) { setMsg(""); }',
+    'try { a(); } catch (e) { setCount(e2); }',                                   // `e2` is not the caught `e`
+    'try { a(); } catch (e) {}',
+  ];
+  for (const code of flagged) assert.equal(findSilentCatchBlocks(code, 'src/x.tsx').length, 1, code);
+});
+
+test('silent-catch-block: state-setter surfacing is JS/TS only -- a Python except with a set_* call is unchanged', () => {
+  const py = 'try:\n    a()\nexcept Exception as e:\n    set_detail(str(e))\n';
+  assert.equal(findSilentCatchBlocks(py, 'x.py').length, 1);
+});
