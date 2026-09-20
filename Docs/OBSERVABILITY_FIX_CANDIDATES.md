@@ -68,3 +68,26 @@ Capture the exception in the catch binding and emit a `console.error` that names
 
 Benefits:
 Once fixed, a corrupt or unreadable coverage file produces an immediate, identifiable stderr line that names the file path, the affected item, and the source project, so an operator can locate and repair the file before the next run silently overwrites it again. The best-effort fallback behavior is preserved (the task still records the candidate), but the silent data loss of prior `promotedAt`/`candidateId` history is no longer invisible — it is logged at the moment it happens, giving the operator a concrete, time-stamped signal to investigate.
+
+### AC-4 · Silent JSON.parse catch blocks mask corrupt state files as "rescan everything"
+Strength: Strong
+Files: src/function-length-review.js
+Snippet:
+```
+  let coverage;
+  try { coverage = JSON.parse(readIfExists(coveragePath) || '{}'); } catch { coverage = {}; }
+  let flags;
+  try { flags = JSON.parse(readIfExists(flagsPath) || '[]'); } catch { flags = []; }
+
+  const now = Date.now();
+  const lastScannedAt = coverage.lastScannedAt ? Date.parse(coverage.lastScannedAt) : NaN;
+```
+
+Problem:
+In `nextFunctionLengthReviewTask`, the two `try/catch` blocks that parse `coveragePath` and `flagsPath` use a bare `catch` with no bound parameter and no body beyond reassigning the default (`{}` or `[]`). If the state file is corrupt, half-written, or manually mangled, `JSON.parse` throws a `SyntaxError` that is discarded entirely — no `console.error`, no `process.stderr.write`, no rethrow. The function then proceeds with an empty coverage object, so `coverage.lastScannedAt` is `undefined`, `lastScannedAt` resolves to `NaN`, and `due` is unconditionally `true`. The pipeline re-scans and re-flags every function it has already reviewed, flooding the queue with duplicate candidates, while the operator receives zero signal that the underlying state file is unreadable. A genuine data-integrity failure is indistinguishable from a normal first-run or interval-expiry rescan.
+
+Solution:
+Bind the caught error in each `catch` clause and emit a `console.error` call that includes the offending file path, a short human-readable description ("failed to parse … ; defaulting to {}" / "… defaulting to []"), and the original error object (so the stack and `SyntaxError` message are preserved). Keep the graceful-degradation contract intact — the function still assigns the empty default and continues the review cycle — because a caller mid-pipeline cannot meaningfully recover a corrupt state file in-place, and crashing the whole pipeline over a recoverable state-file issue is worse than logging and proceeding. No metric, counter, or telemetry primitive is added; the project has no metrics system, and `console.error` (Node stdlib) is the available logging surface.
+
+Benefits:
+An operator running the pipeline sees an immediate, identifiable error on stderr naming the exact file path and the parse failure, so a corrupt or half-written state file is diagnosed in seconds rather than discovered (if at all) through the confusing symptom of duplicate re-scan output. The graceful-degradation behavior is preserved — the pipeline does not crash — but the silent data-loss path is closed. Future debugging of state-file corruption (interrupted writes, merge artifacts, manual edits) becomes a grep-able log line instead of an invisible no-op.
