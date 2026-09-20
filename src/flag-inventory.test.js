@@ -151,3 +151,15 @@ test('inventory hooks are PURE READS: they never rewrite the flags files or crea
   assert.equal(fs.statSync(flagsFile).mtimeMs, beforeStat);
   assert.deepEqual(fs.readdirSync(pipe).sort(), ['queue'], 'no coverage/scan side-effect files appeared');
 });
+
+// A decomposed task becomes a coordinating hub while workers implement its pieces -- that is in flight, not "needs you".
+test('buildFlagInventory: a flag whose task is a coordinating hub counts as queued (in flight), not blocked', () => {
+  const repo = repoWith({ 'src/a.ts': 'x\ny\nz\n' });
+  const inv = buildFlagInventory({
+    projectTag: 'proj', repoRoot: repo, flags: [flag({ file: 'src/a.ts' })],
+    idFor: (f) => `id-${f.file}`, taskState: () => ({ state: 'coordinating' }),
+  });
+  assert.equal(inv.items[0].status, 'queued');
+  assert.equal(inv.counts.queued, 1);
+  assert.equal(inv.counts.blocked, 0);
+});
