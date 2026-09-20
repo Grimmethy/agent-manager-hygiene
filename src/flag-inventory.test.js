@@ -152,6 +152,18 @@ test('inventory hooks are PURE READS: they never rewrite the flags files or crea
   assert.deepEqual(fs.readdirSync(pipe).sort(), ['queue'], 'no coverage/scan side-effect files appeared');
 });
 
+// A decomposed task becomes a coordinating hub while workers implement its pieces -- that is in flight, not "needs you".
+test('buildFlagInventory: a flag whose task is a coordinating hub counts as queued (in flight), not blocked', () => {
+  const repo = repoWith({ 'src/a.ts': 'x\ny\nz\n' });
+  const inv = buildFlagInventory({
+    projectTag: 'proj', repoRoot: repo, flags: [flag({ file: 'src/a.ts' })],
+    idFor: (f) => `id-${f.file}`, taskState: () => ({ state: 'coordinating' }),
+  });
+  assert.equal(inv.items[0].status, 'queued');
+  assert.equal(inv.counts.queued, 1);
+  assert.equal(inv.counts.blocked, 0);
+});
+
 // PF-Client-Portal 2026-09-19: the digest task reviewed 6 low-confidence flags, dismissed every one and suppressed it -- yet the tab said
 // "digest 6" because the digest-batching check ran BEFORE the suppression check. The review filters suppressed findings out first.
 test('buildFlagInventory: a low-confidence flag that was already suppressed is "suppressed", not "digest"', () => {

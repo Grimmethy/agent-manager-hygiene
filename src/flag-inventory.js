@@ -19,8 +19,9 @@ const fs = require('fs');
 const path = require('path');
 
 const DEFAULT_ITEM_CAP = 500;
-const IN_FLIGHT = new Set(['pending', 'drafting', 'review', 'approved']);
-const NEEDS_HUMAN = new Set(['blocked', 'needs-clarification', 'awaiting-confirm', 'coordinating']);
+// A coordinating hub (a decomposed task whose pieces workers are implementing) is in flight, not waiting on a human.
+const IN_FLIGHT = new Set(['pending', 'drafting', 'review', 'approved', 'coordinating']);
+const NEEDS_HUMAN = new Set(['blocked', 'needs-clarification', 'awaiting-confirm']);
 const STATUS_ORDER = ['waiting', 'blocked', 'queued', 'digest', 'suppressed', 'stale', 'done'];
 
 function readIfExists(p) {
