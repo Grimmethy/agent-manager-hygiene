@@ -12,9 +12,13 @@
 // to AGENT_MANAGER_GREP_DIRS), not hardcoded. Output goes to the same file the built-in
 // `unused_export` task source reads: <pipelineDir>/queue/dead-code-flags.json.
 //
-// Scope note: export DEFINITIONS are detected for CommonJS only (module.exports / exports.x),
-// so .js/.jsx define candidates; call sites are searched across .js/.jsx/.ts/.tsx so a symbol
-// referenced from TypeScript still counts. ESM/TS `export` *definitions* are not detected.
+// Scope note: export DEFINITIONS are detected for CommonJS (module.exports / exports.x) in
+// .js/.jsx, and for ES `export` declarations in .ts/.tsx (2026-09-19: PropertyForager is all
+// TS/TSX and this scanner previously saw zero candidates in it). ESM in plain .js/.jsx is
+// still NOT detected -- deliberately left as-is so a CommonJS project's flags don't change;
+// call sites are searched across .js/.jsx/.ts/.tsx so a symbol referenced from either counts.
+// TS re-exports (`export { x } from`, `export * from`) are barrels, not definitions, and are
+// skipped; `.d.ts` files are ambient declarations and are never scanned for definitions.
 //
 // Python is deliberately NOT covered here (unlike function-length / observability /
 // performance, which gained .py support 2026-08-30). "Unused module-level def/class" in
@@ -27,8 +31,11 @@
 const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('agent-manager/src/config.js');
+const { stripNonCode } = require('./scan-utils.js');
 
-const DEFINE_EXTENSIONS = ['.js', '.jsx'];
+const CJS_DEFINE_EXTENSIONS = ['.js', '.jsx'];
+const ES_DEFINE_EXTENSIONS = ['.ts', '.tsx'];
+const DEFINE_EXTENSIONS = [...CJS_DEFINE_EXTENSIONS, ...ES_DEFINE_EXTENSIONS];
 const SEARCH_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx'];
 const SKIP_DIRS = new Set(['node_modules', '.git', 'queue', 'instances', 'dist', 'build', 'coverage']);
 const MAX_CALL_SITES = 20;
@@ -53,9 +60,46 @@ function listSourceFiles(dir, extensions) {
   }
 }
 
+const IDENT = '[A-Za-z_$][\\w$]*';
+const ES_DECLARATION_RE = new RegExp(
+  '^[ \\t]*export\\s+(?:declare\\s+)?(?:async\\s+)?'
+  + '(?:abstract\\s+class|class|function\\*?|interface|type|(?:const\\s+)?enum|const|let|var)\\s+(' + IDENT + ')', 'gm');
+const ES_DEFAULT_DECLARATION_RE = new RegExp(
+  '^[ \\t]*export\\s+default\\s+(?:async\\s+)?(?:abstract\\s+class|class|function\\*?)\\s+(' + IDENT + ')', 'gm');
+const ES_DEFAULT_IDENTIFIER_RE = new RegExp('^[ \\t]*export\\s+default\\s+(' + IDENT + ')\\s*;?[ \\t]*$', 'gm');
+const ES_EXPORT_LIST_RE = /^[ \t]*export\s+(?:type\s+)?\{([^}]*)\}(\s*from\b)?/gm;
+
+// ES/TS `export` definitions in one file's text. Comments/strings are blanked first so an
+// `export` in prose or a string never matches. A `export { x } from '...'` list is a
+// re-export (barrel) and contributes nothing; a local `export { a, b as c }` list contributes
+// the name consumers import (`c`). Anonymous defaults (`export default () => ...`) have no
+// searchable name and are skipped.
+function extractEsExports(text) {
+  const code = stripNonCode(String(text || ''));
+  const set = new Set();
+  for (const re of [ES_DECLARATION_RE, ES_DEFAULT_DECLARATION_RE, ES_DEFAULT_IDENTIFIER_RE]) {
+    for (const m of code.matchAll(re)) set.add(m[1]);
+  }
+  for (const m of code.matchAll(ES_EXPORT_LIST_RE)) {
+    if (m[2]) continue; // re-export from another module
+    for (const part of m[1].split(',')) {
+      const bits = part.trim().replace(/^type\s+/, '').split(/\s+as\s+/);
+      const local = bits[0].trim();
+      const exported = (bits[1] || bits[0]).trim();
+      const name = exported === 'default' ? local : exported;
+      if (new RegExp('^' + IDENT + '$').test(name)) set.add(name);
+    }
+  }
+  return Array.from(set);
+}
+
 function extractExports(filePath) {
   const text = fs.readFileSync(filePath, 'utf8');
   const set = new Set();
+
+  if (ES_DEFINE_EXTENSIONS.some((e) => filePath.endsWith(e))) {
+    for (const name of extractEsExports(text)) set.add(name);
+  }
 
   for (const m of text.matchAll(/module\.exports\s*=\s*\{([^}]*)\}/g)) {
     const inner = m[1];
@@ -128,6 +172,7 @@ function scan() {
   const scannedAt = new Date().toISOString();
   for (const dir of scanRoots) {
     for (const file of listSourceFiles(dir, DEFINE_EXTENSIONS)) {
+      if (file.endsWith('.d.ts')) continue; // ambient declarations, not definitions
       for (const name of extractExports(file)) {
         const callSites = countCallSites(name, file, searchRoots, repoRoot);
         if (callSites.length <= LOW_USAGE_THRESHOLD) {
@@ -155,4 +200,4 @@ function main() {
 
 if (require.main === module) { main(); }
 
-module.exports = { scan, extractExports, countCallSites };
+module.exports = { scan, extractExports, extractEsExports, countCallSites };
