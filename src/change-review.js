@@ -24,6 +24,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { registerTaskSource, updateTaskSource } = require('agent-manager/src/task-source-registry.js');
+const { verifyQuotedCode, describeUnverified } = require('./change-review-quote-check.js');
 const { applyArchDiscoveryCandidates, isEffectivelyEmptyResponse } = require('agent-manager/src/candidate-docs.js');
 const { writeJsonAtomicSync } = require('agent-manager/src/atomic-write.js');
 const { archReviewPlanPrompt, archReviewImplementPrompt } = require('agent-manager/src/prompts.js');
@@ -511,17 +512,32 @@ function hunkForFile(unitDiff, file) {
   return text || unitDiff.slice(0, SNIPPET_CAP_CHARS);
 }
 
-function buildAcBlock(finding, ctx) {
+// Does the code this finding quotes as EXISTING actually appear in the file at the reviewed commit? See
+// change-review-quote-check.js. Fail-open: no readable file / no config -> nothing is checked.
+function verifyFinding(finding, ctx) {
+  let fileText = '';
+  try {
+    const { repoRoot } = require('agent-manager/src/config.js').getConfig();
+    if (repoRoot && ctx.sha && finding.file && !finding.file.includes('..')) fileText = git(repoRoot, ['show', `${ctx.sha}:${finding.file}`]);
+  } catch { /* unreadable -> fall back to the diff, then to "not checked" */ }
+  return verifyQuotedCode(finding, { fileText, unitDiff: ctx.unitDiff });
+}
+
+function buildAcBlock(finding, ctx, verification) {
   const sha7 = ctx.sha || '';
   const base = finding.file.split('/').pop();
   const title = `${finding.regression.replace(/\s+/g, ' ').slice(0, 90)} (${sha7} ${base})`;
   const snippet = hunkForFile(ctx.unitDiff, finding.file);
+  // An unverifiable quote downgrades the finding (kept for a human, not auto-fulfilled: the fix stage consumes only
+  // Strong). See change-review-quote-check.js for the incident.
+  const unverified = verification && verification.unverified && verification.unverified.length ? verification.unverified : null;
+  const unverifiedNote = unverified ? `[UNVERIFIED QUOTE: ${describeUnverified(unverified, { file: finding.file, sha: sha7 })} -- the finding may be a misreading; check before acting] ` : '';
   // applyArchDiscoveryCandidates only preserves the canonical fields (Strength / Split-Depth
   // / Source / Files / Snippet) plus the body -- so severity and the commit go INTO the
   // Problem line where they survive to the fix stage and a human reader.
   const block = [
     `### AC-1 · ${title}`,
-    'Strength: Strong',
+    `Strength: ${unverified ? 'Unverified' : 'Strong'}`,
     `Source: change_review of ${sha7} "${(ctx.subject || '').replace(/"/g, "'").slice(0, 80)}"`,
     `Files: ${finding.file}`,
     'Snippet:',
@@ -529,7 +545,7 @@ function buildAcBlock(finding, ctx) {
     snippet,
     '```',
     '',
-    `Problem: [severity: ${finding.severity}; regression shipped in ${sha7}] ${finding.regression}  Failure scenario: ${finding.failure.replace(/\s+/g, ' ')}`,
+    `Problem: ${unverifiedNote}[severity: ${finding.severity}; regression shipped in ${sha7}] ${finding.regression}  Failure scenario: ${finding.failure.replace(/\s+/g, ' ')}`,
     `Solution: ${finding.fix || 'Restore the pre-diff behaviour for the failure scenario above (smallest change to ' + finding.file + ').'}`,
     `Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in ${sha7}.`,
   ].join('\n');
@@ -549,7 +565,7 @@ function applyChangeReview({ implementResponse, task }) {
     return { skipped: true, reason: 'change review: no well-formed FINDING blocks in the draft' };
   }
   const ctx = (task && task.promptContext) || {};
-  const blocks = findings.map((f) => buildAcBlock(f, ctx));
+  const blocks = findings.map((f) => buildAcBlock(f, ctx, verifyFinding(f, ctx)));
 
   let candidatesPath;
   try {
@@ -569,6 +585,23 @@ function applyChangeReview({ implementResponse, task }) {
     file: res.file,
     doneMarker: `filed ${(res.candidateIds || []).join(', ') || 'change-review candidate(s)'}`,
   };
+}
+
+// Advisory postImplementCheck: the same quote check, surfaced to the review votes as a warning (never a block --
+// applyChangeReview downgrades the finding either way). Warnings reach the reviewer via agent-manager's
+// task.groundingWarnings.
+async function changeReviewQuoteCheck(task, implementResponse) {
+  try {
+    const ctx = (task && task.promptContext) || {};
+    const warnings = [];
+    for (const f of parseFindings(String(implementResponse || ''))) {
+      const v = verifyFinding(f, ctx);
+      if (v.unverified.length) warnings.push(`finding on ${f.file}: ${describeUnverified(v.unverified, { file: f.file, sha: ctx.sha })}`);
+    }
+    return warnings.length ? { verdict: 'ok', warnings } : { verdict: 'ok' };
+  } catch {
+    return { verdict: 'ok' };
+  }
 }
 
 // --- review-gate guidance --------------------------------------------------------
@@ -687,6 +720,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     reportClass: 'housekeeping',
     reviewGuidance: changeReviewGuidanceFor,
     reviewCompletenessQuestion: changeReviewCompletenessQuestionFor,
+    postImplementCheck: changeReviewQuoteCheck,
   });
   updateTaskSource('change_review', {
     buildPlanPrompt: changeReviewPlanPrompt,
@@ -717,6 +751,7 @@ module.exports = {
   buildPromptContext,
   nextChangeReviewTask,
   applyChangeReview,
+  changeReviewQuoteCheck,
   classifyUnit,
   parseFindings,
   changeReviewPlanPrompt,

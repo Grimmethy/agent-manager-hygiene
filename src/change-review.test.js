@@ -281,6 +281,84 @@ test('applyChangeReview: two FINDING blocks -> CHANGE_REVIEW_CANDIDATES.md with 
   assert.match(doc, /the loop now skips the last element/);
 });
 
+// --- quote check (2026-09-19): a finding that quotes non-existent code as "existing" is downgraded -----------
+
+function repoWithFile(rel, content) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cr-quote-'));
+  git(dir, ['init', '-q', '-b', 'main']);
+  git(dir, ['config', 'user.email', 't@t']); git(dir, ['config', 'user.name', 't']);
+  fs.mkdirSync(path.join(dir, path.dirname(rel)), { recursive: true });
+  fs.writeFileSync(path.join(dir, rel), content);
+  git(dir, ['add', '.']); git(dir, ['commit', '-qm', 'the reviewed change']);
+  return { dir, sha: git(dir, ['rev-parse', '--short', 'HEAD']) };
+}
+const FILE_BODY = "const onPage = (p) => {\n  loadBox(mode.box, mode.scope, p);\n};\nconst onScope = (next) => {\n  loadBox(mode.box, next, 1);\n};\n";
+const findingResp = (fix) => ['FINDING', 'File: src/View.tsx', 'Line: 5', 'Severity: high', 'Regression: scope change re-queries with the old scope',
+  'Failure scenario: onScope("SF") calls loadBox(box, "MF", 1) instead of "SF"', `Fix sketch: ${fix}`].join('\n');
+
+test('applyChangeReview: a finding quoting code that is NOT in the file at the reviewed commit is filed as Unverified, not Strong', () => {
+  const { dir, sha } = repoWithFile('src/View.tsx', FILE_BODY);
+  const { mod } = freshPlugin(dir);
+  const res = mod.applyChangeReview({
+    implementResponse: findingResp('replace `loadBox(mode.box, mode.scope, 1)` with `loadBox(mode.box, next, 1)`'),
+    task: { promptContext: { ...applyCtx(), sha } },
+  });
+  assert.equal(res.succeeded, true, 'still filed -- a human can see it');
+  const doc = fs.readFileSync(path.join(dir, 'Docs', 'CHANGE_REVIEW_CANDIDATES.md'), 'utf8');
+  assert.match(doc, /^Strength: Unverified$/m);
+  assert.doesNotMatch(doc, /^Strength: Strong$/m);
+  assert.match(doc, /\[UNVERIFIED QUOTE: `loadBox\(mode\.box, mode\.scope, 1\)` \(quoted as existing code\) does not appear verbatim in src\/View\.tsx/);
+  assert.match(doc, /closest real line: `loadBox\(mode\.box, mode\.scope, p\);`/);
+  assert.match(doc, /severity: high/, 'the finding itself is preserved');
+});
+
+test('applyChangeReview: a finding whose quoted existing code IS in the file stays Strong (no false downgrade)', () => {
+  const { dir, sha } = repoWithFile('src/View.tsx', FILE_BODY);
+  const { mod } = freshPlugin(dir);
+  mod.applyChangeReview({
+    implementResponse: findingResp('replace `loadBox(mode.box, next, 1)` with `loadBox(mode.box, other, 1)`'),
+    task: { promptContext: { ...applyCtx(), sha } },
+  });
+  const doc = fs.readFileSync(path.join(dir, 'Docs', 'CHANGE_REVIEW_CANDIDATES.md'), 'utf8');
+  assert.match(doc, /^Strength: Strong$/m);
+  assert.doesNotMatch(doc, /UNVERIFIED QUOTE/);
+});
+
+test('applyChangeReview: the check fails OPEN -- file unreadable at that commit stays Strong', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cr-quote-open-')); // not a git repo
+  const { mod } = freshPlugin(dir);
+  mod.applyChangeReview({
+    implementResponse: findingResp('replace `totallyMadeUp(code, here, 1)` with x'),
+    task: { promptContext: { sha: 'abc1234', subject: 's', unitDiff: '' } },
+  });
+  assert.match(fs.readFileSync(path.join(dir, 'Docs', 'CHANGE_REVIEW_CANDIDATES.md'), 'utf8'), /^Strength: Strong$/m);
+});
+
+test('applyChangeReview: two findings, one bad quote -> only that one is downgraded', () => {
+  const { dir, sha } = repoWithFile('src/View.tsx', FILE_BODY);
+  const { mod } = freshPlugin(dir);
+  const resp = [findingResp('replace `loadBox(mode.box, mode.scope, 1)` with y'), '', findingResp('replace `loadBox(mode.box, mode.scope, p)` with y').replace('Line: 5', 'Line: 2')].join('\n');
+  mod.applyChangeReview({ implementResponse: resp, task: { promptContext: { ...applyCtx(), sha } } });
+  const doc = fs.readFileSync(path.join(dir, 'Docs', 'CHANGE_REVIEW_CANDIDATES.md'), 'utf8');
+  assert.equal((doc.match(/^Strength: Unverified$/gm) || []).length, 1);
+  assert.equal((doc.match(/^Strength: Strong$/gm) || []).length, 1);
+});
+
+test('change_review registers an advisory postImplementCheck that WARNS (never blocks) on an unverified quote', async () => {
+  const { dir, sha } = repoWithFile('src/View.tsx', FILE_BODY);
+  const { mod, getRegisteredSource } = freshPlugin(dir);
+  const check = getRegisteredSource('change_review').postImplementCheck;
+  assert.equal(typeof check, 'function');
+  const bad = await check({ promptContext: { ...applyCtx(), sha } }, findingResp('replace `loadBox(mode.box, mode.scope, 1)` with y'));
+  assert.equal(bad.verdict, 'ok');
+  assert.equal(bad.warnings.length, 1);
+  assert.match(bad.warnings[0], /finding on src\/View\.tsx: `loadBox\(mode\.box, mode\.scope, 1\)`/);
+  const good = await check({ promptContext: { ...applyCtx(), sha } }, findingResp('replace `loadBox(mode.box, next, 1)` with y'));
+  assert.deepEqual(good, { verdict: 'ok' });
+  assert.deepEqual(await check({ promptContext: applyCtx() }, 'NO CORRECTNESS ISSUES'), { verdict: 'ok' });
+  assert.equal(typeof mod.changeReviewQuoteCheck, 'function');
+});
+
 test('applyChangeReview: malformed block (no Failure scenario) is dropped; all dropped -> skipped', () => {
   const { mod } = freshPlugin(fs.mkdtempSync(path.join(os.tmpdir(), 'cr-apply4-')));
   const resp = 'FINDING\nFile: src/a.js\nRegression: something\nFix sketch: x\n';
