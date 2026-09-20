@@ -23,6 +23,7 @@ const { scanProject } = require('./function-length-scan.js');
 const { reconcileFlags } = require('./flag-store.js');
 const { windowFromContent } = require('./scan-utils.js');
 const { isSuppressed, recordFalsePositiveIfVerdict, recordInconclusiveReview } = require('./suppression-store.js');
+const { buildFlagInventory } = require('./flag-inventory.js');
 const { runGroundingCheck } = require('./function-length-grounding-check.js');
 
 // Judging a function's real shape needs its WHOLE body, not just its start line. A fixed
@@ -271,12 +272,29 @@ function nextFunctionLengthReviewTask({ repoRoot, pipelineDir, defaultDomain, ta
 // taskIdExistsInQueue are passed in by the caller rather than required directly here, so
 // this module never depends on task-sources.js itself -- only on the registry it's
 // registering into, keeping the dependency direction one-way for a future extraction.
+// Read-only inventory of the flags backlog for the dashboard's Hygiene tab (see flag-inventory.js).
+function functionLengthInventory({ repoRoot, pipelineDir, taskState }) {
+  const projectTag = path.basename(repoRoot);
+  let flags;
+  try { flags = JSON.parse(readIfExists(path.join(pipelineDir, 'queue', 'function-length-flags.json')) || '[]'); } catch { flags = []; }
+  return buildFlagInventory({
+    flags, projectTag, repoRoot, taskState,
+    idFor: (f) => `function-length-${slugifyForId(projectTag)}-${slugifyForId(f.file || 'repo')}-${f.line || 0}`,
+    snippetFor: (f, content) => functionSnippet(content, f.line, f.lengthLines),
+    isSuppressed: (rule, snippet) => isSuppressed(pipelineDir, rule, snippet),
+  });
+}
+
 function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
   registerTaskSource('function_length_review', {
     priority: taskPriority('function_length_review', 80),
     next: () => {
       const { repoRoot, pipelineDir, defaultDomain } = getConfig();
       return nextFunctionLengthReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue });
+    },
+    inventory: ({ taskState }) => {
+      const { repoRoot, pipelineDir } = getConfig();
+      return functionLengthInventory({ repoRoot, pipelineDir, taskState });
     },
     apply: ({ implementResponse, task }) => {
       const { repoRoot, pipelineDir } = getConfig();

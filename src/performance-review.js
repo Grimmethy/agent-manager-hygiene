@@ -18,6 +18,7 @@ const { scanProject } = require('./performance-scan.js');
 const { isLikelyMinified, windowFromContent } = require('./scan-utils.js');
 const { reconcileFlags } = require('./flag-store.js');
 const { isSuppressed, recordFalsePositiveIfVerdict, recordInconclusiveReview, classifyReviewOutcome } = require('./suppression-store.js');
+const { buildFlagInventory } = require('./flag-inventory.js');
 
 // 2026-09-17 (agent-manager needs-clarification bd-1788740326297, defensive hardening):
 // mirrors observability_review's own STAMP_REVIEW_DISPOSITION pattern -- performance_review
@@ -267,12 +268,30 @@ function nextPerformanceReviewTask({ repoRoot, pipelineDir, defaultDomain, taskI
   return null;
 }
 
+// Read-only inventory of the flags backlog for the dashboard's Hygiene tab (see flag-inventory.js).
+function performanceInventory({ repoRoot, pipelineDir, taskState }) {
+  const projectTag = path.basename(repoRoot);
+  let flags;
+  try { flags = JSON.parse(readIfExists(path.join(pipelineDir, 'queue', 'performance-flags.json')) || '[]'); } catch { flags = []; }
+  return buildFlagInventory({
+    flags, projectTag, repoRoot, taskState,
+    idFor: (f) => `performance-${slugifyForId(projectTag)}-${slugifyForId(f.rule)}-${slugifyForId(f.file || 'repo')}-${f.line || 0}`,
+    snippetFor: (f, content) => windowFromContent(content, f.line, SNIPPET_BEFORE, SNIPPET_AFTER),
+    isSuppressed: (rule, snippet) => isSuppressed(pipelineDir, rule, snippet),
+    isUnreviewable: (content) => isLikelyMinified(content),
+  });
+}
+
 function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
   registerTaskSource('performance_review', {
     priority: taskPriority('performance_review', 80),
     next: () => {
       const { repoRoot, pipelineDir, defaultDomain, performanceCoveragePath } = getConfig();
       return nextPerformanceReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue, coveragePath: performanceCoveragePath });
+    },
+    inventory: ({ taskState }) => {
+      const { repoRoot, pipelineDir } = getConfig();
+      return performanceInventory({ repoRoot, pipelineDir, taskState });
     },
     apply: ({ implementResponse, task }) => {
       const { performanceFixCandidatesPath, pipelineDir } = getConfig();
