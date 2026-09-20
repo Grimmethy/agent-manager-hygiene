@@ -137,3 +137,49 @@ Replace the bare `catch { silentCatch = []; }` with `catch (err) { console.error
 
 Benefits:
 Once the fix is in place, any future regression in `findSilentCatchBlocks` (a bad regex, a shape mismatch in the AST it receives, a memory-pressure abort) will produce a visible, greppable line in CI logs or `stderr` that names the exact file and the error message. An operator can distinguish "analysed, zero hits" from "analysis crashed" by the presence of the log line, and can triage the root cause without re-running the pipeline with debug instrumentation. The graceful-degradation contract is preserved—no other file in the cache is affected, and the pipeline continues to produce output for every path it is asked about.
+
+### AC-7 · Silent catch swallows JSON parse errors in prepareObservabilityFlags
+Strength: Strong
+Files: src/observability-review.js
+Snippet:
+```
+  const projectTag = path.basename(repoRoot);
+
+  let coverage;
+  try { coverage = JSON.parse(readIfExists(coveragePath) || '{}'); } catch { coverage = {}; }
+
+  const flagsPath = path.join(pipelineDir, 'queue', 'observability-flags.json');
+  let flags;
+```
+
+Problem:
+In `prepareObservabilityFlags`, both the coverage and flags `try` blocks use bare `catch { ... }` that silently discards the exception. If `readIfExists` returns a non-empty but corrupt string (truncated write, partial flush, encoding corruption), `JSON.parse` throws, the catch resets the variable to `{}` or `[]`, and the caller receives an empty value indistinguishable from "file was absent." No log, no stderr write, no rethrow — the parse failure is completely invisible, so a corrupt coverage or flags backlog is silently treated as empty and any queued flags are dropped with no trace.
+
+Solution:
+Capture the error in each catch and emit a `console.error` line that names the file path and the parse failure before falling back to the empty default. For coverage: `catch (err) { console.error(\`[observability-review] failed to parse coverage file ${coveragePath}: ${err.message}\`); coverage = {}; }`. For flags: `catch (err) { console.error(\`[observability-review] failed to parse flags file ${flagsPath}: ${err.message}\`); flags = []; }`. Do not rethrow — the function's documented contract is to return a usable `{ sorted, getFile, projectTag, flags, flagsPath }` even when the backlog or coverage is absent, and a caller cannot meaningfully act on a corrupt-file parse error at this layer. The project has no metrics system, so logging to stderr is the correct and only surfacing mechanism.
+
+Benefits:
+A corrupt or truncated coverage/flags file now produces a single, greppable stderr line identifying the exact file and the parse error, making it immediately distinguishable from the legitimate "file does not exist" path. Operators triaging a run where coverage appears empty or the flags backlog seems to have vanished can find the root cause in the log without adding instrumentation. The fallback-to-empty behavior is preserved, so no caller contract changes.
+
+### AC-8 · Silent catch blocks discard parse errors in observability state loader
+Strength: Strong
+Files: src/observability-review.js
+Snippet:
+```
+
+  const flagsPath = path.join(pipelineDir, 'queue', 'observability-flags.json');
+  let flags;
+  try { flags = JSON.parse(readIfExists(flagsPath) || '[]'); } catch { flags = []; }
+
+  const now = Date.now();
+  const lastScannedAt = coverage.lastScannedAt ? Date.parse(coverage.lastScannedAt) : NaN;
+```
+
+Problem:
+In `prepareObservabilityFlags`, the two `try/catch` blocks that load `coverage` and `flags` from disk bind no error variable and emit no log before substituting the empty defaults (`{}` and `[]`). Because the fallback values are byte-for-byte indistinguishable from a legitimately empty or absent file, a truncated or corrupted JSON file (crash mid-write, partial `fs.writeFileSync`, concurrent writer) is silently treated as "no data." The `lastScannedAt` check then sees `undefined`, computes `NaN`, marks the scan as due, and overwrites the corrupted file with a fresh one—destroying the only evidence of the corruption. Simultaneously, the `flags` backlog is reset to `[]`, so any queued observability flags are dropped with no log line, no rethrow, and no marker for a human to investigate. In a file whose stated purpose is observability review, this is a self-defeating silent swallow: the very signals the tool exists to surface are erased before they can be seen.
+
+Solution:
+Bind the caught error in each `catch` clause and emit a single `console.error` line that names the file path, the operation (parse), and the error message, then fall back to the empty default as before. For the coverage block: `catch (err) { console.error(\`[observability-review] failed to parse coverage file ${coveragePath}: ${err.message}\`); coverage = {}; }`. For the flags block: `catch (err) { console.error(\`[observability-review] failed to parse flags file ${flagsPath}: ${err.message}\`); flags = []; }`. Do not rethrow—the function's documented contract is to return a usable shape even when state is missing, and a hard crash here would break both the per-finding review flow and the low-confidence digest. Do not add a metric or counter; this project has no metrics system. `console.error` writes to stderr, matching the project's Node logging convention.
+
+Benefits:
+A human running the pipeline will see an immediate, greppable stderr line naming the exact file path and the `SyntaxError` message the moment a state file is corrupted, giving them enough to locate, inspect, and recover the file before the next rescan overwrites it. The flags backlog is no longer silently dropped without trace; the log line provides the "why did my flags disappear?" signal that was previously absent. The rest of the function's behavior—falling back to empty defaults, triggering a rescan, returning a well-shaped object—is unchanged, so no caller contract is altered.
