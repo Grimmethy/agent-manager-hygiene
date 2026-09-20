@@ -288,6 +288,7 @@ function functionLengthInventory({ repoRoot, pipelineDir, taskState }) {
 
 function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
   registerTaskSource('function_length_review', {
+    requireCodeShapeInCandidate: true,
     hygieneFamily: hygieneFamily('function_length'),
     priority: taskPriority('function_length_review', 80),
     next: () => {
