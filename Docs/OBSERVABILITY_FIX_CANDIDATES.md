@@ -91,3 +91,26 @@ Bind the caught error in each `catch` clause and emit a `console.error` call tha
 
 Benefits:
 An operator running the pipeline sees an immediate, identifiable error on stderr naming the exact file path and the parse failure, so a corrupt or half-written state file is diagnosed in seconds rather than discovered (if at all) through the confusing symptom of duplicate re-scan output. The graceful-degradation behavior is preserved — the pipeline does not crash — but the silent data-loss path is closed. Future debugging of state-file corruption (interrupted writes, merge artifacts, manual edits) becomes a grep-able log line instead of an invisible no-op.
+
+### AC-5 · Surface swallowed JSON.parse errors in function-length-review coverage/flags loading
+Strength: Strong
+Files: src/function-length-review.js
+Snippet:
+```
+  const flagsPath = path.join(pipelineDir, 'queue', 'function-length-flags.json');
+
+  let coverage;
+  try { coverage = JSON.parse(readIfExists(coveragePath) || '{}'); } catch { coverage = {}; }
+  let flags;
+  try { flags = JSON.parse(readIfExists(flagsPath) || '[]'); } catch { flags = []; }
+
+```
+
+Problem:
+In `nextFunctionLengthReviewTask`, the two `try { … } catch { … }` blocks that parse `function-length-coverage.json` and `function-length-flags.json` use bare `catch` with no binding and no log statement. If either file is corrupted (partial write, truncation, manual edit, encoding glitch), `JSON.parse` throws, the exception is silently discarded, and the code substitutes `{}` or `[]`. For the coverage file this is especially dangerous: `coverage.lastScannedAt` becomes `undefined`, so `Date.parse(undefined)` yields `NaN`, so `due` is always `true`, and the pipeline re-runs the full scan + judge + write cycle on every invocation with zero diagnostic output. For the flags file, all previously queued flags are silently dropped, risking duplicate flagging or loss of tracked items. Because the project has no metrics system and no third-party logger, the only available diagnostic primitive is a `console.error` call, and none is present.
+
+Solution:
+Bind the caught exception (`catch (err)`) in both blocks and emit a `console.error` line that includes the file path, the underlying parse error message, and the fallback value being substituted. Keep the existing fallback semantics (`coverage = {}` / `flags = []`) so the "scan if due" path and downstream callers that expect a valid object or array continue to work unchanged. Do not rethrow: the function's contract is a graceful fallback, and rethrowing would break the scheduling logic that depends on `coverage` being a plain object. The two log lines look like: `console.error('[function-length-review] failed to parse ' + coveragePath + ': ' + (err && err.message ? err.message : String(err)) + '; falling back to {}')` and the analogous line for the flags path.
+
+Benefits:
+An operator or CI log reader can immediately see *which* file failed to parse and *why* (e.g., "Unexpected token in JSON at position 0"), eliminating the silent infinite re-scan loop and the silent flag loss. The fix adds no dependency, no new abstraction, and changes no control-flow behavior—it only makes the already-intended fallback observable.
