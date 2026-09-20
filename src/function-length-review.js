@@ -17,6 +17,7 @@
 // applyArchDiscoveryCandidates, prompts.js's groupBJsonInstructions/formatFileContents.
 // slugifyForId/readIfExists are tiny and duplicated locally rather than reached for.
 
+const { hygieneFamily } = require('./hygiene-family.js');
 const fs = require('fs');
 const path = require('path');
 const { scanProject } = require('./function-length-scan.js');
@@ -287,6 +288,7 @@ function functionLengthInventory({ repoRoot, pipelineDir, taskState }) {
 
 function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
   registerTaskSource('function_length_review', {
+    hygieneFamily: hygieneFamily('function_length'),
     priority: taskPriority('function_length_review', 80),
     next: () => {
       const { repoRoot, pipelineDir, defaultDomain } = getConfig();
@@ -355,6 +357,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
   updateTaskSource('function_length_review', { buildPlanPrompt: functionLengthReviewPlanPrompt, buildImplementPrompt: functionLengthReviewImplementPrompt });
 
   registerTaskSource('function_length_fix', {
+    hygieneFamily: hygieneFamily('function_length', { candidateDoc: true }),
     priority: taskPriority('function_length_fix', 72),
     next: () => {
       const { repoRoot } = getConfig();

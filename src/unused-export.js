@@ -13,6 +13,7 @@
 // prose verdict is a documented no-op once it reaches apply). No buildImplementPrompt:
 // deliberate fallthrough (see agent-manager's prompts.js).
 
+const { hygieneFamily } = require('./hygiene-family.js');
 const path = require('path');
 const fs = require('fs');
 const { registerTaskSource, updateTaskSource, registerSourceAlias } = require('agent-manager/src/task-source-registry.js');
@@ -82,6 +83,7 @@ function unusedExportInventory({ pipelineDir, repoRoot, taskState }) {
 
 function register({ getConfig, taskIdExistsInQueue, taskPriority }) {
   registerTaskSource('unused_export', {
+    hygieneFamily: hygieneFamily('unused_export'),
     priority: taskPriority('unused_export', 90),
     next: () => nextUnusedExportTask({ getConfig, taskIdExistsInQueue }),
     inventory: ({ taskState }) => {
