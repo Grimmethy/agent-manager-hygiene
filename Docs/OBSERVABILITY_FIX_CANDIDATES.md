@@ -114,3 +114,26 @@ Bind the caught exception (`catch (err)`) in both blocks and emit a `console.err
 
 Benefits:
 An operator or CI log reader can immediately see *which* file failed to parse and *why* (e.g., "Unexpected token in JSON at position 0"), eliminating the silent infinite re-scan loop and the silent flag loss. The fix adds no dependency, no new abstraction, and changes no control-flow behavior—it only makes the already-intended fallback observable.
+
+### AC-6 · Silent-catch analysis failure indistinguishable from clean file
+Strength: Strong
+Files: src/observability-review.js
+Snippet:
+```
+    if (content && !minified) {
+      try {
+        silentCatch = findSilentCatchBlocks(content, relPath).filter((f) => f.rule === 'silent-catch-block');
+      } catch { silentCatch = []; }
+    }
+    const entry = { content, minified, silentCatch };
+    cache.set(relPath, entry);
+```
+
+Problem:
+Inside `makeFileCache`, the `try` block calls `findSilentCatchBlocks(content, relPath)` and filters the result. The accompanying `catch { silentCatch = []; }` discards the exception entirely—no variable is bound, nothing is logged, and no marker is set on the returned entry. The resulting object `{ content, minified, silentCatch: [] }` is byte-identical to the case where the analyser ran successfully and found zero silent-catch blocks. In a review pipeline whose sole purpose is to surface findings, an operator or downstream aggregator reading `silentCatch: []` will record the file as clean and move on, with no trace that the analysis step actually threw (catastrophic regex backtrack, an unexpected AST shape causing a `TypeError`, a `RangeError` under memory pressure, etc.). The failure is a silent false-negative: the pipeline reports "no problems" when it could not determine whether problems exist.
+
+Solution:
+Replace the bare `catch { silentCatch = []; }` with `catch (err) { console.error("[observability-review] findSilentCatchBlocks failed for " + relPath + ": " + err.message); silentCatch = []; }`. This binds the exception so the original error message is available, emits a single `console.error` line that names the offending file path and the error's message (the only logging primitive this project uses—no third-party logger, no metrics system exists), and still degrades gracefully to an empty array so one pathological file does not crash the entire cache build. No rethrow is warranted: the caller's contract is a best-effort per-file entry, and aborting `makeFileCache` over a single file's analysis failure would be a larger outage than the single-file gap. No new dependency, no metric, no structural change.
+
+Benefits:
+Once the fix is in place, any future regression in `findSilentCatchBlocks` (a bad regex, a shape mismatch in the AST it receives, a memory-pressure abort) will produce a visible, greppable line in CI logs or `stderr` that names the exact file and the error message. An operator can distinguish "analysed, zero hits" from "analysis crashed" by the presence of the log line, and can triage the root cause without re-running the pipeline with debug instrumentation. The graceful-degradation contract is preserved—no other file in the cache is affected, and the pipeline continues to produce output for every path it is asked about.
