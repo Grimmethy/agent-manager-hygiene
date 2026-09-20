@@ -10,8 +10,8 @@
 //
 // This must be a PURE READ. prepare*Flags() in the review modules rescans the repo and rewrites the flags file, so
 // this reads the file directly and applies only the cheap rules the review loops apply, in the same order:
-//   already tasked (queue state / disposition) -> unreadable file ("stale") -> low-confidence digest batching ->
-//   suppressed (exact snippet, or cluster) -> WAITING (what a worker will pick up next).
+//   already tasked (queue state / disposition) -> unreadable file ("stale") -> suppressed (exact snippet, or cluster) ->
+//   low-confidence digest batching -> WAITING (what a worker will pick up next).
 // It does NOT relocate a flag against the current file (the review does, and may then discard it as stale), so
 // `waiting` can slightly overstate; the caller labels it accordingly.
 
@@ -71,11 +71,14 @@ function buildFlagInventory({
     } else {
       const content = flag.file ? contentOf(flag.file) : null;
       if (flag.file && (!content || (isUnreviewable && isUnreviewable(content)))) status = 'stale';
-      else if (isDigestBatched && isDigestBatched(flag)) status = 'digest';
       else {
+        // Suppression BEFORE digest batching, exactly as the review does (observability-review.js filters suppressed findings out
+        // first, then batches what is left). The other order showed a flag the digest had already reviewed and suppressed as
+        // 'digest' (PF-Client-Portal 2026-09-19: 6 flags, all dismissed as false positives by the digest task, read "digest 6").
         const snippet = snippetFor && content ? snippetFor(flag, content) : null;
         if (isSuppressed && flag.rule && snippet && isSuppressed(flag.rule, snippet)) status = 'suppressed';
         else if (isClusterSuppressed && flag.rule && flag.file && isClusterSuppressed(flag.rule, path.dirname(flag.file))) status = 'suppressed';
+        else if (isDigestBatched && isDigestBatched(flag)) status = 'digest';
         else status = 'waiting';
       }
     }

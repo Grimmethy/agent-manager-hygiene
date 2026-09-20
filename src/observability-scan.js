@@ -103,6 +103,56 @@ function stripComments(body) {
 // "this error was surfaced somehow," even if imperfectly. Covers JS and Python idioms.
 const SURFACES_ERROR_RE = /throw|console\.|log(ger|ging)?\.|\.error\(|Error\(|raise\b|panic\(|record|notify|alert|metric|traceback|warn|capture_exception|sys\.exc_info|reject\(|Promise\.reject|next\(err|captureException|Sentry|reportError|toast\(|showError\(|\.exception\(|\.critical\(|\.fatal\(|print\(|(?:cb|callback|done)\(\s*err/i;
 
+
+// React/Vue-style client code surfaces a caught error by writing it to component state that the UI renders --
+// `catch (e) { setErrorMsg(e.message); setStatus('error'); }` -- not by logging. SURFACES_ERROR_RE cannot see that, so every such
+// handler was flagged (PF-Client-Portal 2026-09-19: Landing.tsx:209 and two of the six digest findings were exactly this, all
+// dismissed as false positives after a paid review call each). A state setter counts as surfacing when, and only when:
+//   - its name says it holds an error/message (setErr, setErrorMsg, setBulkMsg, setFailure, setToast, ...), or
+//   - it is handed the caught error itself (setX(e.message), setX(String(err))), or
+//   - it is handed an error-status string (setStatus('error'), setPhase("failed")),
+// and it is not just CLEARING state (setErr(null), setErrors({}), setMsg('')) -- clearing an error in a catch is a reset, not a report.
+// Deliberately NOT accepted: setData(null) / setResult(null) / setMe(null) -- state reset on failure with no message; those stay
+// flagged (LOW confidence, digest-batched) because the user is told nothing.
+const SETTER_CALL_RE = /\bset[A-Za-z0-9_$]*\s*\(/g;
+const ERRORISH_SETTER_NAME_RE = /^set\w*?(?:[Ee]rr|[Mm]sg|[Mm]essage|[Ff]ail|[Nn]otice|[Ww]arn|[Tt]oast|[Aa]lert|[Bb]anner)/;
+const ERROR_STATUS_LITERAL_RE = /['"`](?:error|errored|failed|failure|fail)['"`]/i;
+const CLEARING_ARGS_RE = /^\s*(?:null|undefined|''|""|``|false|0|\[\s*\]|\{\s*\})?\s*$/;
+
+// Text between the parens of a call whose "(" is at openIdx, or null when unbalanced.
+function callArgs(text, openIdx) {
+  let depth = 0;
+  for (let i = openIdx; i < text.length; i++) {
+    const c = text[i];
+    if (c === '(') depth++;
+    else if (c === ')' && --depth === 0) return text.slice(openIdx + 1, i);
+  }
+  return null;
+}
+
+// stripped: the comment-stripped catch body. caught: the caught identifier ('e', 'err', ...) or null for `catch {`. JS/TS only.
+function surfacesViaStateSetter(stripped, caught) {
+  const identRe = caught ? new RegExp(`(?<![\\w$.])${caught.replace(/\$/g, '\\$')}(?![\\w$])`) : null;
+  SETTER_CALL_RE.lastIndex = 0;
+  let m;
+  while ((m = SETTER_CALL_RE.exec(stripped))) {
+    const name = m[0].replace(/\s*\($/, '');
+    const args = callArgs(stripped, m.index + m[0].length - 1);
+    if (args === null) continue;
+    if (CLEARING_ARGS_RE.test(args)) continue;
+    if (ERRORISH_SETTER_NAME_RE.test(name)) return true;
+    if (ERROR_STATUS_LITERAL_RE.test(args)) return true;
+    if (identRe && identRe.test(args)) return true;
+  }
+  return false;
+}
+
+// The identifier a `catch (e)` / `catch (err: unknown)` header binds, or null (`catch {`).
+function caughtIdentifier(headerParens) {
+  const m = /^\(\s*([A-Za-z_$][\w$]*)/.exec(headerParens || '');
+  return m ? m[1] : null;
+}
+
 // A Python `except` body that is ONLY `pass` or `...` is the silent-swallow equivalent of
 // an empty JS catch block.
 const PY_EMPTY_EXCEPT_RE = /^(?:pass|\.\.\.)$/;
@@ -149,7 +199,7 @@ function findSilentCatchBlocks(text, relPath) {
     // digest-batched triage low-confidence-digest.js already runs for `return
     // someFallbackVar` -- so no new noise-control mechanism is needed; this was just
     // unreachable dead code sitting in front of it. Falls through to that classification.
-    if (stripped.length === 0 || !SURFACES_ERROR_RE.test(stripped)) {
+    if (stripped.length === 0 || (!SURFACES_ERROR_RE.test(stripped) && !surfacesViaStateSetter(stripped, caughtIdentifier(m[1])))) {
       const startLine = lineOfIndex(text, m.index);
       const confidence = classifyCatchConfidence({
         stripped, text, headerIndex: m.index, closeIndex: openIndex + 1 + body.length, isPython: false,

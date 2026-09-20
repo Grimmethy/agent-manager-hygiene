@@ -163,3 +163,23 @@ test('buildFlagInventory: a flag whose task is a coordinating hub counts as queu
   assert.equal(inv.counts.queued, 1);
   assert.equal(inv.counts.blocked, 0);
 });
+
+// PF-Client-Portal 2026-09-19: the digest task reviewed 6 low-confidence flags, dismissed every one and suppressed it -- yet the tab said
+// "digest 6" because the digest-batching check ran BEFORE the suppression check. The review filters suppressed findings out first.
+test('buildFlagInventory: a low-confidence flag that was already suppressed is "suppressed", not "digest"', () => {
+  const repo = repoWith({ 'src/a.ts': 'x\ny\nz\n', 'src/b.ts': 'x\ny\nz\n' });
+  const inv = buildFlagInventory({
+    projectTag: 'proj', repoRoot: repo,
+    flags: [
+      flag({ file: 'src/a.ts', confidence: 'low' }),                         // low, reviewed by the digest and suppressed
+      flag({ file: 'src/b.ts', confidence: 'low', rule: 'not-yet-reviewed' }), // low, still waiting for the digest
+    ],
+    idFor: (f) => `id-${f.file}`, taskState: () => null,
+    snippetFor: () => 'snippet',
+    isSuppressed: (rule) => rule === 'silent-catch-block',
+    isDigestBatched: (f) => f.confidence === 'low',
+  });
+  assert.deepEqual(inv.items.map((i) => [i.file, i.status]).sort(), [['src/a.ts', 'suppressed'], ['src/b.ts', 'digest']]);
+  assert.equal(inv.counts.suppressed, 1);
+  assert.equal(inv.counts.digest, 1);
+});
