@@ -1,0 +1,65 @@
+'use strict';
+
+// Every hygiene source declares its own dashboard family (core names none of them -- ADR-0022), and core's Hygiene tab can
+// rebuild the six families from the registrations alone.
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { hygieneFamily, FAMILIES } = require('./hygiene-family.js');
+
+const EXPECTED = {
+  observability_review: 'observability', observability_review_digest: 'observability', observability_fix: 'observability',
+  performance_review: 'performance', performance_fix: 'performance',
+  function_length_review: 'function_length', function_length_fix: 'function_length',
+  unused_export: 'unused_export',
+  arch_discovery: 'arch', arch_review: 'arch', arch_import: 'arch', arch_import_review: 'arch',
+  change_review: 'change_review', change_review_fix: 'change_review',
+};
+
+function registerAll() {
+  process.env.AGENT_MANAGER_REPO_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'hygfam-'));
+  process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
+  const registry = require('agent-manager/src/task-source-registry.js');
+  registry.clearRegistry();
+  for (const p of ['agent-manager/src/task-sources.js', 'agent-manager/src/prompts.js', './function-length-review.js', './observability-review.js',
+    './performance-review.js', './arch.js', './unused-export.js', './change-review.js', '../register.js']) {
+    try { delete require.cache[require.resolve(p)]; } catch { /* not loaded yet */ }
+  }
+  require('../register.js');
+  return registry;
+}
+
+test('hygieneFamily(): known keys only; candidateDoc is opt-in', () => {
+  assert.equal(hygieneFamily('arch').candidateDoc, undefined);
+  assert.equal(hygieneFamily('arch', { candidateDoc: true }).candidateDoc, true);
+  assert.throws(() => hygieneFamily('nope'), /unknown hygiene family/);
+  assert.equal(new Set(Object.values(FAMILIES).map((f) => f.order)).size, Object.keys(FAMILIES).length, 'family orders are distinct');
+});
+
+test('every hygiene source registers with its family; core groups them from the registrations alone', () => {
+  const registry = registerAll();
+  for (const [name, family] of Object.entries(EXPECTED)) {
+    const s = registry.getRegisteredSource(name);
+    assert.ok(s, `${name} is registered`);
+    assert.equal(s.hygieneFamily && s.hygieneFamily.key, family, `${name} declares family ${family}`);
+  }
+  // Only the four flag-based review sources carry a flag inventory hook, one per family.
+  const withHook = registry.getRegisteredSources().filter((s) => s.hygieneFamily && typeof s.inventory === 'function').map((s) => s.name).sort();
+  assert.deepEqual(withHook, ['function_length_review', 'observability_review', 'performance_review', 'unused_export']);
+
+  let collectFamilies;
+  try { ({ collectFamilies } = require('agent-manager/src/hygiene-inventory.js')); } catch { /* core without the Hygiene tab */ }
+  if (typeof collectFamilies !== 'function') return; // older core: nothing to cross-check
+  const fams = collectFamilies(registry.getRegisteredSources());
+  assert.deepEqual(fams.map((f) => f.key), ['observability', 'performance', 'function_length', 'unused_export', 'arch', 'change_review']);
+  const by = Object.fromEntries(fams.map((f) => [f.key, f]));
+  assert.deepEqual(by.arch.docSources.sort(), ['arch_import_review', 'arch_review']);
+  assert.deepEqual(by.observability.docSources, ['observability_fix']);
+  assert.equal(by.observability.flagSource, 'observability_review');
+  assert.equal(by.arch.flagSource, null);
+  assert.deepEqual(by.unused_export.prefixes, ['deadcode-']);
+  assert.equal(by.unused_export.docSources.length, 0);
+});

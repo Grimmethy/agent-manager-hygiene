@@ -12,6 +12,7 @@
 // done tasks, 297 (84%) false positive, 56 (16%) genuine, scanning deep_dive's cloned
 // EXTERNAL repos with no follow-up mechanism, zero fixes ever shipped.
 
+const { hygieneFamily } = require('./hygiene-family.js');
 const fs = require('fs');
 const path = require('path');
 const { scanProject } = require('./performance-scan.js');
@@ -284,6 +285,7 @@ function performanceInventory({ repoRoot, pipelineDir, taskState }) {
 
 function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
   registerTaskSource('performance_review', {
+    hygieneFamily: hygieneFamily('performance'),
     priority: taskPriority('performance_review', 80),
     next: () => {
       const { repoRoot, pipelineDir, defaultDomain, performanceCoveragePath } = getConfig();
@@ -339,6 +341,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
   updateTaskSource('performance_review', { buildPlanPrompt: performanceReviewPlanPrompt, buildImplementPrompt: performanceReviewImplementPrompt });
 
   registerTaskSource('performance_fix', {
+    hygieneFamily: hygieneFamily('performance', { candidateDoc: true }),
     priority: taskPriority('performance_fix', 73),
     next: () => {
       const { performanceFixCandidatesPath } = getConfig();

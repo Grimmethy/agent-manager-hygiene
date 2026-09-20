@@ -22,6 +22,7 @@
 // flagged (else the SAME unfixed line would get re-flagged every single rescan) and
 // prunes any flag whose file no longer exists (deleted/renamed since it was flagged).
 
+const { hygieneFamily } = require('./hygiene-family.js');
 const fs = require('fs');
 const path = require('path');
 const { scanProject, findSilentCatchBlocks } = require('./observability-scan.js');
@@ -559,6 +560,7 @@ function observabilityInventory({ repoRoot, pipelineDir, taskState }) {
 
 function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
   registerTaskSource('observability_review', {
+    hygieneFamily: hygieneFamily('observability'),
     priority: taskPriority('observability_review', 80),
     next: () => {
       const { repoRoot, pipelineDir, defaultDomain, observabilityCoveragePath } = getConfig();
@@ -630,6 +632,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
   updateTaskSource('observability_review', { buildPlanPrompt: observabilityReviewPlanPrompt, buildImplementPrompt: observabilityReviewImplementPrompt });
 
   registerTaskSource('observability_review_digest', {
+    hygieneFamily: hygieneFamily('observability'),
     priority: taskPriority('observability_review_digest', 78),
     next: () => {
       const { repoRoot, pipelineDir, defaultDomain, observabilityCoveragePath } = getConfig();
@@ -691,6 +694,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
   updateTaskSource('observability_review_digest', { buildPlanPrompt: observabilityReviewDigestPlanPrompt, buildImplementPrompt: observabilityReviewDigestImplementPrompt });
 
   registerTaskSource('observability_fix', {
+    hygieneFamily: hygieneFamily('observability', { candidateDoc: true }),
     priority: taskPriority('observability_fix', 72),
     next: () => {
       const { observabilityFixCandidatesPath } = getConfig();

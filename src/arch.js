@@ -15,6 +15,7 @@
 // the structcheck is invoked by the worker as a subprocess by hardcoded path, and
 // arch-import-fetch is a repo-search harness shared with non-hygiene self-audit sources.
 
+const { hygieneFamily } = require('./hygiene-family.js');
 const fs = require('fs');
 const path = require('path');
 const { registerTaskSource, updateTaskSource } = require('agent-manager/src/task-source-registry.js');
@@ -326,6 +327,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
   // -> retried -> eventually blocked for a human. emptyApproval stays on the arch_discovery
   // / arch_import GENERATORS below, where "found zero real issues" is a valid common outcome.
   registerTaskSource('arch_review', {
+    hygieneFamily: hygieneFamily('arch', { candidateDoc: true }),
     priority: taskPriority('arch_review', 70),
     next: () => nextCandidateFulfillmentTask(getConfig().archReviewCandidatesPath, 'arch_review'),
     candidateFulfillment: true,
@@ -346,6 +348,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
   // finalizeCandidateFulfillment right before a {"mode":"split"} response is honored, so a
   // false premise never fans out into child candidates the way AC-8 did.
   registerTaskSource('arch_import_review', {
+    hygieneFamily: hygieneFamily('arch', { candidateDoc: true }),
     priority: taskPriority('arch_import_review', 71),
     next: () => {
       const task = nextCandidateFulfillmentTask(getConfig().archImportCandidatesPath, 'arch_import_review');
@@ -366,6 +369,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
   // candidate write-ups, not Group B JSON, so without this apply-task.js's writeArtifact()
   // falls through to the generic JSON parser and every approved task fails apply.
   registerTaskSource('arch_discovery', {
+    hygieneFamily: hygieneFamily('arch'),
     priority: taskPriority('arch_discovery', 80),
     next: () => nextArchDiscoveryTask({ getConfig, taskIdExistsInQueue }),
     apply: ({ implementResponse }) => {
@@ -394,6 +398,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
 
   // arch_import -- generator. Same raw-markdown apply, plus the import-coverage.json stamp.
   registerTaskSource('arch_import', {
+    hygieneFamily: hygieneFamily('arch'),
     priority: taskPriority('arch_import', 81),
     next: () => nextArchImportTask({ getConfig, taskIdExistsInQueue }),
     apply: ({ implementResponse, task }) => {

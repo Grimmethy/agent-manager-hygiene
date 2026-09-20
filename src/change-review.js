@@ -20,6 +20,7 @@
 // is already queued/done or was deliberately skipped -- so a task that getNextTask()
 // discards on a tier filter can never make its commit un-reviewable.
 
+const { hygieneFamily } = require('./hygiene-family.js');
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
@@ -709,6 +710,7 @@ const CHANGE_REVIEW_FIX_REVIEW_GUIDANCE = [
 
 function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
   registerTaskSource('change_review', {
+    hygieneFamily: hygieneFamily('change_review'),
     priority: taskPriority('change_review', 60),
     next: () => nextChangeReviewTask({ getConfig, taskIdExistsInQueue }),
     apply: applyChangeReview,
@@ -728,6 +730,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
   });
 
   registerTaskSource('change_review_fix', {
+    hygieneFamily: hygieneFamily('change_review', { candidateDoc: true }),
     priority: taskPriority('change_review_fix', 58),
     next: () => nextCandidateFulfillmentTask(getConfig().changeReviewCandidatesPath, 'change_review_fix'),
     candidateFulfillment: true,
