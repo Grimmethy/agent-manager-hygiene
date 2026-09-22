@@ -30,6 +30,7 @@ const { applyArchDiscoveryCandidates, isEffectivelyEmptyResponse } = require('ag
 const { writeJsonAtomicSync } = require('agent-manager/src/atomic-write.js');
 const { archReviewPlanPrompt, archReviewImplementPrompt } = require('agent-manager/src/prompts.js');
 const { detectDefaultBranch } = require('agent-manager/src/git-runner.js');
+const { runScopedTests } = require('agent-manager/src/scoped-test-runner.js');
 
 const DIFF_LINE_CAP = Number(process.env.AGENT_MANAGER_CHANGE_REVIEW_LINE_CAP) || 1500;
 const DIFF_FILE_CAP = Number(process.env.AGENT_MANAGER_CHANGE_REVIEW_FILE_CAP) || 60;
@@ -398,6 +399,28 @@ function nextChangeReviewTask({ getConfig, taskIdExistsInQueue }) {
     }
 
     const ctx = buildPromptContext(repoRoot, meta, nameStatus, diffText, mainBranch);
+
+    // Deterministic test gate (2026-09-23) -- see scoped-test-runner.js's own header for
+    // the full rationale: this diff broke an EXISTING test is a fact, not a judgment
+    // call, and running the test IS the ground truth -- no model call needed, and none
+    // would be more reliable. Checked BEFORE this unit ever enters the batch/solo LLM
+    // path below; a real failure here files its finding immediately and skips the model
+    // entirely for this commit. `passed: true` or `null` (no covering test exists) both
+    // fall through unchanged -- this gate can only ADD confidence, never subtract it, so
+    // it never suppresses the normal LLM review that still runs for everything else.
+    let testResult = null;
+    try {
+      testResult = runScopedTests(repoRoot, nameStatus.map((f) => f.path));
+    } catch { /* fail open -- a runner-level problem must never block the normal review */ }
+    if (testResult && !testResult.passed) {
+      const flushed = flushBatch();
+      if (flushed) return flushed;
+      fileDeterministicTestFailureFinding(pipelineDir, meta, ctx, testResult);
+      recordSkip(pipelineDir, meta, 'test-failure-auto-filed', stats);
+      writeCursor(changeReviewCursorPath, sha);
+      continue;
+    }
+
     const unitChars = (ctx.unitDiff || '').length;
     const tooLargeForBatch = unitChars > CHANGE_REVIEW_BATCH_UNIT_MAX_CHARS;
 
@@ -593,14 +616,23 @@ function changeReviewImplementPrompt(task, planText) {
 
 // --- apply ---------------------------------------------------------------------
 
+// 2026-09-23, root-caused live wiring the deterministic test gate: with the /m flag, a
+// bare `$` matches before EVERY line ending, not just the end of the whole string -- so
+// `failure`/`fix`'s "or end of string" fallback alternative actually meant "or end of
+// THIS LINE", silently truncating any multi-line field value at its very first internal
+// newline. Invisible until now because a real LLM finding's prose never embeds a hard
+// newline inside one field; the deterministic gate's own synthetic finding embeds real,
+// multi-line `node --test`/`unittest` output and hit this immediately (confirmed live:
+// filed with a completely empty Failure scenario, cut off right after its own first
+// line). `(?![\s\S])` is a true end-of-STRING assertion, unaffected by /m, unlike `$`.
 const FIELD_RES = {
   commit: /^Commit:\s*(.+)$/im,
   file: /^File:\s*(.+)$/im,
   line: /^Line:\s*(.+)$/im,
   severity: /^Severity:\s*(.+)$/im,
   regression: /^Regression:\s*(.+)$/im,
-  failure: /^Failure scenario:\s*([\s\S]+?)(?=\n(?:Fix sketch:|Severity:|Regression:|File:|Line:)|\n{2,}|$)/im,
-  fix: /^Fix sketch:\s*([\s\S]+?)(?=\n{2,}|$)/im,
+  failure: /^Failure scenario:\s*([\s\S]+?)(?=\n(?:Fix sketch:|Severity:|Regression:|File:|Line:)|\n{2,}|(?![\s\S]))/im,
+  fix: /^Fix sketch:\s*([\s\S]+?)(?=\n{2,}|(?![\s\S]))/im,
 };
 
 function parseFindings(text) {
@@ -706,6 +738,48 @@ function buildAcBlock(finding, ctx, verification) {
   // Over budget -- shrink the snippet hard.
   const shortSnippet = snippet.slice(0, Math.max(200, SNIPPET_CAP_CHARS - (block.length - AC_BLOCK_MAX_CHARS) - 40));
   return block.replace(snippet, `${shortSnippet}\n...[snippet truncated]`);
+}
+
+// Deterministic-test-gate finding (2026-09-23): the model is never consulted here -- the
+// FINDING block below is built entirely from real `runScopedTests` output and fed through
+// the exact same applyChangeReview()/buildAcBlock() path a real LLM finding would take, so
+// it lands in Docs/CHANGE_REVIEW_CANDIDATES.md identically (same format, same downstream
+// change_review_fix consumption). Severity is always 'high' -- an existing test failing is
+// unconditionally a real regression, never a judgment call the way an LLM's own findings
+// are. Best-effort: any failure while filing (a config/fs problem) is swallowed with a
+// warning, matching recordSkip's own "an audit-log write must never break the caller"
+// discipline -- the commit's own review coverage isn't lost either way, since the caller
+// (nextChangeReviewTask) still records the ordinary 'test-failure-auto-filed' skip and
+// advances the cursor regardless of whether this filing itself succeeded.
+function fileDeterministicTestFailureFinding(pipelineDir, meta, ctx, testResult) {
+  const primaryFile = (ctx.files || [])[0] ? ctx.files[0].split('\t').slice(1).join('\t') : (ctx.sha || 'unknown file');
+  const failureNames = testResult.failures.length ? testResult.failures.slice(0, 5).join('; ') : '(test runner reported failure with no individually-named test)';
+  const ranList = (testResult.ran || []).join(', ');
+  // Collapsed to single-newline-max BEFORE slicing/embedding: parseFindings' own
+  // Failure-scenario field terminates on a blank line (\n{2,}) exactly like it terminates
+  // on the next field name -- real `node --test`/unittest output is full of blank lines,
+  // so embedding it verbatim silently truncated this field (confirmed live: the finding
+  // filed with an EMPTY failure scenario, cut off at the very first blank line in the raw
+  // TAP output). This is purely a report-readability compaction, not a content change.
+  const rawExcerpt = ((testResult.jsRaw || '') + (testResult.pyRaw || ''))
+    .replace(/\n{2,}/g, '\n').trim().slice(0, 600);
+  const implementResponse = [
+    'FINDING',
+    `File: ${primaryFile}`,
+    'Line: (deterministic test-gate finding -- no single line; see the failing test(s) below)',
+    'Severity: high',
+    `Regression: This diff makes an EXISTING test fail: ${failureNames}. Confirmed by actually running the test (${ranList}), not inferred.`,
+    `Failure scenario: Running the scoped test suite for the files this commit touched fails with:\n${rawExcerpt || '(no output captured)'}`,
+    'Fix sketch: Restore the behaviour the failing test expects, or update the test if this diff intentionally changed the contract it checks (and explain why in the fix).',
+  ].join('\n');
+  try {
+    const res = applyChangeReview({ implementResponse, task: { promptContext: ctx } });
+    if (!res || (!res.succeeded && !res.skipped)) {
+      console.error(`[change-review] deterministic test-failure finding for ${meta.sha7} did not file cleanly: ${JSON.stringify(res)}`);
+    }
+  } catch (e) {
+    console.error(`[change-review] failed to file deterministic test-failure finding for ${meta.sha7}: ${e.message}`);
+  }
 }
 
 function applyChangeReview({ implementResponse, task }) {
