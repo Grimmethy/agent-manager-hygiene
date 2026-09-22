@@ -174,7 +174,11 @@ test('generated-only commit (package-lock.json) -> skipped', () => {
 test('test-only commit -> NOT skipped, task returned', () => {
   const repo = makeGitRepo();
   repo.commit({ 'a.js': 'v0\n' }, 'c1');
-  const c2 = repo.commit({ 'a.test.js': 'assert(1)\nassert(2)\n' }, 'tests');
+  // Valid, PASSING node:test content (2026-09-23: the deterministic test gate now
+  // actually EXECUTES a changed test file -- the placeholder `assert(1)` this used to be
+  // isn't real runnable test code at all and genuinely throws ReferenceError under
+  // `node --test`, which is a correct catch by the new gate, not a bug in it).
+  const c2 = repo.commit({ 'a.test.js': "require('node:test')('t', () => {});\n" }, 'tests');
   writeCursor(repo.dir, git(repo.dir, ['rev-parse', `${c2}^`]));
   const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
   const task = mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
@@ -244,6 +248,60 @@ test('cursor safety: an individually-already-queued commit (pre-batching legacy 
   // c2 alone forms the first batch (c3 ends it); c3 itself gets skipped/advanced past.
   assert.equal(task.id, `change-review-${c2.slice(0, 7)}`);
   assert.equal(task.promptContext.unitDiff !== undefined, true, 'a batch of exactly one member keeps the legacy flat shape');
+});
+
+// --- deterministic test gate (2026-09-23) -----------------------------------------
+// See scoped-test-runner.js's own header and this file's own comment above
+// fileDeterministicTestFailureFinding for the full rationale: "this diff breaks an
+// EXISTING test" needs no model call, ever -- running the test IS the ground truth.
+
+test('deterministic test gate: a commit that breaks its own co-located test files a candidate directly, with NO task returned for it', () => {
+  const repo = makeGitRepo();
+  // A real, passing node:test file for a.js...
+  repo.commit({
+    'a.js': 'module.exports = { add: (x, y) => x + y };\n',
+    'a.test.js': [
+      "const test = require('node:test');",
+      "const assert = require('node:assert/strict');",
+      "const { add } = require('./a.js');",
+      "test('adds', () => { assert.equal(add(1, 2), 3); });",
+    ].join('\n'),
+  }, 'init with a passing test');
+  // ...then a commit that breaks add() without touching its test.
+  const bad = repo.commit({ 'a.js': 'module.exports = { add: (x, y) => x - y };\n' }, 'accidentally subtracts now');
+  writeCursor(repo.dir, git(repo.dir, ['rev-parse', `${bad}^`]));
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+
+  const task = mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+  assert.equal(task, null, 'the broken-test commit must never reach the model -- filed directly instead');
+  const doc = fs.readFileSync(path.join(repo.dir, 'Docs', 'CHANGE_REVIEW_CANDIDATES.md'), 'utf8');
+  assert.match(doc, /### AC-1 /);
+  assert.match(doc, /\[severity: high/, 'a deterministic test-failure finding is always high severity');
+  assert.match(doc, /EXISTING test fail/);
+  assert.match(doc, /adds/, 'names the actual failing test');
+  assert.match(doc, /Failure scenario: Running the scoped test suite.+not ok/s, 'the real test-runner output survives into the filed finding, not truncated to empty');
+  const skipped = JSON.parse(fs.readFileSync(path.join(repo.dir, 'change-review-skipped.json'), 'utf8'));
+  assert.equal(skipped[0].reason, 'test-failure-auto-filed');
+});
+
+test('deterministic test gate: a commit whose scoped tests still pass proceeds through the normal LLM task path, unaffected', () => {
+  const repo = makeGitRepo();
+  repo.commit({
+    'a.js': 'module.exports = { add: (x, y) => x + y };\n',
+    'a.test.js': [
+      "const test = require('node:test');",
+      "const assert = require('node:assert/strict');",
+      "const { add } = require('./a.js');",
+      "test('adds', () => { assert.equal(add(1, 2), 3); });",
+    ].join('\n'),
+  }, 'init with a passing test');
+  const good = repo.commit({ 'a.js': 'module.exports = { add: (x, y) => y + x };\n' }, 'harmless refactor, test still passes');
+  writeCursor(repo.dir, git(repo.dir, ['rev-parse', `${good}^`]));
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+
+  const task = mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+  assert.ok(task, 'a commit whose tests pass must still get a normal review task');
+  assert.equal(task.id, `change-review-${good.slice(0, 7)}`);
 });
 
 // --- batching mechanics (2026-09-23) ---------------------------------------------
@@ -496,6 +554,36 @@ test('applyChangeReview: malformed block (no Failure scenario) is dropped; all d
   const { mod } = freshPlugin(fs.mkdtempSync(path.join(os.tmpdir(), 'cr-apply4-')));
   const resp = 'FINDING\nFile: src/a.js\nRegression: something\nFix sketch: x\n';
   assert.equal(mod.applyChangeReview({ implementResponse: resp, task: { promptContext: applyCtx() } }).skipped, true);
+});
+
+// 2026-09-23, root-caused live wiring the deterministic test gate: with the /m flag on
+// FIELD_RES.failure/.fix, a bare `$` matches before every LINE ending, not just the end of
+// the whole string -- so a Failure scenario or Fix sketch containing an embedded newline
+// (real `node --test`/unittest output, not typical LLM prose) got silently truncated at
+// its own first line. Confirmed live: a deterministic finding filed with a completely
+// empty Failure scenario. This proves the fix directly, independent of the test-gate
+// wiring that surfaced it.
+test('parseFindings: a Failure scenario containing embedded newlines is captured in full, not truncated at its first line', () => {
+  const { mod } = freshPlugin(fs.mkdtempSync(path.join(os.tmpdir(), 'cr-multiline-')));
+  const resp = [
+    'FINDING', 'File: src/a.js', 'Line: 1', 'Severity: high', 'Regression: r',
+    'Failure scenario: first line of real output\nsecond line\nthird line',
+    'Fix sketch: s',
+  ].join('\n');
+  const [finding] = mod.parseFindings(resp);
+  assert.equal(finding.failure, 'first line of real output\nsecond line\nthird line');
+  assert.equal(finding.fix, 's');
+});
+
+test('parseFindings: a Fix sketch containing embedded newlines is captured in full, not truncated at its first line', () => {
+  const { mod } = freshPlugin(fs.mkdtempSync(path.join(os.tmpdir(), 'cr-multiline2-')));
+  const resp = [
+    'FINDING', 'File: src/a.js', 'Line: 1', 'Severity: high', 'Regression: r',
+    'Failure scenario: f',
+    'Fix sketch: step one\nstep two\nstep three',
+  ].join('\n');
+  const [finding] = mod.parseFindings(resp);
+  assert.equal(finding.fix, 'step one\nstep two\nstep three');
 });
 
 test('applyChangeReview: AC block stays under 3500 chars even with a huge hunk', () => {
