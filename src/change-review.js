@@ -42,6 +42,26 @@ const SNIPPET_CAP_CHARS = 1500;
 const AC_BLOCK_MAX_CHARS = 3500;           // MAX_ARCH_REVIEW_TASK_CHARS is 4000 -- stay well under
 const DEFAULT_BACKFILL = 10;
 
+// --- batching small commits into one review task (2026-09-23) -----------------------
+// Generation was outpacing consumption: change_review materializes one task per
+// first-parent commit, and this repo's own pipeline can land dozens of tiny commits
+// (a one-line fix, a doc tweak that still touches code, a config bump) in a single day,
+// each paying the full per-task overhead (a worker claim, a plan pass, an implement pass,
+// a review round) for a diff a human would glance at in seconds. Confirmed live
+// 2026-09-22: ~870 new pending change_review tasks materialized in 24h against only ~22
+// new commits actually landing that day -- the generator was grinding through a long-
+// stale historical backlog, one tiny commit at a time.
+//
+// Bundling several small, CONSECUTIVE commits into one review task cuts task count
+// without skipping anything: every commit is still reviewed, hunk-by-hunk, by name --
+// this only amortizes the fixed per-task overhead across commits too small to need their
+// own dedicated pass. A commit whose own diff already eats a meaningful chunk of the
+// budget is still reviewed alone, exactly as before (large, security/behavior-heavy
+// changes are exactly the ones that should NOT get diluted by being bundled with others).
+const CHANGE_REVIEW_BATCH_MAX_UNITS = Number(process.env.AGENT_MANAGER_CHANGE_REVIEW_BATCH_SIZE) || 5;
+const CHANGE_REVIEW_BATCH_UNIT_MAX_CHARS = 3000;    // a unit diff bigger than this reviews alone
+const CHANGE_REVIEW_BATCH_COMBINED_MAX_CHARS = 12000; // stays well under DIFF_BUDGET_CHARS/CONTEXT_BUDGET
+
 // %n (newline) field separator: execFileSync args cannot contain a literal NUL byte, and
 // %s (subject) / %an / %cI never themselves contain a newline, so this round-trips cleanly.
 const FIELD_SEP = '\n';
@@ -315,9 +335,37 @@ function nextChangeReviewTask({ getConfig, taskIdExistsInQueue }) {
   if (cursor.lastReviewedSha === head) return null;
 
   const units = enumerateUnits(repoRoot, mainBranch, cursor.lastReviewedSha);
+
+  // Accumulates consecutive small reviewable units into one batch task -- see this file's
+  // own header on CHANGE_REVIEW_BATCH_MAX_UNITS for why. flushBatch() below either returns
+  // the batch as a task (0 or 1 members -> the exact legacy shape/behavior; 2+ -> the new
+  // batch shape), or -- when that exact batch was already queued/done from a prior tick --
+  // advances the cursor past every member and returns null so the caller keeps scanning.
+  let batch = [];
+  let batchChars = 0;
+  const flushBatch = () => {
+    if (batch.length === 0) return undefined;
+    if (batch.length === 1) {
+      const { id, meta, ctx } = batch[0];
+      batch = []; batchChars = 0;
+      return soloTask(defaultDomain, meta, ctx, id);
+    }
+    const batchId = `change-review-batch-${batch[0].meta.sha7}-${batch[batch.length - 1].meta.sha7}`;
+    if (taskIdExistsInQueue(batchId)) {
+      writeCursor(changeReviewCursorPath, batch[batch.length - 1].sha);
+      batch = []; batchChars = 0;
+      return undefined;
+    }
+    const task = batchTask(defaultDomain, batch, batchId, mainBranch);
+    batch = []; batchChars = 0;
+    return task;
+  };
+
   for (const sha of units) {
     const id = `change-review-${sha.slice(0, 7)}`;
     if (taskIdExistsInQueue(id)) {
+      const flushed = flushBatch();
+      if (flushed) return flushed;
       writeCursor(changeReviewCursorPath, sha);
       continue;
     }
@@ -325,12 +373,16 @@ function nextChangeReviewTask({ getConfig, taskIdExistsInQueue }) {
     const nameStatus = unitNameStatus(repoRoot, sha);
     const kind = classifyUnit(nameStatus);
     if (kind !== 'reviewable') {
+      const flushed = flushBatch();
+      if (flushed) return flushed;
       recordSkip(pipelineDir, meta, kind, null);
       writeCursor(changeReviewCursorPath, sha);
       continue;
     }
     const stats = unitNumstat(repoRoot, sha);
     if (stats.changedLines > DIFF_LINE_CAP || stats.files > DIFF_FILE_CAP) {
+      const flushed = flushBatch();
+      if (flushed) return flushed;
       recordSkip(pipelineDir, meta, 'too-large', stats);
       writeCursor(changeReviewCursorPath, sha);
       continue;
@@ -338,21 +390,85 @@ function nextChangeReviewTask({ getConfig, taskIdExistsInQueue }) {
     const diffText = unitDiff(repoRoot, sha);
     if (!diffText.trim()) {
       // Empty first-parent delta (e.g. a merge that changed nothing) -- nothing to review.
+      const flushed = flushBatch();
+      if (flushed) return flushed;
       recordSkip(pipelineDir, meta, 'empty-diff', stats);
       writeCursor(changeReviewCursorPath, sha);
       continue;
     }
-    // Found a reviewable unit whose task is NOT yet queued -- return it WITHOUT advancing
-    // the cursor (tier-filter-discard safety).
-    return {
-      id,
-      domain: defaultDomain,
-      source: 'change_review',
-      title: `Change review: ${meta.sha7} ${meta.subject}`.slice(0, 140),
-      promptContext: buildPromptContext(repoRoot, meta, nameStatus, diffText, mainBranch),
-    };
+
+    const ctx = buildPromptContext(repoRoot, meta, nameStatus, diffText, mainBranch);
+    const unitChars = (ctx.unitDiff || '').length;
+    const tooLargeForBatch = unitChars > CHANGE_REVIEW_BATCH_UNIT_MAX_CHARS;
+
+    if (batch.length > 0 && (tooLargeForBatch || batchChars + unitChars > CHANGE_REVIEW_BATCH_COMBINED_MAX_CHARS)) {
+      // This unit doesn't fit in the batch accumulated so far -- close that batch out
+      // (returning it, or discarding it if already queued) before considering this unit.
+      const flushed = flushBatch();
+      if (flushed) return flushed;
+    }
+    if (batch.length === 0 && tooLargeForBatch) {
+      // Too big to ever bundle -- reviewed alone, exactly like the original behavior.
+      return soloTask(defaultDomain, meta, ctx, id);
+    }
+
+    batch.push({ id, sha, meta, ctx });
+    batchChars += unitChars;
+    if (batch.length >= CHANGE_REVIEW_BATCH_MAX_UNITS) {
+      const flushed = flushBatch();
+      if (flushed) return flushed;
+    }
   }
-  return null;
+  return flushBatch() || null;
+}
+
+function soloTask(defaultDomain, meta, ctx, id) {
+  // Found a reviewable unit whose task is NOT yet queued -- return it WITHOUT advancing
+  // the cursor (tier-filter-discard safety) -- exactly the original single-commit shape,
+  // unchanged, so every already-queued task and every existing caller keeps working.
+  return {
+    id,
+    domain: defaultDomain,
+    source: 'change_review',
+    title: `Change review: ${meta.sha7} ${meta.subject}`.slice(0, 140),
+    promptContext: ctx,
+  };
+}
+
+function batchTask(defaultDomain, batch, batchId, mainBranch) {
+  const first = batch[0].meta.sha7;
+  const last = batch[batch.length - 1].meta.sha7;
+  return {
+    id: batchId,
+    domain: defaultDomain,
+    source: 'change_review',
+    title: `Change review: ${batch.length} small commits (${first}..${last})`.slice(0, 140),
+    // Deliberately NOT the single-commit shape (no top-level sha/unitDiff) -- `units` is
+    // the multi-commit shape unitsOf() below recognizes; every already-existing pending/
+    // done task still has the flat legacy shape and unitsOf() wraps that unchanged.
+    promptContext: {
+      mainBranch,
+      units: batch.map(({ meta, ctx }) => ({
+        sha: meta.sha7,
+        subject: meta.subject,
+        author: meta.author,
+        dateISO: meta.dateISO,
+        files: ctx.files,
+        unitDiff: ctx.unitDiff,
+        smallFileContents: ctx.smallFileContents,
+      })),
+    },
+  };
+}
+
+// Normalizes either promptContext shape (legacy flat single-unit, or the new
+// `{units:[...]}` multi-unit batch) into an array -- every reader of a unit's own fields
+// (prompts, apply, the quote-check) goes through this so both shapes work everywhere.
+function unitsOf(ctx) {
+  if (!ctx) return [];
+  if (Array.isArray(ctx.units) && ctx.units.length) return ctx.units;
+  if (ctx.sha) return [{ sha: ctx.sha, subject: ctx.subject, author: ctx.author, dateISO: ctx.dateISO, files: ctx.files, unitDiff: ctx.unitDiff, smallFileContents: ctx.smallFileContents }];
+  return [];
 }
 
 // --- prompts --------------------------------------------------------------------
@@ -366,24 +482,38 @@ function renderSmallFiles(ctx) {
     .join('\n\n');
 }
 
-function changeReviewPlanPrompt(task) {
-  const ctx = task.promptContext || {};
+function renderUnitBlock(u, index, total) {
   return [
-    `You are triaging the diff of ONE change already merged to ${ctx.mainBranch || 'the main branch'}, looking ONLY for CORRECTNESS REGRESSIONS this diff introduced -- behaviour that was right before and is wrong after.`,
-    '',
-    `COMMIT: ${ctx.sha} ${ctx.subject}  (author ${ctx.author}, ${ctx.dateISO})`,
+    total > 1 ? `=== COMMIT ${index + 1}/${total}: ${u.sha} ${u.subject}  (author ${u.author}, ${u.dateISO}) ===` : `COMMIT: ${u.sha} ${u.subject}  (author ${u.author}, ${u.dateISO})`,
     'Changed files:',
-    (ctx.files || []).join('\n'),
+    (u.files || []).join('\n'),
     '',
     'DIFF (unified, first-parent delta):',
-    ctx.unitDiff || '(no diff)',
+    u.unitDiff || '(no diff)',
     '',
     'Small touched files, full content, for context:',
-    renderSmallFiles(ctx),
+    renderSmallFiles(u),
+  ].join('\n');
+}
+
+function changeReviewPlanPrompt(task) {
+  const ctx = task.promptContext || {};
+  const units = unitsOf(ctx);
+  const multi = units.length > 1;
+  const header = multi
+    ? `You are triaging the diffs of ${units.length} small, separately-authored changes already merged to ${ctx.mainBranch || 'the main branch'}, looking ONLY for CORRECTNESS REGRESSIONS each one introduced -- behaviour that was right before and is wrong after. Judge each commit independently; a regression in one is unrelated to the others.`
+    : `You are triaging the diff of ONE change already merged to ${ctx.mainBranch || 'the main branch'}, looking ONLY for CORRECTNESS REGRESSIONS this diff introduced -- behaviour that was right before and is wrong after.`;
+  return [
+    header,
     '',
-    'PART 1 -- write a numbered PLAN that walks EVERY changed hunk and, for each, states one of:',
+    ...units.map((u, i) => renderUnitBlock(u, i, units.length)),
+    '',
+    multi
+      ? 'PART 1 -- for EACH commit above, write a numbered PLAN that walks EVERY changed hunk and, for each, states one of:'
+      : 'PART 1 -- write a numbered PLAN that walks EVERY changed hunk and, for each, states one of:',
     '  - "hunk N (<file>): no correctness change" + a one-clause reason, OR',
     '  - "hunk N (<file>): SUSPECT -- <what could now be wrong>"',
+    multi ? 'Prefix each hunk with which commit it belongs to, e.g. "commit 2, hunk 1 (<file>): ...".' : '',
     '',
     'Hunt ONLY: off-by-one / wrong bound; inverted, dropped, or weakened condition; a removed',
     'or bypassed error/validation path; a resource not released on a path that now exists;',
@@ -395,9 +525,9 @@ function changeReviewPlanPrompt(task) {
     'than guessing at code you were not shown.',
     '',
     'PART 2 -- for every function, method, or exported constant whose signature or contract',
-    'this diff CHANGED, emit one line to find its callers elsewhere in the repo:',
+    'any commit above CHANGED, emit one line to find its callers elsewhere in the repo:',
     'QUERY: <the symbol name>',
-    '(Emit nothing here if the diff changed no public symbol.)',
+    '(Emit nothing here if nothing changed a public symbol.)',
   ].join('\n');
 }
 
@@ -415,14 +545,18 @@ function renderHarness(ctx) {
 
 function changeReviewImplementPrompt(task, planText) {
   const ctx = task.promptContext || {};
+  const units = unitsOf(ctx);
+  const multi = units.length > 1;
   return [
-    'CONTEXT: you already triaged this merged change hunk-by-hunk:',
+    'CONTEXT: you already triaged ' + (multi ? 'these merged changes' : 'this merged change') + ' hunk-by-hunk:',
     planText || '(no plan)',
     '',
-    `COMMIT: ${ctx.sha} ${ctx.subject}`,
-    'DIFF:',
-    ctx.unitDiff || '(no diff)',
-    renderSmallFiles(ctx),
+    ...units.map((u, i) => [
+      multi ? `=== COMMIT ${i + 1}/${units.length}: ${u.sha} ${u.subject} ===` : `COMMIT: ${u.sha} ${u.subject}`,
+      'DIFF:',
+      u.unitDiff || '(no diff)',
+      renderSmallFiles(u),
+    ].join('\n')),
     '',
     'CALLERS FOUND ELSEWHERE IN THE REPO (from your PART 2 queries -- check each against the',
     'changed contract):',
@@ -435,12 +569,13 @@ function changeReviewImplementPrompt(task, planText) {
     'Output EXACTLY one of:',
     '',
     '(A) the single line:  NO CORRECTNESS ISSUES',
-    '    -- use this if, after walking every hunk, there is no regression you can demonstrate',
-    '      with a concrete input. Common and fully acceptable.',
+    '    -- use this if, after walking every hunk in every commit above, there is no regression',
+    '      you can demonstrate with a concrete input. Common and fully acceptable.',
     '',
     '(B) one or more findings, each EXACTLY this block, blank-line separated, NOTHING else:',
     '',
     'FINDING',
+    ...(multi ? [`Commit: <the exact COMMIT sha shown above this finding's diff, e.g. ${units[0].sha}>`] : []),
     'File: <path from the diff>',
     'Line: <post-change line number or hunk header>',
     'Severity: high | med | low',
@@ -452,13 +587,14 @@ function changeReviewImplementPrompt(task, planText) {
     'Rules: every finding needs a Failure scenario with real values -- no constructible',
     'failing input means it is not a finding. Only regressions introduced by THIS diff (not a',
     'pre-existing bug it merely moved). Do not invent code outside the diff, the embedded',
-    'files, and the caller hits. Cite the hunk.',
+    'files, and the caller hits. Cite the hunk.' + (multi ? ' A finding with no Commit: line, or one that names a sha not shown above, is unusable -- always include it.' : ''),
   ].join('\n');
 }
 
 // --- apply ---------------------------------------------------------------------
 
 const FIELD_RES = {
+  commit: /^Commit:\s*(.+)$/im,
   file: /^File:\s*(.+)$/im,
   line: /^Line:\s*(.+)$/im,
   severity: /^Severity:\s*(.+)$/im,
@@ -477,6 +613,7 @@ function parseFindings(text) {
       return m ? m[1].trim() : '';
     };
     const finding = {
+      commit: g(FIELD_RES.commit), // '' on a solo (single-commit) task -- Commit: is only required/emitted for a batch
       file: g(FIELD_RES.file),
       line: g(FIELD_RES.line),
       severity: (g(FIELD_RES.severity) || 'med').toLowerCase().split(/\s|\|/)[0],
@@ -489,6 +626,21 @@ function parseFindings(text) {
     out.push(finding);
   }
   return out;
+}
+
+// Resolves which reviewed commit a finding is about. A solo task has exactly one unit --
+// always that one, Commit: field or not. A batch needs the model's own Commit: line to
+// disambiguate; an exact or prefix match against a unit's (short) sha wins, and an
+// unmatched/missing Commit: on a batch falls back to the first unit rather than silently
+// mislabeling the finding as belonging to none of them.
+function unitForFinding(units, finding) {
+  if (units.length <= 1) return units[0] || {};
+  const wanted = (finding.commit || '').trim();
+  if (wanted) {
+    const hit = units.find((u) => u.sha && (u.sha === wanted || u.sha.startsWith(wanted) || wanted.startsWith(u.sha)));
+    if (hit) return hit;
+  }
+  return units[0];
 }
 
 // Best-effort: the hunk from ctx.unitDiff that touches the finding's file, capped.
@@ -566,7 +718,11 @@ function applyChangeReview({ implementResponse, task }) {
     return { skipped: true, reason: 'change review: no well-formed FINDING blocks in the draft' };
   }
   const ctx = (task && task.promptContext) || {};
-  const blocks = findings.map((f) => buildAcBlock(f, ctx, verifyFinding(f, ctx)));
+  const units = unitsOf(ctx);
+  const blocks = findings.map((f) => {
+    const unit = unitForFinding(units, f);
+    return buildAcBlock(f, unit, verifyFinding(f, unit));
+  });
 
   let candidatesPath;
   try {
@@ -594,10 +750,12 @@ function applyChangeReview({ implementResponse, task }) {
 async function changeReviewQuoteCheck(task, implementResponse) {
   try {
     const ctx = (task && task.promptContext) || {};
+    const units = unitsOf(ctx);
     const warnings = [];
     for (const f of parseFindings(String(implementResponse || ''))) {
-      const v = verifyFinding(f, ctx);
-      if (v.unverified.length) warnings.push(`finding on ${f.file}: ${describeUnverified(v.unverified, { file: f.file, sha: ctx.sha })}`);
+      const unit = unitForFinding(units, f);
+      const v = verifyFinding(f, unit);
+      if (v.unverified.length) warnings.push(`finding on ${f.file}: ${describeUnverified(v.unverified, { file: f.file, sha: unit.sha })}`);
     }
     return warnings.length ? { verdict: 'ok', warnings } : { verdict: 'ok' };
   } catch {
@@ -767,4 +925,9 @@ module.exports = {
   changeReviewCompletenessQuestionFor,
   CHANGE_REVIEW_REVIEW_GUIDANCE,
   CHANGE_REVIEW_COMPLETENESS_QUESTION,
+  unitsOf,
+  unitForFinding,
+  CHANGE_REVIEW_BATCH_MAX_UNITS,
+  CHANGE_REVIEW_BATCH_UNIT_MAX_CHARS,
+  CHANGE_REVIEW_BATCH_COMBINED_MAX_CHARS,
 };
