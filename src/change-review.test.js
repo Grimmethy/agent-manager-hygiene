@@ -104,7 +104,7 @@ test('first run, BACKFILL=0, no new commits -> null; cursor seeded at HEAD', () 
   assert.equal(readCursor(repo.dir), git(repo.dir, ['rev-parse', 'origin/main']));
 });
 
-test('BACKFILL past N commits -> task for the OLDEST unreviewed commit; cursor NOT advanced', () => {
+test('BACKFILL past N commits -> task covers the OLDEST unreviewed commits first, batched (both are small); cursor NOT advanced', () => {
   const repo = makeGitRepo();
   repo.commit({ 'a.js': 'v0\n' }, 'c1');
   const c2 = repo.commit({ 'a.js': 'v1\nSECOND\n' }, 'c2');
@@ -113,11 +113,14 @@ test('BACKFILL past N commits -> task for the OLDEST unreviewed commit; cursor N
   const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
   const task = mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
   assert.ok(task);
-  assert.equal(task.id, `change-review-${c2.slice(0, 7)}`);
+  // c2 and c3 are both tiny, consecutive commits -- they batch into one task rather than
+  // each paying for their own dedicated review pass (2026-09-23 batching).
+  assert.equal(task.id, `change-review-batch-${c2.slice(0, 7)}-${c3.slice(0, 7)}`);
   assert.equal(task.source, 'change_review');
-  assert.match(task.promptContext.unitDiff, /SECOND/);
-  assert.equal(readCursor(repo.dir), git(repo.dir, ['rev-parse', `${c2}^`]), 'cursor holds at the pre-c2 sha');
-  assert.ok(c3);
+  assert.equal(task.promptContext.units.length, 2);
+  assert.match(task.promptContext.units[0].unitDiff, /SECOND/);
+  assert.match(task.promptContext.units[1].unitDiff, /THIRD/);
+  assert.equal(readCursor(repo.dir), git(repo.dir, ['rev-parse', `${c2}^`]), 'cursor holds before the batch -- neither member is queued yet');
 });
 
 test('id already in queue -> cursor advances, returns the next commit', () => {
@@ -202,7 +205,7 @@ test('merge commit -> unit = merge SHA, unitDiff is the first-parent net delta',
   assert.match(task.promptContext.unitDiff, /TWO/);
 });
 
-test('cursor safety: a returned-but-unqueued commit does not lose later commits', () => {
+test('cursor safety: a returned-but-unqueued BATCH does not lose commits, and is skipped whole once queued', () => {
   const repo = makeGitRepo();
   repo.commit({ 'a.js': 'v0\n' }, 'c1');
   const c2 = repo.commit({ 'a.js': 'v0\nB\n' }, 'c2');
@@ -211,14 +214,144 @@ test('cursor safety: a returned-but-unqueued commit does not lose later commits'
   writeCursor(repo.dir, git(repo.dir, ['rev-parse', `${c2}^`]));
   const p1 = freshPlugin(repo.dir);
   const t1 = p1.mod.nextChangeReviewTask({ getConfig: p1.getConfig, taskIdExistsInQueue: p1.taskIdExistsInQueue });
-  assert.equal(t1.id, `change-review-${c2.slice(0, 7)}`);
-  assert.equal(readCursor(repo.dir), git(repo.dir, ['rev-parse', `${c2}^`]));
-  // c2's task now lands in the queue; next tick must reach c3, then c4.
-  seedQueue(repo.dir, 'approved', `change-review-${c2.slice(0, 7)}`);
+  // c2, c3, c4 are all tiny and consecutive -- one batch covers all three.
+  const batchId = `change-review-batch-${c2.slice(0, 7)}-${c4.slice(0, 7)}`;
+  assert.equal(t1.id, batchId);
+  assert.equal(t1.promptContext.units.length, 3);
+  assert.equal(readCursor(repo.dir), git(repo.dir, ['rev-parse', `${c2}^`]), 'nothing in the batch is queued yet -- cursor holds before it');
+  // The batch task now lands in the queue; the next tick must recognize the WHOLE batch
+  // as already covered (not re-split it back into c2/c3/c4) and find nothing left.
+  seedQueue(repo.dir, 'approved', batchId);
   const p2 = freshPlugin(repo.dir);
   const t2 = p2.mod.nextChangeReviewTask({ getConfig: p2.getConfig, taskIdExistsInQueue: p2.taskIdExistsInQueue });
-  assert.equal(t2.id, `change-review-${c3.slice(0, 7)}`);
+  assert.equal(t2, null);
+  assert.equal(readCursor(repo.dir), c4, 'cursor advances past every member of the now-queued batch');
+});
+
+test('cursor safety: an individually-already-queued commit (pre-batching legacy task) breaks the batch there, not lost', () => {
+  const repo = makeGitRepo();
+  repo.commit({ 'a.js': 'v0\n' }, 'c1');
+  const c2 = repo.commit({ 'a.js': 'v0\nB\n' }, 'c2');
+  const c3 = repo.commit({ 'a.js': 'v0\nB\nC\n' }, 'c3');
+  const c4 = repo.commit({ 'a.js': 'v0\nB\nC\nD\n' }, 'c4');
+  writeCursor(repo.dir, git(repo.dir, ['rev-parse', `${c2}^`]));
+  // c3 already has its OWN legacy single-commit task queued (e.g. from before this batch
+  // was ever generated, or from before this feature existed) -- it must not be silently
+  // swept into a new batch alongside c2/c4.
+  seedQueue(repo.dir, 'approved', `change-review-${c3.slice(0, 7)}`);
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+  const task = mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+  // c2 alone forms the first batch (c3 ends it); c3 itself gets skipped/advanced past.
+  assert.equal(task.id, `change-review-${c2.slice(0, 7)}`);
+  assert.equal(task.promptContext.unitDiff !== undefined, true, 'a batch of exactly one member keeps the legacy flat shape');
+});
+
+// --- batching mechanics (2026-09-23) ---------------------------------------------
+// See change-review.js's own header comment on CHANGE_REVIEW_BATCH_MAX_UNITS for why:
+// generation was outpacing consumption because every commit, however tiny, paid the
+// full per-task overhead. These prove the size/count caps and the large-commit-stays-
+// solo behavior a pure "does it batch at all" test wouldn't catch.
+
+test('batching: a run longer than CHANGE_REVIEW_BATCH_MAX_UNITS splits into multiple batch tasks', () => {
+  const repo = makeGitRepo();
+  repo.commit({ 'a.js': 'v0\n' }, 'c1');
+  const shas = [];
+  for (let i = 0; i < 7; i += 1) {
+    shas.push(repo.commit({ 'a.js': `v0\n${'x'.repeat(i + 1)}\n` }, `c${i + 2}`));
+  }
+  writeCursor(repo.dir, git(repo.dir, ['rev-parse', `${shas[0]}^`]));
+  process.env.AGENT_MANAGER_CHANGE_REVIEW_BATCH_SIZE = '3';
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+  delete process.env.AGENT_MANAGER_CHANGE_REVIEW_BATCH_SIZE;
+  const t1 = mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+  assert.equal(t1.promptContext.units.length, 3, 'first batch stops at the configured cap, not the whole run of 7');
+  assert.equal(t1.id, `change-review-batch-${shas[0].slice(0, 7)}-${shas[2].slice(0, 7)}`);
+});
+
+test('batching: a unit whose own diff exceeds the per-unit batch cap reviews alone, even mid-run', () => {
+  const repo = makeGitRepo();
+  repo.commit({ 'a.js': 'v0\n' }, 'c1');
+  const c2 = repo.commit({ 'a.js': 'v0\nsmall\n' }, 'c2');
+  const bigContent = Array.from({ length: 400 }, (_, i) => `line ${i} of a real change`).join('\n');
+  const c3 = repo.commit({ 'a.js': bigContent }, 'c3-big');
+  const c4 = repo.commit({ 'a.js': `${bigContent}\nsmall too\n` }, 'c4');
+  writeCursor(repo.dir, git(repo.dir, ['rev-parse', `${c2}^`]));
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+  const t1 = mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+  // c2 alone: c3's oversized diff ends the batch before c3 joins it.
+  assert.equal(t1.id, `change-review-${c2.slice(0, 7)}`);
+  assert.equal(t1.promptContext.unitDiff !== undefined, true);
   assert.ok(c4);
+});
+
+test('batching: combined size cap ends a batch even when each member individually fits', () => {
+  const repo = makeGitRepo();
+  repo.commit({ 'a.js': 'v0\n' }, 'c1');
+  // Each commit's diff is a few hundred chars (under the per-unit cap) but five of them
+  // together exceed the combined cap -- the batch must close before absorbing all of them.
+  const chunk = Array.from({ length: 80 }, (_, i) => `line ${i}`).join('\n');
+  const shas = [];
+  for (let i = 0; i < 6; i += 1) {
+    shas.push(repo.commit({ [`f${i}.js`]: `${chunk}\nmarker ${i}\n` }, `c${i + 2}`));
+  }
+  writeCursor(repo.dir, git(repo.dir, ['rev-parse', `${shas[0]}^`]));
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+  const t1 = mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+  assert.ok(t1.promptContext.units.length < 6, 'the combined-size cap must close the batch before every commit joins it');
+  assert.ok(t1.promptContext.units.length >= 1);
+});
+
+test('unitsOf: normalizes the legacy flat shape and the new multi-unit shape identically', () => {
+  const { mod } = freshPlugin(fs.mkdtempSync(path.join(os.tmpdir(), 'cr-unitsof-')));
+  const legacy = mod.unitsOf({ sha: 'abc1234', subject: 's', unitDiff: 'd' });
+  assert.equal(legacy.length, 1);
+  assert.equal(legacy[0].sha, 'abc1234');
+  const batch = mod.unitsOf({ units: [{ sha: 'aaa1111' }, { sha: 'bbb2222' }] });
+  assert.equal(batch.length, 2);
+  assert.equal(mod.unitsOf({}).length, 0);
+});
+
+test('unitForFinding: a solo task always resolves to its one unit, Commit: field or not', () => {
+  const { mod } = freshPlugin(fs.mkdtempSync(path.join(os.tmpdir(), 'cr-uff-solo-')));
+  const units = mod.unitsOf({ sha: 'abc1234', subject: 's', unitDiff: 'd' });
+  assert.equal(mod.unitForFinding(units, {}).sha, 'abc1234');
+  assert.equal(mod.unitForFinding(units, { commit: 'zzzzzzz' }).sha, 'abc1234');
+});
+
+test('unitForFinding: a batch resolves by exact or prefix sha match, and falls back to the first unit when unmatched/missing', () => {
+  const { mod } = freshPlugin(fs.mkdtempSync(path.join(os.tmpdir(), 'cr-uff-batch-')));
+  const units = mod.unitsOf({ units: [{ sha: 'aaa1111' }, { sha: 'bbb2222' }] });
+  assert.equal(mod.unitForFinding(units, { commit: 'bbb2222' }).sha, 'bbb2222');
+  assert.equal(mod.unitForFinding(units, { commit: 'bbb' }).sha, 'bbb2222', 'a short prefix still matches');
+  assert.equal(mod.unitForFinding(units, { commit: '' }).sha, 'aaa1111', 'missing Commit: falls back to the first unit');
+  assert.equal(mod.unitForFinding(units, { commit: 'nope0000' }).sha, 'aaa1111', 'unmatched Commit: falls back to the first unit');
+});
+
+test('applyChangeReview: a batch task files each finding under the RIGHT commit, via Commit:', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cr-apply-batch-'));
+  const { mod } = freshPlugin(dir);
+  const batchCtx = {
+    mainBranch: 'main',
+    units: [
+      { sha: 'aaa1111', subject: 'first small fix', unitDiff: 'diff --git a/src/a.js b/src/a.js\n@@ -1 +1 @@\n-old a\n+new a\n' },
+      { sha: 'bbb2222', subject: 'second small fix', unitDiff: 'diff --git a/src/b.js b/src/b.js\n@@ -1 +1 @@\n-old b\n+new b\n' },
+    ],
+  };
+  const resp = [
+    'FINDING',
+    'Commit: bbb2222',
+    'File: src/b.js',
+    'Line: 1',
+    'Severity: med',
+    'Regression: b regressed',
+    'Failure scenario: calling g() on src/b.js now returns the wrong value',
+    'Fix sketch: revert the b.js change',
+  ].join('\n');
+  const res = mod.applyChangeReview({ implementResponse: resp, task: { promptContext: batchCtx } });
+  assert.equal(res.succeeded, true);
+  const doc = fs.readFileSync(path.join(dir, 'Docs', 'CHANGE_REVIEW_CANDIDATES.md'), 'utf8');
+  assert.match(doc, /Source: change_review of bbb2222 "second small fix"/, 'the finding is attributed to bbb2222, the commit its own Commit: line named -- not aaa1111');
+  assert.match(doc, /Files: src\/b\.js/);
 });
 
 // --- classifyUnit ---------------------------------------------------------------
@@ -419,6 +552,31 @@ test('prompt builders carry the required scaffolding', () => {
   assert.match(impl, /^FINDING$/m);
   assert.match(impl, /NO CORRECTNESS ISSUES/);
   assert.match(impl, /Failure scenario:/);
+});
+
+test('prompt builders: a batch task shows every commit separately and demands a Commit: line on each finding', () => {
+  const { mod } = freshPlugin(fs.mkdtempSync(path.join(os.tmpdir(), 'cr-prompt-batch-')));
+  const task = {
+    promptContext: {
+      mainBranch: 'main',
+      units: [
+        { sha: 'aaa1111', subject: 'first fix', author: 'a', dateISO: 'd1', files: ['M\tsrc/a.js'], unitDiff: '@@ -1 +1 @@\n-old a\n+new a\n', smallFileContents: [] },
+        { sha: 'bbb2222', subject: 'second fix', author: 'a', dateISO: 'd2', files: ['M\tsrc/b.js'], unitDiff: '@@ -1 +1 @@\n-old b\n+new b\n', smallFileContents: [] },
+      ],
+    },
+  };
+  const plan = mod.changeReviewPlanPrompt(task);
+  assert.match(plan, /COMMIT 1\/2: aaa1111/);
+  assert.match(plan, /COMMIT 2\/2: bbb2222/);
+  assert.match(plan, /-old a\n\+new a/);
+  assert.match(plan, /-old b\n\+new b/);
+  assert.match(plan, /2 small, separately-authored changes/);
+
+  const impl = mod.changeReviewImplementPrompt(task, 'PLAN TEXT HERE');
+  assert.match(impl, /COMMIT 1\/2: aaa1111/);
+  assert.match(impl, /COMMIT 2\/2: bbb2222/);
+  assert.match(impl, /^Commit: <the exact COMMIT sha shown above/m, 'a batch task must instruct the model to name which commit each finding is about');
+  assert.match(impl, /^FINDING$/m);
 });
 
 // --- Truncated-diff review-gate exception (2026-09-18, bd-1789601881616) ---------------
