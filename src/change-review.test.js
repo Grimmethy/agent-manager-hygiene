@@ -80,6 +80,37 @@ function writeCursor(dir, sha) {
 function readCursor(dir) {
   return JSON.parse(fs.readFileSync(path.join(dir, 'change-review-cursor.json'), 'utf8')).lastReviewedSha;
 }
+function writeLowPriorityCursor(dir, sha) {
+  fs.writeFileSync(path.join(dir, 'change-review-cursor.lowpriority.json'), JSON.stringify({ lastReviewedSha: sha }));
+}
+function readLowPriorityCursor(dir) {
+  return JSON.parse(fs.readFileSync(path.join(dir, 'change-review-cursor.lowpriority.json'), 'utf8')).lastReviewedSha;
+}
+function lowPriorityCursorExists(dir) {
+  return fs.existsSync(path.join(dir, 'change-review-cursor.lowpriority.json'));
+}
+// A real commit carrying the pipeline's own `Task: <id>` trailer in its body -- two -m
+// flags give it a real subject + body paragraph, exactly how a real pipeline-applied
+// commit is authored (task-history.js's own convention), not a single-line commit with no
+// body at all.
+function commitWithTaskTrailer(dir, files, subject, taskId) {
+  for (const [rel, content] of Object.entries(files)) {
+    fs.writeFileSync(path.join(dir, rel), content);
+  }
+  git(dir, ['add', '-A']);
+  git(dir, ['commit', '-q', '-m', subject, '-m', `Task: ${taskId}`]);
+  git(dir, ['push', '-q', 'origin', 'main']);
+  return git(dir, ['rev-parse', 'HEAD']);
+}
+function commitViaDashboard(dir, files, title) {
+  for (const [rel, content] of Object.entries(files)) {
+    fs.writeFileSync(path.join(dir, rel), content);
+  }
+  git(dir, ['add', '-A']);
+  git(dir, ['commit', '-q', '-m', `Merge ${title} (via dashboard)`]);
+  git(dir, ['push', '-q', 'origin', 'main']);
+  return git(dir, ['rev-parse', 'HEAD']);
+}
 function seedQueue(dir, state, id) {
   const d = path.join(dir, 'queue', state);
   fs.mkdirSync(d, { recursive: true });
@@ -410,6 +441,106 @@ test('applyChangeReview: a batch task files each finding under the RIGHT commit,
   const doc = fs.readFileSync(path.join(dir, 'Docs', 'CHANGE_REVIEW_CANDIDATES.md'), 'utf8');
   assert.match(doc, /Source: change_review of bbb2222 "second small fix"/, 'the finding is attributed to bbb2222, the commit its own Commit: line named -- not aaa1111');
   assert.match(doc, /Files: src\/b\.js/);
+});
+
+// --- origin-based priority lanes (2026-09-23) --------------------------------------
+// See nextChangeReviewTask's own header comment for the full rationale (real data: 7 of
+// 10 catches ever filed came from a commit with neither marker; 2 of 10 from a
+// pipeline-reviewed one). Two independent cursors -- change-review-cursor.json (high
+// priority) and change-review-cursor.lowpriority.json (low priority) -- because a single
+// shared cursor cannot safely "defer" a low-priority commit without permanently losing it.
+
+test('isPipelineReviewed: a Task: trailer in the body marks a commit pipeline-reviewed', () => {
+  const { mod } = freshPlugin(fs.mkdtempSync(path.join(os.tmpdir(), 'cr-origin-1-')));
+  assert.equal(mod.isPipelineReviewed({ subject: 'Fix the thing', body: 'Task: observability-fix-ac-9\n' }), true);
+  assert.equal(mod.isPipelineReviewed({ subject: 'Fix the thing', body: '' }), false);
+});
+
+test('isPipelineReviewed: a "(via dashboard)" merge subject marks a commit pipeline-reviewed', () => {
+  const { mod } = freshPlugin(fs.mkdtempSync(path.join(os.tmpdir(), 'cr-origin-2-')));
+  assert.equal(mod.isPipelineReviewed({ subject: 'Merge AC-9 · fix the thing (via dashboard)', body: '' }), true);
+});
+
+test('isPipelineReviewed: a GitHub PR merge (human-reviewed on GitHub, but never by this pipeline) is NOT pipeline-reviewed', () => {
+  const { mod } = freshPlugin(fs.mkdtempSync(path.join(os.tmpdir(), 'cr-origin-3-')));
+  assert.equal(mod.isPipelineReviewed({ subject: 'Merge pull request #447 from Grimmethy/some-fix', body: '' }), false);
+});
+
+test('isPipelineReviewed: a plain human commit with neither marker is NOT pipeline-reviewed', () => {
+  const { mod } = freshPlugin(fs.mkdtempSync(path.join(os.tmpdir(), 'cr-origin-4-')));
+  assert.equal(mod.isPipelineReviewed({ subject: 'Quick manual fix', body: 'Co-Authored-By: Someone <x@y.z>\n' }), false);
+});
+
+test('priority lanes: a chronologically LATER external commit is reviewed BEFORE an earlier pipeline-reviewed one', () => {
+  const repo = makeGitRepo();
+  repo.commit({ 'a.js': 'v0\n' }, 'c1');
+  const pipelineCommit = commitWithTaskTrailer(repo.dir, { 'b.js': 'v0\n' }, 'AC-9 · a real pipeline fix', 'observability-fix-ac-9');
+  const externalCommit = repo.commit({ 'c.js': 'v0\n' }, 'a human just pushed this directly');
+  writeCursor(repo.dir, git(repo.dir, ['rev-parse', `${pipelineCommit}^`]));
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+
+  const task = mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+  assert.equal(task.id, `change-review-${externalCommit.slice(0, 7)}`, 'the later EXTERNAL commit wins, not the earlier pipeline-reviewed one');
+  // The high-priority (default) cursor has walked PAST the deferred pipeline commit (it
+  // was skip-recorded as "not this lane"), but the deferred commit itself is not lost --
+  // the low-priority lane's own, separate cursor has not moved at all yet.
+  assert.equal(readCursor(repo.dir), pipelineCommit, 'high lane cursor sits just past the deferred pipeline commit, having skip-recorded it');
+});
+
+test('priority lanes: the low-priority lane is only reached once the high-priority lane is fully caught up to HEAD', () => {
+  const repo = makeGitRepo();
+  repo.commit({ 'a.js': 'v0\n' }, 'c1');
+  const pipelineCommit = commitWithTaskTrailer(repo.dir, { 'b.js': 'v0\n' }, 'AC-9 · a real pipeline fix', 'observability-fix-ac-9');
+  writeCursor(repo.dir, git(repo.dir, ['rev-parse', `${pipelineCommit}^`]));
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+
+  // No external commit exists in range -- the high lane walks to HEAD finding nothing,
+  // and the low-priority lane's own commit is what actually gets returned.
+  const task = mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+  assert.equal(task.id, `change-review-${pipelineCommit.slice(0, 7)}`);
+  assert.equal(readCursor(repo.dir), pipelineCommit, 'high lane cursor reaches HEAD (it had nothing of its own to act on)');
+  assert.equal(lowPriorityCursorExists(repo.dir), true, 'the low-priority lane gets its own, independent cursor file');
+});
+
+test('priority lanes: a "(via dashboard)" merge commit is also deferred behind an external one', () => {
+  const repo = makeGitRepo();
+  repo.commit({ 'a.js': 'v0\n' }, 'c1');
+  const dashboardCommit = commitViaDashboard(repo.dir, { 'b.js': 'v0\n' }, 'AC-9 · a real fix');
+  const externalCommit = repo.commit({ 'c.js': 'v0\n' }, 'a human just pushed this directly');
+  writeCursor(repo.dir, git(repo.dir, ['rev-parse', `${dashboardCommit}^`]));
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+
+  const task = mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+  assert.equal(task.id, `change-review-${externalCommit.slice(0, 7)}`);
+});
+
+test('priority lanes: an already-queued low-priority commit is skipped whole exactly like the high-priority lane does', () => {
+  const repo = makeGitRepo();
+  repo.commit({ 'a.js': 'v0\n' }, 'c1');
+  const p1 = commitWithTaskTrailer(repo.dir, { 'b.js': 'v0\n' }, 'AC-9', 'ac-9');
+  const p2 = commitWithTaskTrailer(repo.dir, { 'b.js': 'v1\n' }, 'AC-10', 'ac-10');
+  writeCursor(repo.dir, git(repo.dir, ['rev-parse', `${p1}^`]));
+  writeLowPriorityCursor(repo.dir, git(repo.dir, ['rev-parse', `${p1}^`]));
+  seedQueue(repo.dir, 'approved', `change-review-${p1.slice(0, 7)}`);
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+
+  // High lane: nothing of its own between the two pipeline commits and HEAD -- reaches
+  // HEAD immediately. Low lane: p1 is already queued (skip + advance), p2 is real work.
+  const task = mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+  assert.equal(task.id, `change-review-${p2.slice(0, 7)}`);
+  assert.equal(readLowPriorityCursor(repo.dir), p1);
+});
+
+test('priority lanes: two consecutive small pipeline-reviewed commits still batch together within the low-priority lane', () => {
+  const repo = makeGitRepo();
+  repo.commit({ 'a.js': 'v0\n' }, 'c1');
+  const p1 = commitWithTaskTrailer(repo.dir, { 'a.js': 'v1\n' }, 'AC-9', 'ac-9');
+  const p2 = commitWithTaskTrailer(repo.dir, { 'a.js': 'v2\n' }, 'AC-10', 'ac-10');
+  writeCursor(repo.dir, git(repo.dir, ['rev-parse', `${p1}^`]));
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+
+  const task = mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+  assert.equal(task.id, `change-review-batch-${p1.slice(0, 7)}-${p2.slice(0, 7)}`);
 });
 
 // --- classifyUnit ---------------------------------------------------------------
