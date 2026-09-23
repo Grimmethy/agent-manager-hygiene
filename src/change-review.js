@@ -124,9 +124,34 @@ function enumerateUnits(repoRoot, mainBranch, sinceSha) {
 }
 
 function unitMetadata(repoRoot, sha) {
-  const raw = git(repoRoot, ['show', '-s', '--format=%H%n%s%n%an%n%cI', sha]);
-  const [full = sha, subject = '', author = '', dateISO = ''] = raw.split(FIELD_SEP);
-  return { sha: full, sha7: full.slice(0, 7), subject: subject.trim(), author: author.trim(), dateISO: dateISO.trim() };
+  // %b (body) is last and NOT destructured positionally like the others -- a commit body
+  // is itself multi-line by nature (the pipeline's own "Task: <id>" trailer sits after a
+  // blank line, sometimes with a Co-Authored-By: line after that), so it would otherwise
+  // get shredded by the same FIELD_SEP split used for the single-line fields above it.
+  const raw = git(repoRoot, ['show', '-s', '--format=%H%n%s%n%an%n%cI%n%b', sha]);
+  const [full = sha, subject = '', author = '', dateISO = '', ...bodyParts] = raw.split(FIELD_SEP);
+  return {
+    sha: full, sha7: full.slice(0, 7), subject: subject.trim(), author: author.trim(),
+    dateISO: dateISO.trim(), body: bodyParts.join(FIELD_SEP),
+  };
+}
+
+// Did this commit already go through the pipeline's OWN plan/critique/majority-vote gate
+// before landing, rather than arriving as a direct human push or an externally-reviewed
+// GitHub PR merge? Two independent markers, either is sufficient:
+//   - a real pipeline-drafted task's commit always carries a `Task: <id>` trailer in its
+//     body (task-history.js's own commit-message convention).
+//   - the dashboard's own Unmerged-Branches-tab merge route always titles its merge
+//     commit "Merge <title> (via dashboard)" (api_git_merge_branch, core repo).
+// Neither fires for a plain human commit or a "Merge pull request #N from ..." GitHub PR
+// merge -- both of those are treated as NOT pipeline-reviewed, matching the real data
+// (2026-09-22 benefit analysis): 7 of 10 real change_review catches ever filed came from
+// commits with NEITHER marker; only 2 of 10 came from a pipeline-reviewed commit, and a
+// GitHub PR merge -- reviewed by a human on GitHub, but never by THIS pipeline's own gate
+// -- accounted for the other 1 and is deliberately grouped with "not pipeline-reviewed"
+// here, not with the low-priority lane.
+function isPipelineReviewed(meta) {
+  return /^Task:\s/m.test(meta.body || '') || /\(via dashboard\)\s*$/.test((meta.subject || '').trim());
 }
 
 function unitNameStatus(repoRoot, sha) {
@@ -309,28 +334,40 @@ function recordSkip(pipelineDir, meta, reason, stats) {
 
 // --- the generator ----------------------------------------------------------------
 
-function nextChangeReviewTask({ getConfig, taskIdExistsInQueue }) {
-  let cfg;
-  try {
-    cfg = getConfig();
-  } catch {
-    return null;
-  }
-  const { repoRoot, pipelineDir, defaultDomain, changeReviewCursorPath } = cfg;
-  if (!repoRoot || !isGitRepo(repoRoot)) return null;
+// Origin-based priority lanes (2026-09-23, Grimmethy: "build the origin based priority
+// differentiation"). Real data (2026-09-22 benefit analysis of every finding this source
+// has ever filed): 7 of 10 real catches came from a commit with NEITHER a `Task:` trailer
+// nor a "(via dashboard)" merge marker -- a direct human push or an externally-reviewed
+// GitHub PR, never independently reviewed by THIS pipeline's own gate. Only 2 of 10 came
+// from an already-pipeline-reviewed commit, and both were low severity. The HIGH lane
+// (not pipeline-reviewed) is always scanned to completion (all the way to HEAD) before the
+// LOW lane (pipeline-reviewed) is ever touched -- a low-priority backlog can never make a
+// real regression wait, since real regressions have concentrated almost entirely in the
+// high lane.
+//
+// Two INDEPENDENT cursors, not one shared cursor with a reordered walk, because a single
+// monotonic cursor cannot safely represent "skip this low-priority commit for now, but
+// come back to it later" -- writing the cursor past a later high-priority commit while an
+// earlier low-priority one is still unresolved would make the NEXT enumerateUnits() call
+// start strictly after that written position, permanently losing the deferred commit (it
+// would never be re-examined by either lane again). Each lane instead walks the FULL
+// shared commit stream with its own cursor, treating any commit outside its own priority
+// class exactly like classifyUnit's other skip reasons (recorded, cursor advanced,
+// nothing lost -- the other lane's own independent walk is what actually resolves it).
+const LOW_PRIORITY_LANE_SUFFIX = '.lowpriority.json';
 
-  const mainBranch = resolveMainBranch(repoRoot);
-  if (process.env.AGENT_MANAGER_CHANGE_REVIEW_FETCH === '1') {
-    git(repoRoot, ['fetch', 'origin', mainBranch, '--quiet']);
-  }
-  const head = headSha(repoRoot, mainBranch);
-  if (!head) return null;
+function lowPriorityCursorPath(highPriorityCursorPath) {
+  return highPriorityCursorPath.endsWith('.json')
+    ? `${highPriorityCursorPath.slice(0, -'.json'.length)}${LOW_PRIORITY_LANE_SUFFIX}`
+    : `${highPriorityCursorPath}${LOW_PRIORITY_LANE_SUFFIX}`;
+}
 
-  let cursor = readCursor(changeReviewCursorPath);
+function scanLane({ repoRoot, pipelineDir, defaultDomain, mainBranch, head, cursorPath, wantPipelineReviewed, taskIdExistsInQueue }) {
+  let cursor = readCursor(cursorPath);
   if (!cursor) {
     const seed = seedCursorSha(repoRoot, mainBranch);
     if (!seed) return null;
-    writeCursor(changeReviewCursorPath, seed);
+    writeCursor(cursorPath, seed);
     cursor = { lastReviewedSha: seed };
   }
   if (cursor.lastReviewedSha === head) return null;
@@ -353,7 +390,7 @@ function nextChangeReviewTask({ getConfig, taskIdExistsInQueue }) {
     }
     const batchId = `change-review-batch-${batch[0].meta.sha7}-${batch[batch.length - 1].meta.sha7}`;
     if (taskIdExistsInQueue(batchId)) {
-      writeCursor(changeReviewCursorPath, batch[batch.length - 1].sha);
+      writeCursor(cursorPath, batch[batch.length - 1].sha);
       batch = []; batchChars = 0;
       return undefined;
     }
@@ -367,17 +404,32 @@ function nextChangeReviewTask({ getConfig, taskIdExistsInQueue }) {
     if (taskIdExistsInQueue(id)) {
       const flushed = flushBatch();
       if (flushed) return flushed;
-      writeCursor(changeReviewCursorPath, sha);
+      writeCursor(cursorPath, sha);
       continue;
     }
     const meta = unitMetadata(repoRoot, sha);
+    if (isPipelineReviewed(meta) !== wantPipelineReviewed) {
+      // Not this lane's commit -- the OTHER lane's own independent walk is what resolves
+      // it. Cheap: no nameStatus/diff/test-gate work spent on a unit this lane will never
+      // act on. NOTE for anyone reading change-review-skipped.json: recordSkip dedupes by
+      // sha alone (first write per sha wins), so if the owning lane hasn't reached this
+      // commit yet, this 'other-lane-*' entry is what the audit log shows for it forever
+      // -- even after the owning lane later resolves it for a completely different, more
+      // specific reason (or files a real finding). The audit log can lag reality here;
+      // the actual queue/task state never does.
+      const flushed = flushBatch();
+      if (flushed) return flushed;
+      recordSkip(pipelineDir, meta, wantPipelineReviewed ? 'other-lane-not-pipeline-reviewed' : 'other-lane-pipeline-reviewed', null);
+      writeCursor(cursorPath, sha);
+      continue;
+    }
     const nameStatus = unitNameStatus(repoRoot, sha);
     const kind = classifyUnit(nameStatus);
     if (kind !== 'reviewable') {
       const flushed = flushBatch();
       if (flushed) return flushed;
       recordSkip(pipelineDir, meta, kind, null);
-      writeCursor(changeReviewCursorPath, sha);
+      writeCursor(cursorPath, sha);
       continue;
     }
     const stats = unitNumstat(repoRoot, sha);
@@ -385,7 +437,7 @@ function nextChangeReviewTask({ getConfig, taskIdExistsInQueue }) {
       const flushed = flushBatch();
       if (flushed) return flushed;
       recordSkip(pipelineDir, meta, 'too-large', stats);
-      writeCursor(changeReviewCursorPath, sha);
+      writeCursor(cursorPath, sha);
       continue;
     }
     const diffText = unitDiff(repoRoot, sha);
@@ -394,7 +446,7 @@ function nextChangeReviewTask({ getConfig, taskIdExistsInQueue }) {
       const flushed = flushBatch();
       if (flushed) return flushed;
       recordSkip(pipelineDir, meta, 'empty-diff', stats);
-      writeCursor(changeReviewCursorPath, sha);
+      writeCursor(cursorPath, sha);
       continue;
     }
 
@@ -417,7 +469,7 @@ function nextChangeReviewTask({ getConfig, taskIdExistsInQueue }) {
       if (flushed) return flushed;
       fileDeterministicTestFailureFinding(pipelineDir, meta, ctx, testResult);
       recordSkip(pipelineDir, meta, 'test-failure-auto-filed', stats);
-      writeCursor(changeReviewCursorPath, sha);
+      writeCursor(cursorPath, sha);
       continue;
     }
 
@@ -443,6 +495,34 @@ function nextChangeReviewTask({ getConfig, taskIdExistsInQueue }) {
     }
   }
   return flushBatch() || null;
+}
+
+function nextChangeReviewTask({ getConfig, taskIdExistsInQueue }) {
+  let cfg;
+  try {
+    cfg = getConfig();
+  } catch {
+    return null;
+  }
+  const { repoRoot, pipelineDir, defaultDomain, changeReviewCursorPath } = cfg;
+  if (!repoRoot || !isGitRepo(repoRoot)) return null;
+
+  const mainBranch = resolveMainBranch(repoRoot);
+  if (process.env.AGENT_MANAGER_CHANGE_REVIEW_FETCH === '1') {
+    git(repoRoot, ['fetch', 'origin', mainBranch, '--quiet']);
+  }
+  const head = headSha(repoRoot, mainBranch);
+  if (!head) return null;
+
+  const laneArgs = { repoRoot, pipelineDir, defaultDomain, mainBranch, head, taskIdExistsInQueue };
+
+  // HIGH priority lane first, always -- see this function's own header comment above for
+  // why this is two independent cursors, not a reordered single walk.
+  const high = scanLane({ ...laneArgs, cursorPath: changeReviewCursorPath, wantPipelineReviewed: false });
+  if (high) return high;
+
+  // Only reached once the high-priority lane is fully caught up to HEAD.
+  return scanLane({ ...laneArgs, cursorPath: lowPriorityCursorPath(changeReviewCursorPath), wantPipelineReviewed: true });
 }
 
 function soloTask(defaultDomain, meta, ctx, id) {
@@ -1004,4 +1084,6 @@ module.exports = {
   CHANGE_REVIEW_BATCH_MAX_UNITS,
   CHANGE_REVIEW_BATCH_UNIT_MAX_CHARS,
   CHANGE_REVIEW_BATCH_COMBINED_MAX_CHARS,
+  isPipelineReviewed,
+  lowPriorityCursorPath,
 };
