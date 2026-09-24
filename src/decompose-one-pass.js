@@ -16,7 +16,7 @@
 // until then a .js source falls through to the hub.
 
 const path = require('path');
-const { buildExtraction } = require('./script-extract.js');
+const { buildExtraction } = require('agent-manager/src/script-extract.js');
 
 function scriptTagFor(newFile) {
   // Matches what the (retired) wiring child was instructed to write:
@@ -120,6 +120,27 @@ require('agent-manager/src/mechanical-move-registry.js').registerMechanicalMoveK
 require('agent-manager/src/decompose-review-registry.js').registerDeterministicReview('one-pass-decompose', {
   verify: (task, repoRoot) => require('agent-manager/src/decompose-review-registry.js').verifyOnePassStyleRederivation(
     task, repoRoot, (sourceText, sourceFile, moves) => buildOnePassGroupBChanges(sourceText, sourceFile, moves),
+  ),
+});
+
+// Deterministic-draft hook (S4a of the hub-tasks extraction, 2026-09-24,
+// deterministic-draft-registry.js's own header has the full design). Moved verbatim from
+// lib/deterministic-extract.js's former tryDeterministicOnePassDecompose -- the shared
+// "N creates + one edit" draft-construction flow lives in runOnePassStyleDraft, this kind
+// only supplies its own rebuild + how to describe the work in progress.
+require('agent-manager/src/deterministic-draft-registry.js').registerDeterministicDraft('one-pass-decompose', {
+  tryDraft: (task, attempt) => require('agent-manager/src/deterministic-draft-registry.js').runOnePassStyleDraft(
+    task, attempt,
+    (sourceText, sourceFile, moves) => buildOnePassGroupBChanges(sourceText, sourceFile, moves),
+    (ctx) => {
+      const symCount = ctx.moves.reduce((n, m) => n + (m.symbols || []).length, 0);
+      return {
+        label: 'deterministic one-pass decompose',
+        plan: `Deterministic one-pass decomposition: ${ctx.moves.length} module(s), ${symCount} symbol(s), every one a V8-parser-verified top-level declaration -- no model judgment needed.`,
+        implementNote: `deterministic one-pass decompose (${ctx.moves.length} module(s), ${symCount} symbol(s), V8-parser-verified)`,
+        implementEvent: `deterministic one-pass decompose: ${symCount} symbol(s) into ${ctx.moves.length} module(s) + <script> wiring, no model call`,
+      };
+    },
   ),
 });
 

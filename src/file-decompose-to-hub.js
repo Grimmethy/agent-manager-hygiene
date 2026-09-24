@@ -145,7 +145,7 @@ function staticCheckScriptExtractMove(repoRoot, sourceFile, symbols) {
   if (!fs.existsSync(abs)) return null;
   let html;
   try { html = fs.readFileSync(abs, 'utf8'); } catch { return null; }
-  const { locateFunctions } = require('./script-extract.js');
+  const { locateFunctions } = require('agent-manager/src/script-extract.js');
   const located = locateFunctions(html, symbols, { isHtml });
   if (located.error) return { ok: false, missing: symbols, resolvable: false };
   const missing = located.results.filter((r) => r.status !== 'OK').map((r) => `${r.name} (${r.status})`);

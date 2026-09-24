@@ -566,3 +566,61 @@ test('buildNodeModuleOnePassChanges: newFile a directory deeper than sourceFile 
   const edit = r.changes.find((c) => c.mode === 'edit');
   assert.match(edit.replace, /require\('\.\/lib\/thing-use\.js'\)/, 'back-require carries the lib/ subdirectory prefix');
 });
+
+// --- Deterministic-review hook registration (S4a of the hub-tasks extraction, 2026-09-24)
+// -----------------------------------------------------------------------------------------
+// Ported from agent-manager core's review-task.test.js when this file moved here -- see
+// script-extract.test.js's identical section for the full rationale.
+
+const { verifyDeterministicDraft } = require('agent-manager/src/decompose-review-registry.js');
+
+function makeFixtureRepo() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'decompose-node-module-review-test-'));
+}
+
+test('registered "node-module-decompose" review: a byte-exact re-derivation -> ok:true', () => {
+  const repoRoot = makeFixtureRepo();
+  const rel = 'src/mod.js';
+  const abs = path.join(repoRoot, rel);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, [
+    "'use strict';",
+    "const fs = require('fs');",
+    '',
+    'function alpha(x) { return x + 1; }',
+    'function beta(x) { return alpha(x) * 2; }',
+    'function keep() { return fs.existsSync("x"); }',
+    '',
+    'module.exports = { alpha, beta, keep };',
+    '',
+  ].join('\n'));
+  const moves = [{ newFile: 'src/mod-math.js', symbols: ['alpha', 'beta'] }];
+  const built = buildNodeModuleOnePassChanges(fs.readFileSync(abs, 'utf8'), rel, moves);
+  assert.equal(built.ok, true, built.ok ? '' : built.reason);
+
+  const task = {
+    promptContext: { deterministicApply: 'node-module-decompose', sourceFile: rel, moves },
+    implementResponse: JSON.stringify(built.changes),
+  };
+  assert.deepEqual(verifyDeterministicDraft(task, repoRoot), { ok: true, moduleCount: 1 });
+});
+
+test('registered "node-module-decompose" review: tampered create content -> ok:false (drift)', () => {
+  const repoRoot = makeFixtureRepo();
+  const rel = 'src/mod.js';
+  const abs = path.join(repoRoot, rel);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, "'use strict';\n\nfunction alpha(x) { return x + 1; }\nfunction beta(x) { return x; }\n\nmodule.exports = { alpha, beta };\n");
+  const moves = [{ newFile: 'src/mod-a.js', symbols: ['alpha'] }];
+  const built = buildNodeModuleOnePassChanges(fs.readFileSync(abs, 'utf8'), rel, moves);
+  const changes = JSON.parse(JSON.stringify(built.changes));
+  changes[0].content = changes[0].content.replace('x + 1', 'x + 999'); // tamper
+
+  const task = {
+    promptContext: { deterministicApply: 'node-module-decompose', sourceFile: rel, moves },
+    implementResponse: JSON.stringify(changes),
+  };
+  const r = verifyDeterministicDraft(task, repoRoot);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /no longer byte-matches/);
+});

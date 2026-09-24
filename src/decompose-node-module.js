@@ -33,7 +33,7 @@
 // a self-contained move").
 
 const path = require('path');
-const { buildExtraction } = require('./script-extract.js');
+const { buildExtraction } = require('agent-manager/src/script-extract.js');
 
 // Names always in scope in a Node module without being declared.
 const JS_GLOBALS = new Set([
@@ -386,7 +386,7 @@ function buildNodeModuleExtraction(sourceText, sourceFile, newFile, symbols) {
   // oracle) and top-level const/let/var declarations (relocated verbatim). A cluster whose
   // functions read a module-scope constant can now carry that constant with them instead of
   // being rejected as not-self-contained.
-  const located = require('./script-extract.js').locateFunctions(sourceText, symbols, { isHtml: false });
+  const located = require('agent-manager/src/script-extract.js').locateFunctions(sourceText, symbols, { isHtml: false });
   const fnSyms = symbols.filter((s) => (located.results || []).some((r) => r.name === s && r.status === 'OK'));
   const constSyms = symbols.filter((s) => !fnSyms.includes(s));
 
@@ -713,6 +713,27 @@ function planIsFullyMechanicalNodeModule(request, validation) {
 require('agent-manager/src/decompose-review-registry.js').registerDeterministicReview('node-module-decompose', {
   verify: (task, repoRoot) => require('agent-manager/src/decompose-review-registry.js').verifyOnePassStyleRederivation(
     task, repoRoot, (sourceText, sourceFile, moves, rr) => buildNodeModuleOnePassChanges(sourceText, sourceFile, moves, rr),
+  ),
+});
+
+// Deterministic-draft hook (S4a of the hub-tasks extraction, 2026-09-24,
+// deterministic-draft-registry.js's own header has the full design). Moved verbatim from
+// lib/deterministic-extract.js's former tryDeterministicNodeModuleDecompose -- the shared
+// "N creates + one edit" draft-construction flow lives in runOnePassStyleDraft, this kind
+// only supplies its own rebuild (needs repoRoot too) + how to describe the work.
+require('agent-manager/src/deterministic-draft-registry.js').registerDeterministicDraft('node-module-decompose', {
+  tryDraft: (task, attempt) => require('agent-manager/src/deterministic-draft-registry.js').runOnePassStyleDraft(
+    task, attempt,
+    (sourceText, sourceFile, moves, rr) => buildNodeModuleOnePassChanges(sourceText, sourceFile, moves, rr),
+    (ctx) => {
+      const symCount = ctx.moves.reduce((n, m) => n + (m.symbols || []).length, 0);
+      return {
+        label: 'deterministic node-module decompose',
+        plan: `Deterministic one-pass CommonJS decomposition: ${ctx.moves.length} module(s), ${symCount} function(s), every one a V8-parser-verified self-contained top-level declaration -- no model judgment needed.`,
+        implementNote: `deterministic node-module decompose (${ctx.moves.length} module(s), ${symCount} function(s), V8-parser-verified)`,
+        implementEvent: `deterministic node-module decompose: ${symCount} function(s) into ${ctx.moves.length} module(s) + require() wiring, no model call`,
+      };
+    },
   ),
 });
 

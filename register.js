@@ -36,19 +36,29 @@ require('./src/deterministic-recheck.js').register();
 // sources (no .register(deps) call) -- these are the deterministic decompose builders and
 // their watchdog sweeps, invoked directly by agent-manager's scripts/queue-watcher.sh
 // (agent-manager-hygiene/src/<file>.js, resolved off AGENT_MANAGER_REGISTER_PATH the same
-// way queue-watcher.sh already resolves file-length-scan.js). script-extract.js /
+// way queue-watcher.sh already resolves file-length-scan.js).
+//
+// script-extract.js deliberately did NOT move here -- found live while verifying this
+// move: scripts/extract-core-ui.js (a standalone agent-manager dev CLI, unrelated to the
+// pipeline) requires it directly and can't depend on an optional plugin being installed.
+// It stays in core and registers its own 'script-extract' kind there automatically
+// (decompose-auto-merge.js / review-task.js already require it for other reasons). This
+// repo's decompose-one-pass.js / decompose-node-module.js reach its buildExtraction /
+// locateFunctions via `agent-manager/src/script-extract.js`, the normal plugin-depends-
+// on-core direction.
+//
 // decompose-one-pass.js / decompose-node-module.js / decompose-flask-blueprint.js each
-// call agent-manager's registerMechanicalMoveKind/registerDeterministicReview as a
-// module-load side effect -- requiring them here is how that registration actually
-// reaches coordinator-sweep.js's and review-task.js's own one-shot processes (both call
-// agent-manager/src/config.js's ensureRegistered(), which requires this file).
+// call agent-manager's registerMechanicalMoveKind/registerDeterministicReview/
+// registerDeterministicDraft as a module-load side effect -- requiring them here is how
+// that registration actually reaches coordinator-sweep.js's / review-task.js's / local-
+// draft.js's own one-shot processes (all three call agent-manager/src/config.js's
+// ensureRegistered(), which requires this file).
 // decompose-loop-autoroute.js / proactive-file-decompose-sweep.js / file-decompose-to-hub.js
 // / decompose-move-determinism-backfill.js / file-decompose-plan-pass.js / hot-file-guard.js
 // need no registration of their own -- queue-watcher.sh invokes them directly as their own
 // `node <file>.js` processes -- but are required here too so a plain
 // `require('agent-manager-hygiene')`-style load (or a future test harness) sees the whole
 // family, and so a require-cycle among them never depends on load order.
-require('./src/script-extract.js');
 require('./src/decompose-one-pass.js');
 require('./src/decompose-node-module.js');
 require('./src/decompose-flask-blueprint.js');

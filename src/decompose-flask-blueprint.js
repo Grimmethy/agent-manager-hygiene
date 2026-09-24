@@ -201,6 +201,27 @@ require('agent-manager/src/decompose-review-registry.js').registerDeterministicR
   ),
 });
 
+// Deterministic-draft hook (S4a of the hub-tasks extraction, 2026-09-24,
+// deterministic-draft-registry.js's own header has the full design). Moved verbatim from
+// lib/deterministic-extract.js's former tryDeterministicBlueprintDecompose -- the shared
+// "N creates + one edit" draft-construction flow lives in runOnePassStyleDraft, this kind
+// only supplies its own rebuild + how to describe the work.
+require('agent-manager/src/deterministic-draft-registry.js').registerDeterministicDraft('blueprint-decompose', {
+  tryDraft: (task, attempt) => require('agent-manager/src/deterministic-draft-registry.js').runOnePassStyleDraft(
+    task, attempt,
+    (sourceText, sourceFile, moves) => buildBlueprintOnePassChanges(sourceText, sourceFile, moves),
+    (ctx) => {
+      const routeCount = ctx.moves.reduce((n, m) => n + (m.symbols || []).length, 0);
+      return {
+        label: 'deterministic blueprint decompose',
+        plan: `Deterministic one-pass Flask-Blueprint decomposition: ${ctx.moves.length} blueprint(s), ${routeCount} route(s), AST-extracted + py_compile-verified -- no model judgment needed.`,
+        implementNote: `deterministic blueprint decompose (${ctx.moves.length} blueprint(s), ${routeCount} route(s), AST + py_compile)`,
+        implementEvent: `deterministic blueprint decompose: ${routeCount} route(s) into ${ctx.moves.length} blueprint(s) + register_blueprint wiring, no model call`,
+      };
+    },
+  ),
+});
+
 module.exports = {
   buildBlueprintExtraction,
   buildBlueprintOnePassChanges,
