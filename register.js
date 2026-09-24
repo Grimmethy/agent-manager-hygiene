@@ -30,3 +30,25 @@ require('./src/change-review.js').register(deps);
 // are re-run against a file's current content, for agent-manager's staleness-fastpath.js
 // deterministic recheck. Takes no deps -- imports the detectors from agent-manager core.
 require('./src/deterministic-recheck.js').register();
+
+// File-decompose family (S4a of the hub-tasks extraction, 2026-09-24, moved here from
+// agent-manager core -- see Docs/hub-tasks-extraction-plan.md in that repo). Not task
+// sources (no .register(deps) call) -- these are the deterministic decompose builders and
+// their watchdog sweeps, invoked directly by agent-manager's scripts/queue-watcher.sh
+// (agent-manager-hygiene/src/<file>.js, resolved off AGENT_MANAGER_REGISTER_PATH the same
+// way queue-watcher.sh already resolves file-length-scan.js). script-extract.js /
+// decompose-one-pass.js / decompose-node-module.js / decompose-flask-blueprint.js each
+// call agent-manager's registerMechanicalMoveKind/registerDeterministicReview as a
+// module-load side effect -- requiring them here is how that registration actually
+// reaches coordinator-sweep.js's and review-task.js's own one-shot processes (both call
+// agent-manager/src/config.js's ensureRegistered(), which requires this file).
+// decompose-loop-autoroute.js / proactive-file-decompose-sweep.js / file-decompose-to-hub.js
+// / decompose-move-determinism-backfill.js / file-decompose-plan-pass.js / hot-file-guard.js
+// need no registration of their own -- queue-watcher.sh invokes them directly as their own
+// `node <file>.js` processes -- but are required here too so a plain
+// `require('agent-manager-hygiene')`-style load (or a future test harness) sees the whole
+// family, and so a require-cycle among them never depends on load order.
+require('./src/script-extract.js');
+require('./src/decompose-one-pass.js');
+require('./src/decompose-node-module.js');
+require('./src/decompose-flask-blueprint.js');
