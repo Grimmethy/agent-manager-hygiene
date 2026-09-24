@@ -1064,3 +1064,120 @@ test('inventory: a caught-up repo, a non-git dir and the registration hook all b
   const p = freshPlugin(nogit);
   assert.equal(p.mod.changeReviewInventory({ getConfig: p.getConfig, taskState: () => null }).total, 0);
 });
+
+// --- queued-task expiry hook (2026-09-24) -----------------------------------------------------------
+// Real task shapes: the generator itself produces them, so the hook is tested against exactly what production queues.
+function expiryHook(repoDir) {
+  const { mod, getConfig } = freshPlugin(repoDir);
+  return { mod, getConfig, hook: mod.changeReviewExpiry({ getConfig }) };
+}
+function taskFor(repoDir, cursorSha) {
+  writeCursor(repoDir, cursorSha);
+  process.env.AGENT_MANAGER_CHANGE_REVIEW_WINDOW_DAYS = '0';   // generate regardless of age; the HOOK is what is under test
+  try {
+    const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repoDir);
+    return mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+  } finally { delete process.env.AGENT_MANAGER_CHANGE_REVIEW_WINDOW_DAYS; }
+}
+
+test('expiry hook: a solo task for a commit older than the window expires (archive); one inside it does not', () => {
+  const repo = makeGitRepo();
+  const base = commitDaysAgo(repo.dir, 30, { 'a.js': 'v0\n' }, 'base');
+  const bigOld = 'x = 1;\n'.repeat(700);                       // > the batch unit cap, so each is reviewed SOLO
+  const old = commitDaysAgo(repo.dir, 20, { 'a.js': 'v0\n' + bigOld }, 'old solo');
+  const oldTask = taskFor(repo.dir, base);
+  assert.equal(oldTask.id, `change-review-${old.slice(0, 7)}`);
+  const fresh = commitDaysAgo(repo.dir, 1, { 'a.js': 'v0\n' + bigOld + 'y = 2;\n'.repeat(700) }, 'fresh solo');
+  const freshTask = taskFor(repo.dir, old);
+  assert.equal(freshTask.id, `change-review-${fresh.slice(0, 7)}`);
+
+  const { hook } = expiryHook(repo.dir);
+  const out = hook.findExpired({ tasks: [{ id: oldTask.id, task: oldTask }, { id: freshTask.id, task: freshTask }], now: new Date() });
+  assert.deepEqual(out.map((o) => [o.id, o.action]), [[oldTask.id, 'archive']]);
+  assert.match(out[0].reason, /aged out of the 7-day/);
+});
+
+test('expiry hook: a batch expires only when EVERY commit in it is older than the window; a straddling batch stays', () => {
+  const repo = makeGitRepo();
+  const base = commitDaysAgo(repo.dir, 30, { 'a.js': 'v0\n' }, 'base');
+  commitDaysAgo(repo.dir, 20, { 'a.js': 'v0\nA\n' }, 'old a');
+  commitDaysAgo(repo.dir, 19, { 'a.js': 'v0\nA\nB\n' }, 'old b');
+  const allOld = taskFor(repo.dir, base);
+  assert.match(allOld.id, /^change-review-batch-/);
+  const { hook } = expiryHook(repo.dir);
+  assert.equal(hook.findExpired({ tasks: [{ id: allOld.id, task: allOld }], now: new Date() }).length, 1);
+
+  const repo2 = makeGitRepo();
+  const b2 = commitDaysAgo(repo2.dir, 30, { 'a.js': 'v0\n' }, 'base');
+  commitDaysAgo(repo2.dir, 20, { 'a.js': 'v0\nA\n' }, 'old');
+  commitDaysAgo(repo2.dir, 1, { 'a.js': 'v0\nA\nB\n' }, 'fresh');
+  const straddle = taskFor(repo2.dir, b2);
+  assert.match(straddle.id, /^change-review-batch-/);
+  assert.equal(expiryHook(repo2.dir).hook.findExpired({ tasks: [{ id: straddle.id, task: straddle }], now: new Date() }).length, 0, 'still has a current commit in it');
+});
+
+test('expiry hook: an old task that already holds an approved result is APPLIED, not archived', () => {
+  const repo = makeGitRepo();
+  const base = commitDaysAgo(repo.dir, 30, { 'a.js': 'v0\n' }, 'base');
+  commitDaysAgo(repo.dir, 20, { 'a.js': 'v0\nA\n' }, 'old');
+  const task = taskFor(repo.dir, base);
+  const withResult = { ...task, implementResponse: 'NO CORRECTNESS ISSUES', localVerdict: 'Confident majority APPROVE (votes: 2/3 real)' };
+  const notApproved = { ...task, id: task.id, implementResponse: 'FINDING ...', localVerdict: 'REJECT' };
+  const { hook } = expiryHook(repo.dir);
+  assert.equal(hook.findExpired({ tasks: [{ id: task.id, task: withResult }], now: new Date() })[0].action, 'apply');
+  assert.equal(hook.findExpired({ tasks: [{ id: task.id, task: notApproved }], now: new Date() })[0].action, 'archive');
+});
+
+test('expiry hook: window disabled -> nothing expires; an unresolvable commit is never guessed at', () => {
+  const repo = makeGitRepo();
+  const base = commitDaysAgo(repo.dir, 30, { 'a.js': 'v0\n' }, 'base');
+  commitDaysAgo(repo.dir, 20, { 'a.js': 'v0\nA\n' }, 'old');
+  const task = taskFor(repo.dir, base);
+  const { hook } = expiryHook(repo.dir);
+  process.env.AGENT_MANAGER_CHANGE_REVIEW_WINDOW_DAYS = '0';
+  try { assert.deepEqual(hook.findExpired({ tasks: [{ id: task.id, task }], now: new Date() }), []); } finally { delete process.env.AGENT_MANAGER_CHANGE_REVIEW_WINDOW_DAYS; }
+  const ghost = { id: 'change-review-deadbee', promptContext: { sha: 'deadbee' } };
+  assert.deepEqual(hook.findExpired({ tasks: [{ id: ghost.id, task: ghost }], now: new Date() }), [], 'unknown commit -> left for a human');
+});
+
+test('expiry hook: record() puts every commit of an ARCHIVED task in the aged-out ledger (full shas, deduped), and skips applied ones', () => {
+  const repo = makeGitRepo();
+  const base = commitDaysAgo(repo.dir, 30, { 'a.js': 'v0\n' }, 'base');
+  const c1 = commitDaysAgo(repo.dir, 20, { 'a.js': 'v0\nA\n' }, 'old a');
+  const c2 = commitDaysAgo(repo.dir, 19, { 'a.js': 'v0\nA\nB\n' }, 'old b');
+  const batch = taskFor(repo.dir, base);
+  const { hook } = expiryHook(repo.dir);
+  hook.record({ results: [{ id: batch.id, action: 'archive', task: batch }] });
+  hook.record({ results: [{ id: batch.id, action: 'archive', task: batch }] });   // again: deduped
+  const ledger = readJsonIn(repo.dir, 'change-review-aged-out.json');
+  assert.deepEqual(ledger.map((e) => e.sha), [c1, c2]);
+  assert.deepEqual(ledger.map((e) => e.subject), ['old a', 'old b']);
+
+  const repo2 = makeGitRepo();
+  const b2 = commitDaysAgo(repo2.dir, 30, { 'a.js': 'v0\n' }, 'base');
+  commitDaysAgo(repo2.dir, 20, { 'a.js': 'v0\nA\n' }, 'old');
+  const t2 = taskFor(repo2.dir, b2);
+  expiryHook(repo2.dir).hook.record({ results: [{ id: t2.id, action: 'apply', task: t2 }] });
+  assert.equal(fs.existsSync(path.join(repo2.dir, 'change-review-aged-out.json')), false, 'an applied task was reviewed -- not aged-out work');
+});
+
+test('ledger dedupe is by the 7-char prefix: a short-sha entry (solo task) and a full-sha jump entry are one commit, not two', () => {
+  const { repo, o1 } = staleThenFreshRepo();
+  fs.writeFileSync(path.join(repo.dir, 'change-review-aged-out.json'), JSON.stringify([{ sha: o1.slice(0, 7), sha7: o1.slice(0, 7), subject: 'old1', dateISO: 'x' }]));
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+  mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });                    // the jump also passes o1 (full sha)
+  const ledger = readJsonIn(repo.dir, 'change-review-aged-out.json');
+  assert.equal(ledger.filter((e) => e.sha7 === o1.slice(0, 7)).length, 1);
+  assert.equal(mod.changeReviewInventory({ getConfig, taskState: () => null }).counts.stale, 3, 'each aged-out commit counted once');
+});
+
+test('expiry hook is registered on change_review with the change-review- id prefix', () => {
+  const repo = makeGitRepo();
+  commitDaysAgo(repo.dir, 0, { 'a.js': 'x\n' }, 'c1');
+  const { getRegisteredSource } = freshPlugin(repo.dir);
+  const ex = getRegisteredSource('change_review').expiry;
+  assert.deepEqual(ex.idPrefixes, ['change-review-']);
+  assert.equal(typeof ex.findExpired, 'function');
+  assert.equal(typeof ex.record, 'function');
+  assert.equal(getRegisteredSource('change_review_fix').expiry, undefined, 'the sibling fix source (same id prefix) does not opt in');
+});

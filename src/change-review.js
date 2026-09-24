@@ -396,11 +396,12 @@ function readAgedOut(pipelineDir) {
 function recordAgedOut(pipelineDir, entries) {
   if (!entries.length) return;
   const arr = readAgedOut(pipelineDir);
-  const seen = new Set(arr.map((e) => e && e.sha));
+  const key = (x) => String((x && (x.sha7 || x.sha)) || '').slice(0, 7);
+  const seen = new Set(arr.map(key));
   const at = new Date().toISOString();
   for (const e of entries) {
-    if (seen.has(e.sha)) continue;
-    seen.add(e.sha);
+    if (seen.has(key(e))) continue;
+    seen.add(key(e));
     arr.push({ sha: e.sha, sha7: e.sha7, subject: e.subject, dateISO: e.dateISO, agedOutAt: at, windowDays: windowDays() });
   }
   try { writeJsonAtomicSync(agedOutPath(pipelineDir), arr.slice(-AGED_OUT_LEDGER_CAP)); } catch { /* non-fatal ledger */ }
@@ -1148,8 +1149,9 @@ function changeReviewInventory({ getConfig, taskState, now = Date.now() }) {
   const seen = new Set();
   const cutoffEpoch = windowCutoffEpoch(now);
   const add = (item) => {
-    if (seen.has(item.sha)) return;
-    seen.add(item.sha);
+    const k = String(item.sha).slice(0, 7);   // the ledger may hold short shas (solo tasks carry 7 chars); lanes carry full ones
+    if (seen.has(k)) return;
+    seen.add(k);
     out.counts[item.status] += 1;
     if (item.status === 'waiting') {
       out.waitingByConfidence[item.confidence] = (out.waitingByConfidence[item.confidence] || 0) + 1;
@@ -1227,6 +1229,94 @@ function changeReviewInventory({ getConfig, taskState, now = Date.now() }) {
   return out;
 }
 
+// --- queued-task expiry (2026-09-24) --------------------------------------------------------------
+// The recency window above stops NEW generation past the window; it cannot help a task that is already queued and simply waited too
+// long. Core's source-agnostic expiry-sweep.js (queue watchdog) asks each source that declares an `expiry` hook which of its pending
+// tasks have expired (see agent-manager's docs/PLUGIN_API.md, "Expiring queued work"). A change_review task expires when EVERY commit
+// it covers is older than the window -- a batch that straddles the window still has something current in it, so it stays. A task that
+// already holds an approved result is not archived: it is sent on to apply (a real finding on an old commit can still be a live bug,
+// and applying costs no model call).
+const CHUNK = 100;
+
+function taskCommitShas(task, id) {
+  const pc = task && task.promptContext;
+  if (String(id).startsWith('change-review-batch-')) {
+    const units = pc && Array.isArray(pc.units) ? pc.units : [];
+    return units.map((u) => u && u.sha).filter(Boolean);
+  }
+  const sha = (pc && typeof pc.sha === 'string' && pc.sha) || String(id).split('-').pop();
+  return sha ? [sha] : [];
+}
+
+// sha -> { epoch, iso, subject } for every commit git can resolve; a missing key means "unknown". One git call per CHUNK shas.
+function commitFacts(repoRoot, shas) {
+  const facts = new Map();
+  const list = [...new Set(shas)];
+  for (let i = 0; i < list.length; i += CHUNK) {
+    const chunk = list.slice(i, i + CHUNK);
+    let raw = '';
+    try { raw = git(repoRoot, ['show', '-s', '--format=%H%x1f%ct%x1f%cI%x1f%s%x1e', ...chunk]); } catch { continue; }
+    for (const rec of raw.split('\x1e')) {
+      const [full, ct, iso, subject = ''] = rec.replace(/^\n/, '').split('\x1f');
+      if (!full || !ct) continue;
+      const fact = { full, epoch: Number(ct), iso: (iso || '').trim(), subject: subject.trim() };
+      facts.set(full, fact);
+      for (const c of chunk) if (full.startsWith(c)) facts.set(c, fact);   // ids carry a 7-char sha
+    }
+  }
+  return facts;
+}
+
+function hasApprovedResult(task) {
+  return !!(String(task.implementResponse || '').trim() && String(task.localVerdict || '').startsWith('Confident majority APPROVE'));
+}
+
+function changeReviewExpiry({ getConfig }) {
+  return {
+    idPrefixes: ['change-review-'],
+    findExpired({ tasks, now }) {
+      const cutoff = windowCutoffEpoch(now instanceof Date ? now.getTime() : Date.now());
+      if (cutoff === null) return [];                       // window disabled -> nothing ever expires
+      let repoRoot;
+      try { ({ repoRoot } = getConfig()); } catch { return []; }
+      if (!repoRoot || !isGitRepo(repoRoot)) return [];
+      const shasById = new Map(tasks.map((t) => [t.id, taskCommitShas(t.task, t.id)]));
+      const facts = commitFacts(repoRoot, [...shasById.values()].flat());
+      const out = [];
+      for (const { id, task } of tasks) {
+        const shas = shasById.get(id);
+        if (!shas || !shas.length) continue;
+        const fs_ = shas.map((s) => facts.get(s));
+        if (fs_.some((f) => !f)) continue;                  // an unresolvable commit: leave it for a human, never guess
+        if (!fs_.every((f) => f.epoch < cutoff)) continue;  // in window, or a batch that straddles it
+        const newest = fs_.reduce((a, b) => (b.epoch > a.epoch ? b : a));
+        out.push({
+          id,
+          action: hasApprovedResult(task) ? 'apply' : 'archive',
+          reason: `aged out of the ${windowDays()}-day change-review window while pending (newest commit ${newest.iso.slice(0, 10)}); never reviewed`,
+        });
+      }
+      return out;
+    },
+    // Bookkeeping the Hygiene tab counts (see changeReviewInventory): every commit of an ARCHIVED task goes into the aged-out ledger.
+    // A task sent on to apply was reviewed, so it is not aged-out work and is not recorded.
+    record({ results }) {
+      let cfg;
+      try { cfg = getConfig(); } catch { return; }
+      const archived = results.filter((r) => r.action === 'archive' && r.task);
+      const shas = archived.flatMap((r) => taskCommitShas(r.task, r.id));
+      if (!shas.length) return;
+      const facts = commitFacts(cfg.repoRoot, shas);
+      const entries = [];
+      for (const sha of new Set(shas)) {
+        const f = facts.get(sha);
+        if (f) entries.push({ sha: f.full, sha7: f.full.slice(0, 7), subject: f.subject.slice(0, 200), dateISO: f.iso });
+      }
+      recordAgedOut(cfg.pipelineDir, entries);
+    },
+  };
+}
+
 // --- registration --------------------------------------------------------------
 
 function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
@@ -1235,6 +1325,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     priority: taskPriority('change_review', 60),
     next: () => nextChangeReviewTask({ getConfig, taskIdExistsInQueue }),
     inventory: ({ taskState }) => changeReviewInventory({ getConfig, taskState }),
+    expiry: changeReviewExpiry({ getConfig }),
     apply: applyChangeReview,
     directToMain: true,
     advisoryProse: true,
@@ -1297,6 +1388,8 @@ module.exports = {
   isPipelineReviewed,
   lowPriorityCursorPath,
   changeReviewInventory,
+  changeReviewExpiry,
+  taskCommitShas,
   jumpCursorPastAgedOut,
   windowDays,
   readAgedOut,
