@@ -9,7 +9,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { extractEsExports, extractExports, scan } = require('./unused-export-scan.js');
+const { extractEsExports, extractExports, scan, isDue, markChecked } = require('./unused-export-scan.js');
 
 test('extractEsExports: declarations, defaults, and export lists', () => {
   const names = extractEsExports([
@@ -69,4 +69,20 @@ test('scan: flags an unused TS export with its (empty) call sites, skips .d.ts, 
   assert.deepEqual(flagged.map((c) => c.symbol), ['dead']);
   assert.equal(flagged[0].definedIn, 'src/lib.ts');
   assert.deepEqual(flagged[0].callSites, []);
+});
+
+// Throttle (2026-09-24): this scanner is O(exports x repo size), unlike its cheap siblings
+// wired into queue-watcher.sh -- it must not be run every watchdog tick.
+test('isDue: true when never checked before, false right after markChecked, true again once the interval elapses', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'unused-export-throttle-'));
+  const instancesDir = path.join(dir, 'instances');
+  assert.equal(isDue(instancesDir), true, 'never checked before -- due immediately');
+
+  const now = new Date('2026-09-24T00:00:00.000Z');
+  markChecked(instancesDir, now);
+  assert.equal(isDue(instancesDir, now), false, 'just checked -- not due yet');
+  assert.equal(isDue(instancesDir, new Date(now.getTime() + 60 * 1000)), false, 'still well inside the interval');
+
+  const oneDayLater = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  assert.equal(isDue(instancesDir, oneDayLater), true, 'interval elapsed -- due again');
 });

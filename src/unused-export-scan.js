@@ -41,6 +41,36 @@ const SKIP_DIRS = new Set(['node_modules', '.git', 'queue', 'instances', 'dist',
 const MAX_CALL_SITES = 20;
 const LOW_USAGE_THRESHOLD = 2; // flag exports with this many or fewer external call sites
 
+// Throttle (2026-09-24, wiring this scanner into queue-watcher.sh for the first time):
+// unlike a cheap sibling scan (file-length-scan.js is one pass over the tree), this one is
+// O(exports x repo size) -- for every exported symbol it re-walks the whole search tree
+// counting call sites. Running it every watchdog tick (~30-60s) would be real, wasted
+// cost on a repo this size. Same isDue()/markChecked() shape
+// proactive-file-decompose-sweep.js already uses (a JSON schedule file under instances/),
+// default 24h, overridable via AGENT_MANAGER_UNUSED_EXPORT_SCAN_INTERVAL_MS.
+const CHECK_INTERVAL_MS = Number(process.env.AGENT_MANAGER_UNUSED_EXPORT_SCAN_INTERVAL_MS) || 24 * 60 * 60 * 1000;
+
+function schedulePath(instancesDir) {
+  return path.join(instancesDir, '.unused-export-scan-schedule.json');
+}
+
+function isDue(instancesDir, now = new Date()) {
+  let schedule;
+  try {
+    schedule = JSON.parse(fs.readFileSync(schedulePath(instancesDir), 'utf8'));
+  } catch {
+    return true; // never run before -- due immediately.
+  }
+  const last = schedule.lastCheckedAt;
+  if (!last) return true;
+  return now.getTime() - new Date(last).getTime() >= CHECK_INTERVAL_MS;
+}
+
+function markChecked(instancesDir, now = new Date()) {
+  fs.mkdirSync(instancesDir, { recursive: true });
+  fs.writeFileSync(schedulePath(instancesDir), JSON.stringify({ lastCheckedAt: now.toISOString() }, null, 2));
+}
+
 function listSourceFiles(dir, extensions) {
   try {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -191,13 +221,21 @@ function scan() {
 
 function main() {
   const { pipelineDir } = getConfig();
+  const instancesDir = path.join(pipelineDir, 'instances');
+  const force = process.argv.includes('--force');
+  if (!force && !isDue(instancesDir)) {
+    console.log('not due yet -- skipping (see AGENT_MANAGER_UNUSED_EXPORT_SCAN_INTERVAL_MS, or pass --force)');
+    return;
+  }
+
   const resultsPath = path.join(pipelineDir, 'queue', 'dead-code-flags.json');
   const candidates = scan();
   fs.mkdirSync(path.dirname(resultsPath), { recursive: true });
   fs.writeFileSync(resultsPath, JSON.stringify(candidates, null, 2));
+  markChecked(instancesDir);
   console.log(`scanned, found ${candidates.length} low-usage export candidate(s), written to ${resultsPath}`);
 }
 
 if (require.main === module) { main(); }
 
-module.exports = { scan, extractExports, extractEsExports, countCallSites };
+module.exports = { scan, extractExports, extractEsExports, countCallSites, isDue, markChecked };

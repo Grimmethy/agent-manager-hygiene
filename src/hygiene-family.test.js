@@ -14,7 +14,7 @@ const EXPECTED = {
   observability_review: 'observability', observability_review_digest: 'observability', observability_fix: 'observability',
   performance_review: 'performance', performance_fix: 'performance',
   function_length_review: 'function_length', function_length_fix: 'function_length',
-  unused_export: 'unused_export',
+  unused_export: 'unused_export', deadcode_fix: 'unused_export',
   arch_discovery: 'arch', arch_review: 'arch', arch_import: 'arch', arch_import_review: 'arch',
   change_review: 'change_review', change_review_fix: 'change_review',
 };
@@ -66,7 +66,11 @@ test('every hygiene source registers with its family; core groups them from the 
   assert.equal(by.arch.flagSource, null);
   assert.equal(by.change_review.flagSource, 'change_review', 'the Hygiene tab reads change review\'s untasked/aged-out backlog from its hook');
   assert.deepEqual(by.unused_export.prefixes, ['deadcode-']);
-  assert.equal(by.unused_export.docSources.length, 0);
+  // 2026-09-24: deadcode_fix (the new candidate-fulfillment consumer) now carries
+  // candidateDoc: true, same as every other review/fix pair's fix side -- unused_export's
+  // GENUINE verdict writes a real candidate to Docs/DEAD_CODE_CANDIDATES.md instead of
+  // being thrown away, and deadcode_fix is what consumes it.
+  assert.deepEqual(by.unused_export.docSources, ['deadcode_fix']);
 });
 
 // Core's review gates are driven by these registration flags (ADR-0022: core names no plugin source). If a flag is dropped the

@@ -69,7 +69,7 @@ function loadPluginFresh() {
 // arch_import GENERATORS, where "found zero real issues" is a valid, common outcome.
 test('no candidate-fulfillment source carries emptyApproval; the arch generators still do', () => {
   const registry = loadPluginFresh();
-  for (const name of ['arch_review', 'arch_import_review', 'observability_fix', 'performance_fix', 'function_length_fix']) {
+  for (const name of ['arch_review', 'arch_import_review', 'observability_fix', 'performance_fix', 'function_length_fix', 'deadcode_fix']) {
     const s = registry.getRegisteredSource(name);
     assert.ok(s && s.candidateFulfillment === true, `${name} should still be a candidateFulfillment source`);
     assert.notEqual(s.emptyApproval, true, `${name} (a fulfillment source) must not auto-approve an empty draft`);
@@ -84,13 +84,17 @@ test('no candidate-fulfillment source carries emptyApproval; the arch generators
 // unused_export declares its 'deadcode_triage' source-field alias via registerSourceAlias()
 // instead of relying on agent-manager's legacy hardcoded fallback. (2026-08-31:
 // function_length_review joined the list -- it was the last candidate-generating review
-// source still producing a hand-merge branch for a one-line markdown append.)
+// source still producing a hand-merge branch for a one-line markdown append. 2026-09-24:
+// unused_export joined too -- a GENUINE verdict now appends a real candidate to
+// Docs/DEAD_CODE_CANDIDATES.md instead of being thrown away by applyVerdictOnly; its new
+// consumer, deadcode_fix, takes unused_export's old spot in the "NOT direct-to-main" list
+// since IT is now the one making a real code-removal diff.)
 test('directToMain is set on the candidate-doc-append review sources; deadcode_triage resolves via a registered alias', () => {
   const registry = loadPluginFresh();
-  for (const name of ['arch_discovery', 'arch_import', 'observability_review', 'performance_review', 'function_length_review']) {
+  for (const name of ['arch_discovery', 'arch_import', 'observability_review', 'performance_review', 'function_length_review', 'unused_export']) {
     assert.equal(registry.getRegisteredSource(name).directToMain, true, `${name} must declare directToMain: true`);
   }
-  for (const name of ['arch_review', 'arch_import_review', 'observability_fix', 'performance_fix', 'function_length_fix', 'unused_export']) {
+  for (const name of ['arch_review', 'arch_import_review', 'observability_fix', 'performance_fix', 'function_length_fix', 'deadcode_fix']) {
     assert.notEqual(registry.getRegisteredSource(name).directToMain, true, `${name} must NOT be direct-to-main`);
   }
   assert.equal(registry.resolveSourceName({ source: 'deadcode_triage' }), 'unused_export');
@@ -108,9 +112,22 @@ test('arch_discovery / arch_import declare reviewGuidance; arch_review and the f
   assert.match(disc, /architecture-discovery task: finding ZERO real issues/);
   assert.equal(typeof imp, 'string');
   assert.match(imp, /architecture-import task \(an idea from an external project/);
-  for (const name of ['arch_review', 'observability_fix', 'performance_fix', 'function_length_fix']) {
+  for (const name of ['arch_review', 'observability_fix', 'performance_fix', 'function_length_fix', 'deadcode_fix']) {
     assert.equal(registry.getRegisteredSource(name).reviewGuidance, undefined, `${name} must not set reviewGuidance`);
   }
+});
+
+// 2026-09-24: unused_export's verdict-review shape needs the exact same "prose-or-
+// candidate-block, not code" review guidance function_length_review already proved out
+// (334-340 in that file) -- without it the generic reviewer falls back to "does it contain
+// real code" and rejects every correct verdict.
+test('unused_export declares its own dead-code review guidance + completeness question', () => {
+  const registry = loadPluginFresh();
+  const s = registry.getRegisteredSource('unused_export');
+  assert.equal(typeof s.reviewGuidance, 'string');
+  assert.match(s.reviewGuidance, /dead-code triage verdict/);
+  assert.equal(typeof s.reviewCompletenessQuestion, 'string');
+  assert.match(s.reviewCompletenessQuestion, /GENUINE/);
 });
 
 // 2026-09-04 (AC-8 incident): arch_import_review is the one candidate-fulfillment consumer
@@ -142,7 +159,9 @@ test('the scanner-review sources declare groundingFields: ["snippet"]; the fix c
   for (const name of ['performance_review', 'function_length_review']) {
     assert.deepEqual(registry.getRegisteredSource(name).groundingFields, ['snippet'], `${name} must ground review on its snippet`);
   }
-  for (const name of ['observability_fix', 'performance_fix', 'function_length_fix', 'arch_discovery', 'arch_import', 'arch_review']) {
+  assert.deepEqual(registry.getRegisteredSource('unused_export').groundingFields, ['callSites'],
+    'unused_export must ground review on the real call sites the drafter saw');
+  for (const name of ['observability_fix', 'performance_fix', 'function_length_fix', 'deadcode_fix', 'arch_discovery', 'arch_import', 'arch_review']) {
     assert.equal(registry.getRegisteredSource(name).groundingFields, undefined, `${name} must not set groundingFields`);
   }
   // arch_import_review is the one exception -- see the dedicated premise-check test above.
@@ -159,7 +178,7 @@ test('arch_import declares harnessSearch + skipImplementWhenNoHarnessHits; no ot
   assert.equal(ai.skipImplementWhenNoHarnessHits, true);
   for (const name of ['arch_discovery', 'arch_review', 'arch_import_review', 'observability_review',
     'observability_fix', 'performance_review', 'performance_fix', 'function_length_review',
-    'function_length_fix', 'unused_export']) {
+    'function_length_fix', 'unused_export', 'deadcode_fix']) {
     const s = registry.getRegisteredSource(name);
     assert.notEqual(s.harnessSearch, 'archImport', `${name} must not declare harnessSearch`);
     assert.notEqual(s.skipImplementWhenNoHarnessHits, true, `${name} must not declare skipImplementWhenNoHarnessHits`);
@@ -174,6 +193,7 @@ test('reportClass: arch generators are benefit; observability/performance review
   const registry = loadPluginFresh();
   assert.equal(registry.getRegisteredSource('arch_discovery').reportClass, 'benefit');
   assert.equal(registry.getRegisteredSource('arch_import').reportClass, 'benefit');
+  assert.equal(registry.getRegisteredSource('unused_export').reportClass, 'benefit');
   for (const name of ['observability_review', 'performance_review']) {
     const fn = registry.getRegisteredSource(name).reportClass;
     assert.equal(typeof fn, 'function', `${name}.reportClass must be a (task) => bucket function`);
