@@ -894,3 +894,173 @@ test('register smoke: change_review reviewGuidance/reviewCompletenessQuestion ar
     assert.match(ctx.unitDiff, /bulk data file elided/);
   });
 }
+
+// --- recency window (2026-09-24) --------------------------------------------------------------------
+// A commit authored/committed `daysAgo` days in the past (the window keys on the committer date).
+function commitDaysAgo(dir, daysAgo, files, msg) {
+  const iso = new Date(Date.now() - daysAgo * 86400 * 1000).toISOString();
+  for (const [rel, content] of Object.entries(files)) {
+    const full = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, content);
+  }
+  git(dir, ['add', '-A']);
+  execFileSync('git', ['commit', '-q', '-m', msg], {
+    cwd: dir, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, GIT_AUTHOR_DATE: iso, GIT_COMMITTER_DATE: iso },
+  });
+  git(dir, ['push', '-q', 'origin', 'main']);
+  return git(dir, ['rev-parse', 'HEAD']);
+}
+function readJsonIn(dir, name) { return JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')); }
+
+// Repo shaped like the incident: an old prefix (10-14 days), then in-window commits. Cursor sits before the prefix.
+function staleThenFreshRepo() {
+  const repo = makeGitRepo();
+  const base = commitDaysAgo(repo.dir, 20, { 'a.js': 'v0\n' }, 'base');
+  const o1 = commitDaysAgo(repo.dir, 14, { 'a.js': 'v0\nold1\n' }, 'old1');
+  const o2 = commitDaysAgo(repo.dir, 12, { 'a.js': 'v0\nold1\nold2\n' }, 'old2');
+  const o3 = commitDaysAgo(repo.dir, 10, { 'a.js': 'v0\nold1\nold2\nold3\n' }, 'old3');
+  const f1 = commitDaysAgo(repo.dir, 2, { 'a.js': 'v0\nold1\nold2\nold3\nfresh1\n' }, 'fresh1');
+  const f2 = commitDaysAgo(repo.dir, 1, { 'a.js': 'v0\nold1\nold2\nold3\nfresh1\nfresh2\n' }, 'fresh2');
+  writeCursor(repo.dir, base);
+  return { repo, base, o1, o2, o3, f1, f2 };
+}
+
+test('window: a cursor trailing commits older than 7 days JUMPS past them -- only in-window commits become a task', () => {
+  const { repo, o1, o2, o3, f1, f2 } = staleThenFreshRepo();
+  delete process.env.AGENT_MANAGER_CHANGE_REVIEW_WINDOW_DAYS;
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+  const task = mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+  assert.ok(task);
+  assert.equal(task.id, `change-review-batch-${f1.slice(0, 7)}-${f2.slice(0, 7)}`, 'the task covers ONLY the two in-window commits');
+  assert.equal(readCursor(repo.dir), o3, 'cursor jumped to the newest aged-out commit');
+  const ledger = readJsonIn(repo.dir, 'change-review-aged-out.json');
+  assert.deepEqual(ledger.map((e) => e.sha), [o1, o2, o3], 'every commit passed is recorded, oldest first -- nothing dropped silently');
+  assert.deepEqual(ledger.map((e) => e.subject), ['old1', 'old2', 'old3']);
+  const skipped = readJsonIn(repo.dir, 'change-review-skipped.json').filter((e) => e.reason === 'aged-out');
+  assert.equal(skipped.length, 3, 'also in the audit skip log');
+});
+
+test('window: the jump is idempotent -- a second tick neither re-records nor moves the cursor', () => {
+  const { repo, o3 } = staleThenFreshRepo();
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+  mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+  mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+  assert.equal(readJsonIn(repo.dir, 'change-review-aged-out.json').length, 3);
+  assert.equal(readCursor(repo.dir), o3);
+});
+
+test('window: AGENT_MANAGER_CHANGE_REVIEW_WINDOW_DAYS=0 disables it -- the old history is reviewed oldest-first as before', () => {
+  const { repo, o1, o2, o3 } = staleThenFreshRepo();
+  process.env.AGENT_MANAGER_CHANGE_REVIEW_WINDOW_DAYS = '0';
+  try {
+    const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+    const task = mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+    assert.match(task.id, new RegExp(`^change-review-batch-${o1.slice(0, 7)}-`), 'starts at the oldest commit');
+    assert.equal(fs.existsSync(path.join(repo.dir, 'change-review-aged-out.json')), false);
+    void o2; void o3;
+  } finally { delete process.env.AGENT_MANAGER_CHANGE_REVIEW_WINDOW_DAYS; }
+});
+
+test('window: a wider window (30 days) keeps the older commits in scope', () => {
+  const { repo, o1 } = staleThenFreshRepo();
+  process.env.AGENT_MANAGER_CHANGE_REVIEW_WINDOW_DAYS = '30';
+  try {
+    const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+    const task = mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+    assert.match(task.id, new RegExp(`^change-review-batch-${o1.slice(0, 7)}-`));
+  } finally { delete process.env.AGENT_MANAGER_CHANGE_REVIEW_WINDOW_DAYS; }
+});
+
+test('window: when EVERY unreviewed commit is older than the window, nothing is generated and the cursor lands on HEAD', () => {
+  const repo = makeGitRepo();
+  const base = commitDaysAgo(repo.dir, 40, { 'a.js': 'v0\n' }, 'base');
+  commitDaysAgo(repo.dir, 30, { 'a.js': 'v0\nA\n' }, 'a');
+  const head = commitDaysAgo(repo.dir, 20, { 'a.js': 'v0\nA\nB\n' }, 'b');
+  writeCursor(repo.dir, base);
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+  assert.equal(mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue }), null);
+  assert.equal(readCursor(repo.dir), head);
+  assert.equal(readJsonIn(repo.dir, 'change-review-aged-out.json').length, 2);
+});
+
+test('window: the low-priority lane jumps too, and the shared ledger is not double-recorded', () => {
+  const { repo, o3 } = staleThenFreshRepo();
+  // Make the high lane fully caught up so the low lane's scan is reached.
+  writeCursor(repo.dir, git(repo.dir, ['rev-parse', 'origin/main']));
+  writeLowPriorityCursor(repo.dir, git(repo.dir, ['rev-list', '--max-parents=0', 'HEAD']));
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+  mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+  assert.equal(readLowPriorityCursor(repo.dir).length > 0, true);
+  assert.ok(readJsonIn(repo.dir, 'change-review-aged-out.json').some((e) => e.sha === o3));
+  const shas = readJsonIn(repo.dir, 'change-review-aged-out.json').map((e) => e.sha);
+  assert.equal(new Set(shas).size, shas.length, 'deduped by sha');
+});
+
+// --- Hygiene-tab inventory ---------------------------------------------------------------------------
+function inventoryFor(repoDir, taskState = () => null) {
+  const { mod, getConfig } = freshPlugin(repoDir);
+  return mod.changeReviewInventory({ getConfig, taskState });
+}
+
+test('inventory: counts in-window untasked commits as waiting, and aged-out ones (still ahead of the cursor) as stale', () => {
+  const { repo, f1, f2 } = staleThenFreshRepo();
+  const inv = inventoryFor(repo.dir);
+  assert.equal(inv.counts.waiting, 2);
+  assert.equal(inv.counts.stale, 3);
+  assert.equal(inv.windowDays, 7);
+  assert.deepEqual(inv.items.filter((i) => i.status === 'waiting').map((i) => i.file), [f1.slice(0, 7), f2.slice(0, 7)], 'waiting rows come first, oldest first');
+  assert.ok(inv.oldestWaitingAt);
+  assert.equal(inv.approximate, false);
+});
+
+test('inventory: is a PURE READ -- no cursor move, no ledger, no skip log', () => {
+  const { repo, base } = staleThenFreshRepo();
+  inventoryFor(repo.dir);
+  assert.equal(readCursor(repo.dir), base);
+  assert.equal(fs.existsSync(path.join(repo.dir, 'change-review-aged-out.json')), false);
+  assert.equal(fs.existsSync(path.join(repo.dir, 'change-review-skipped.json')), false);
+});
+
+test('inventory: the aged-out count PERSISTS after the generator has jumped (ledger, independent of any cursor)', () => {
+  const { repo } = staleThenFreshRepo();
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+  mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });   // jumps; cursor is now past the old prefix
+  const inv = mod.changeReviewInventory({ getConfig, taskState: () => null });
+  assert.equal(inv.counts.stale, 3, 'still reported although no cursor is behind them any more');
+  assert.equal(inv.agedOutTotal, 3);
+  assert.equal(inv.counts.waiting, 2);
+});
+
+test('inventory: a commit with a task is queued/done, not waiting; a doc-only commit is suppressed', () => {
+  const repo = makeGitRepo();
+  const base = commitDaysAgo(repo.dir, 3, { 'a.js': 'v0\n' }, 'base');
+  const c1 = commitDaysAgo(repo.dir, 2, { 'a.js': 'v0\nB\n' }, 'code');
+  const c2 = commitDaysAgo(repo.dir, 1, { 'README.md': 'docs\n' }, 'docs only');
+  const c3 = commitDaysAgo(repo.dir, 0, { 'a.js': 'v0\nB\nC\n' }, 'more code');
+  writeCursor(repo.dir, base);
+  const ts = (id) => (id === `change-review-${c1.slice(0, 7)}` ? { state: 'done', disposition: 'noop' } : null);
+  const inv = inventoryFor(repo.dir, ts);
+  assert.equal(inv.counts.done, 1);
+  assert.equal(inv.counts.suppressed, 1);
+  assert.equal(inv.counts.waiting, 1);
+  assert.equal(inv.doneByDisposition.noop, 1);
+  assert.equal(inv.items.find((i) => i.file === c3.slice(0, 7)).status, 'waiting');
+  assert.equal(inv.items.find((i) => i.file === c2.slice(0, 7)).status, 'suppressed');
+});
+
+test('inventory: a caught-up repo, a non-git dir and the registration hook all behave', () => {
+  const repo = makeGitRepo();
+  const c = commitDaysAgo(repo.dir, 0, { 'a.js': 'x\n' }, 'c1');
+  writeCursor(repo.dir, c);
+  const { mod, getConfig, getRegisteredSource } = freshPlugin(repo.dir);
+  const inv = mod.changeReviewInventory({ getConfig, taskState: () => null });
+  assert.equal(inv.total, 0);
+  const hook = getRegisteredSource('change_review').inventory;
+  assert.equal(typeof hook, 'function', 'registered on change_review so the Hygiene tab picks it up');
+  assert.equal(hook({ taskState: () => null }).total, 0);
+
+  const nogit = fs.mkdtempSync(path.join(os.tmpdir(), 'change-review-inv-nogit-'));
+  const p = freshPlugin(nogit);
+  assert.equal(p.mod.changeReviewInventory({ getConfig: p.getConfig, taskState: () => null }).total, 0);
+});
