@@ -49,9 +49,10 @@ test('every hygiene source registers with its family; core groups them from the 
     assert.ok(s, `${name} is registered`);
     assert.equal(s.hygieneFamily && s.hygieneFamily.key, family, `${name} declares family ${family}`);
   }
-  // Only the four flag-based review sources carry a flag inventory hook, one per family.
+  // Only the four flag-based review sources plus change_review (2026-09-24: its "flags" are the commits not yet turned into
+  // tasks, and the ones aged out of the review window) carry an inventory hook, one per family.
   const withHook = registry.getRegisteredSources().filter((s) => s.hygieneFamily && typeof s.inventory === 'function').map((s) => s.name).sort();
-  assert.deepEqual(withHook, ['function_length_review', 'observability_review', 'performance_review', 'unused_export']);
+  assert.deepEqual(withHook, ['change_review', 'function_length_review', 'observability_review', 'performance_review', 'unused_export']);
 
   let collectFamilies;
   try { ({ collectFamilies } = require('agent-manager/src/hygiene-inventory.js')); } catch { /* core without the Hygiene tab */ }
@@ -63,6 +64,7 @@ test('every hygiene source registers with its family; core groups them from the 
   assert.deepEqual(by.observability.docSources, ['observability_fix']);
   assert.equal(by.observability.flagSource, 'observability_review');
   assert.equal(by.arch.flagSource, null);
+  assert.equal(by.change_review.flagSource, 'change_review', 'the Hygiene tab reads change review\'s untasked/aged-out backlog from its hook');
   assert.deepEqual(by.unused_export.prefixes, ['deadcode-']);
   assert.equal(by.unused_export.docSources.length, 0);
 });

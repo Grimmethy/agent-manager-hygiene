@@ -332,6 +332,104 @@ function recordSkip(pipelineDir, meta, reason, stats) {
   } catch { /* non-fatal audit log */ }
 }
 
+// Bulk form of recordSkip for a whole aged-out prefix: one read + one atomic write instead of one per commit.
+function recordSkips(pipelineDir, metas, reason) {
+  if (!metas.length) return;
+  const p = skippedPath(pipelineDir);
+  let arr = [];
+  try {
+    arr = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (!Array.isArray(arr)) arr = [];
+  } catch { /* new */ }
+  const seen = new Set(arr.map((e) => e && e.sha));
+  const at = new Date().toISOString();
+  for (const m of metas) {
+    if (seen.has(m.sha)) continue;
+    seen.add(m.sha);
+    arr.push({ sha: m.sha, sha7: m.sha7, subject: m.subject, reason, skippedAt: at });
+  }
+  try { writeJsonAtomicSync(p, arr); } catch { /* non-fatal audit log */ }
+}
+
+// --- recency window (2026-09-24, Grimmethy: "anything over a week old is stale") ---------------
+// Generation had no notion of age. A cursor left weeks behind HEAD (change_review lay dormant, then woke on
+// 2026-09-21 at Aug 29 commits) walked the whole history forward at ~88 tasks/hour, materializing ~850 tasks of
+// which two-thirds reviewed commits over a week old -- stale review crowding out the changes that matter. Now a
+// lane whose cursor is older than the window JUMPS to the newest commit older than the window, so only
+// in-window commits ever become tasks. Nothing is dropped silently: every jumped-over commit is written to the
+// aged-out ledger (change-review-aged-out.json) and the skip log, and the Hygiene tab reports the count (see
+// changeReviewInventory). No action is taken on them -- deliberately no on-demand review.
+//
+// Why a cursor jump and not newest-first: the lane comment above explains a single monotonic cursor cannot
+// safely represent "skip this one for now, come back later" -- writing it past an unresolved commit loses that
+// commit for good. Jumping past a whole OLD PREFIX is safe (every commit passed is recorded), and inside a 7-day
+// window the oldest-first order is bounded anyway.
+const DEFAULT_WINDOW_DAYS = 7;
+const AGED_OUT_LEDGER_CAP = 5000;
+
+function windowDays() {
+  const raw = process.env.AGENT_MANAGER_CHANGE_REVIEW_WINDOW_DAYS;
+  if (raw === undefined || raw === '') return DEFAULT_WINDOW_DAYS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_WINDOW_DAYS; // 0 disables the window
+}
+
+// Unix seconds of the window's edge, or null when the window is disabled.
+function windowCutoffEpoch(now = Date.now()) {
+  const d = windowDays();
+  return d > 0 ? Math.floor((now - d * 86400 * 1000) / 1000) : null;
+}
+
+function agedOutPath(pipelineDir) {
+  return path.join(pipelineDir, 'change-review-aged-out.json');
+}
+
+function readAgedOut(pipelineDir) {
+  try {
+    const arr = JSON.parse(fs.readFileSync(agedOutPath(pipelineDir), 'utf8'));
+    return Array.isArray(arr) ? arr : [];
+  } catch { return []; }
+}
+
+// entries: [{ sha, sha7, subject, dateISO }]. Deduped by sha (both lanes walk the same shared stream, so each
+// lane records the same prefix); oldest entries fall off past the cap.
+function recordAgedOut(pipelineDir, entries) {
+  if (!entries.length) return;
+  const arr = readAgedOut(pipelineDir);
+  const seen = new Set(arr.map((e) => e && e.sha));
+  const at = new Date().toISOString();
+  for (const e of entries) {
+    if (seen.has(e.sha)) continue;
+    seen.add(e.sha);
+    arr.push({ sha: e.sha, sha7: e.sha7, subject: e.subject, dateISO: e.dateISO, agedOutAt: at, windowDays: windowDays() });
+  }
+  try { writeJsonAtomicSync(agedOutPath(pipelineDir), arr.slice(-AGED_OUT_LEDGER_CAP)); } catch { /* non-fatal ledger */ }
+}
+
+// If this lane's cursor trails commits older than the window, move it to the newest such commit (recording every
+// commit passed). Returns the new cursor sha, or null when there was nothing to jump. Fails open: a git error
+// leaves the cursor exactly where it was, so the worst case is the pre-window behaviour.
+function jumpCursorPastAgedOut({ repoRoot, pipelineDir, mainBranch, cursorPath, cursorSha }) {
+  const cutoff = windowCutoffEpoch();
+  if (cutoff === null) return null;
+  try {
+    const range = `${cursorSha}..origin/${mainBranch}`;
+    const tip = git(repoRoot, ['rev-list', '--first-parent', '-n', '1', `--before=${cutoff}`, range]).trim();
+    if (!tip) return null;
+    const raw = git(repoRoot, ['log', '--first-parent', '--reverse', '--format=%H%x1f%cI%x1f%s', `${cursorSha}..${tip}`]).trim();
+    const passed = raw ? raw.split('\n').filter(Boolean).map((line) => {
+      const [sha, dateISO = '', subject = ''] = line.split('\x1f');
+      return { sha, sha7: sha.slice(0, 7), subject: subject.trim(), dateISO: dateISO.trim() };
+    }) : [];
+    recordAgedOut(pipelineDir, passed);
+    recordSkips(pipelineDir, passed, 'aged-out');
+    writeCursor(cursorPath, tip);
+    return tip;
+  } catch {
+    return null;
+  }
+}
+
 // --- the generator ----------------------------------------------------------------
 
 // Origin-based priority lanes (2026-09-23, Grimmethy: "build the origin based priority
@@ -370,6 +468,9 @@ function scanLane({ repoRoot, pipelineDir, defaultDomain, mainBranch, head, curs
     writeCursor(cursorPath, seed);
     cursor = { lastReviewedSha: seed };
   }
+  // Recency window: never walk commits older than it (see the header above). Both lanes do this for the shared stream.
+  const jumped = jumpCursorPastAgedOut({ repoRoot, pipelineDir, mainBranch, cursorPath, cursorSha: cursor.lastReviewedSha });
+  if (jumped) cursor = { lastReviewedSha: jumped };
   if (cursor.lastReviewedSha === head) return null;
 
   const units = enumerateUnits(repoRoot, mainBranch, cursor.lastReviewedSha);
@@ -1018,6 +1119,114 @@ const CHANGE_REVIEW_FIX_REVIEW_GUIDANCE = [
   '"nothing to do" -- it means the fix could not be produced.',
 ].join('\n');
 
+// --- Hygiene-tab inventory (2026-09-24) -----------------------------------------------------
+// A READ-ONLY picture of the change-review backlog that is NOT yet a task, in the shape the tab's flag hooks
+// return (see agent-manager's flag-inventory.js). The tab otherwise sees only tasks that already exist: it showed
+// 522 pending and "0 waiting" while a cursor was still weeks behind HEAD. One row per commit:
+//   waiting    reviewable, inside the window, no task yet -- what the generator will materialize next
+//   queued / blocked / done   a task for it already exists (the tab's task funnel also counts these)
+//   suppressed skipped by rule (doc-only / generated / too large / empty) -- never reviewed by design
+//   stale      older than the window: aged out and NOT going to be reviewed (the ledger + anything still ahead of a cursor)
+// Pure read: no cursor writes, no ledger writes, no fetch.
+const INVENTORY_COMMIT_CAP = 2000;   // commits inspected per lane
+const INVENTORY_ITEM_CAP = 500;
+const INVENTORY_CLASSIFY_CAP = 200;  // commits per lane that get a per-commit name-status classification
+
+function changeReviewInventory({ getConfig, taskState, now = Date.now() }) {
+  const empty = () => ({
+    total: 0, counts: { waiting: 0, queued: 0, blocked: 0, done: 0, digest: 0, suppressed: 0, stale: 0 },
+    doneByDisposition: {}, waitingByConfidence: {}, oldestWaitingAt: null, items: [], truncated: false, approximate: false,
+    windowDays: windowDays(), agedOutTotal: 0,
+  });
+  let cfg;
+  try { cfg = getConfig(); } catch { return empty(); }
+  const { repoRoot, pipelineDir, changeReviewCursorPath } = cfg;
+  if (!repoRoot || !isGitRepo(repoRoot)) return empty();
+
+  const out = empty();
+  const items = [];
+  const seen = new Set();
+  const cutoffEpoch = windowCutoffEpoch(now);
+  const add = (item) => {
+    if (seen.has(item.sha)) return;
+    seen.add(item.sha);
+    out.counts[item.status] += 1;
+    if (item.status === 'waiting') {
+      out.waitingByConfidence[item.confidence] = (out.waitingByConfidence[item.confidence] || 0) + 1;
+      if (item.scannedAt && (!out.oldestWaitingAt || item.scannedAt < out.oldestWaitingAt)) out.oldestWaitingAt = item.scannedAt;
+    }
+    items.push(item);
+  };
+  const IN_FLIGHT_STATES = new Set(['pending', 'drafting', 'review', 'approved', 'coordinating']);
+  const NEEDS_HUMAN_STATES = new Set(['blocked', 'needs-clarification', 'awaiting-confirm']);
+
+  let mainBranch; let head;
+  try {
+    mainBranch = resolveMainBranch(repoRoot);
+    head = headSha(repoRoot, mainBranch);
+  } catch { return out; }
+  if (!head) return out;
+
+  const lanes = [
+    { name: 'high', cursorPath: changeReviewCursorPath, wantPipelineReviewed: false },
+    { name: 'low', cursorPath: lowPriorityCursorPath(changeReviewCursorPath), wantPipelineReviewed: true },
+  ];
+  for (const lane of lanes) {
+    try {
+      const cur = readCursor(lane.cursorPath);
+      const cursorSha = cur ? cur.lastReviewedSha : seedCursorSha(repoRoot, mainBranch);
+      if (!cursorSha || cursorSha === head) continue;
+      const raw = git(repoRoot, ['log', '--first-parent', '--reverse', `-n${INVENTORY_COMMIT_CAP}`, '--format=%H%x1f%cI%x1f%s%x1f%b%x1e', `${cursorSha}..origin/${mainBranch}`]);
+      let classified = 0;
+      for (const rec of raw.split('\x1e')) {
+        const body = rec.replace(/^\n/, '');
+        if (!body.trim()) continue;
+        const [sha, dateISO = '', subject = '', ...bodyParts] = body.split('\x1f');
+        if (!sha) continue;
+        const meta = { sha, sha7: sha.slice(0, 7), subject: subject.trim(), dateISO: dateISO.trim(), body: bodyParts.join('\x1f') };
+        if (isPipelineReviewed(meta) !== lane.wantPipelineReviewed) continue;   // the other lane owns it
+        const base = { sha, rule: 'change-review', file: meta.sha7, line: 0, confidence: lane.name, scannedAt: meta.dateISO, detail: meta.subject.slice(0, 200) };
+        if (cutoffEpoch !== null && Date.parse(meta.dateISO) / 1000 < cutoffEpoch) {
+          add({ ...base, status: 'stale', detail: `${base.detail} (older than ${windowDays()}d -- will be aged out, not reviewed)` });
+          continue;
+        }
+        const ts = taskState ? taskState(`change-review-${meta.sha7}`) : null;
+        if (ts) {
+          const item = { ...base, taskState: ts.state };
+          if (ts.disposition) item.disposition = ts.disposition;
+          if (IN_FLIGHT_STATES.has(ts.state)) item.status = 'queued';
+          else if (NEEDS_HUMAN_STATES.has(ts.state)) item.status = 'blocked';
+          else { item.status = 'done'; const d = ts.disposition || 'unclassified'; out.doneByDisposition[d] = (out.doneByDisposition[d] || 0) + 1; }
+          add(item);
+          continue;
+        }
+        if (classified < INVENTORY_CLASSIFY_CAP) {
+          classified += 1;
+          const kind = classifyUnit(unitNameStatus(repoRoot, sha));
+          if (kind !== 'reviewable') { add({ ...base, status: 'suppressed', detail: `${base.detail} (${kind})` }); continue; }
+        }
+        add({ ...base, status: 'waiting' });
+      }
+    } catch { /* one lane failing must not blank the other */ }
+  }
+
+  // The persistent part: everything already jumped over. Independent of any cursor, so the count survives the jump.
+  const ledger = readAgedOut(pipelineDir);
+  out.agedOutTotal = ledger.length;
+  for (const e of ledger) {
+    if (!e || !e.sha) continue;
+    add({ sha: e.sha, rule: 'change-review', file: e.sha7 || String(e.sha).slice(0, 7), line: 0, confidence: 'aged-out', scannedAt: e.dateISO || null,
+      detail: `${String(e.subject || '').slice(0, 200)} (aged out ${String(e.agedOutAt || '').slice(0, 10)}, older than ${e.windowDays || windowDays()}d)`, status: 'stale' });
+  }
+
+  const ORDER = ['waiting', 'blocked', 'queued', 'digest', 'suppressed', 'stale', 'done'];
+  items.sort((a, b) => (ORDER.indexOf(a.status) - ORDER.indexOf(b.status)) || String(a.scannedAt || '').localeCompare(String(b.scannedAt || '')));
+  out.total = items.length;
+  out.items = items.slice(0, INVENTORY_ITEM_CAP).map(({ sha, ...rest }) => ({ ...rest, status: rest.status }));
+  out.truncated = items.length > INVENTORY_ITEM_CAP;
+  return out;
+}
+
 // --- registration --------------------------------------------------------------
 
 function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
@@ -1025,6 +1234,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     hygieneFamily: hygieneFamily('change_review'),
     priority: taskPriority('change_review', 60),
     next: () => nextChangeReviewTask({ getConfig, taskIdExistsInQueue }),
+    inventory: ({ taskState }) => changeReviewInventory({ getConfig, taskState }),
     apply: applyChangeReview,
     directToMain: true,
     advisoryProse: true,
@@ -1086,4 +1296,9 @@ module.exports = {
   CHANGE_REVIEW_BATCH_COMBINED_MAX_CHARS,
   isPipelineReviewed,
   lowPriorityCursorPath,
+  changeReviewInventory,
+  jumpCursorPastAgedOut,
+  windowDays,
+  readAgedOut,
+  DEFAULT_WINDOW_DAYS,
 };
