@@ -18,6 +18,7 @@
 const { hygieneFamily } = require('./hygiene-family.js');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { registerTaskSource, updateTaskSource } = require('agent-manager/src/task-source-registry.js');
 const { applyArchDiscoveryCandidates } = require('agent-manager/src/candidate-docs.js');
 const { writeJsonAtomicSync } = require('agent-manager/src/atomic-write.js');
@@ -69,28 +70,7 @@ function readIfExists(filePath) {
 // arch_discovery's plan call never overrides.
 const ARCH_DISCOVERY_CONTEXT_BUDGET_CHARS = 24000;
 
-function nextArchDiscoveryTask({ getConfig, taskIdExistsInQueue }) {
-  const { repoRoot, communityCoveragePath, graphPath, archReviewCandidatesPath, defaultDomain } = getConfig();
-  const coverageText = readIfExists(communityCoveragePath);
-  if (!coverageText) return null;
-
-  let coverage;
-  try {
-    coverage = JSON.parse(coverageText);
-  } catch {
-    return null;
-  }
-  if (!coverage || !Array.isArray(coverage.communities) || coverage.communities.length === 0) return null;
-
-  // Oldest lastReviewedAt first; null (never reviewed) sorts before any real timestamp.
-  const sorted = [...coverage.communities].sort((a, b) => {
-    const at = a.lastReviewedAt ? Date.parse(a.lastReviewedAt) : -Infinity;
-    const bt = b.lastReviewedAt ? Date.parse(b.lastReviewedAt) : -Infinity;
-    return at - bt;
-  });
-  const chosen = sorted.find((c) => !taskIdExistsInQueue('arch-discovery-community-' + c.id));
-  if (!chosen) return null; // every community already has an in-flight or terminal task
-
+function loadGraph(graphPath) {
   const graphText = readIfExists(graphPath);
   if (!graphText) return null;
 
@@ -101,7 +81,40 @@ function nextArchDiscoveryTask({ getConfig, taskIdExistsInQueue }) {
     return null;
   }
   if (!graph || !Array.isArray(graph.nodes) || !Array.isArray(graph.links)) return null;
+  return graph;
+}
 
+// Content hash of a community (2026-09-24, staleness fix -- see the long comment on
+// isCommunityCovered() below for the incident this traces back to): every member file's
+// path + current content, hashed together. Two reads of the same file set with
+// byte-identical content always produce the same hash regardless of the community's `id`
+// (an unstable enumerate() position that can shift across graph rebuilds) -- this is what
+// lets "this community's code actually changed" be distinguished from "nothing changed"
+// without any mtime/timestamp bookkeeping, which agent-manager doesn't track per-file
+// anywhere. A missing/unreadable file hashes as empty, same "skip, never throw" tolerance
+// the rest of this file uses -- it still changes the hash (a file disappearing IS a real
+// change), it just doesn't blow up the whole computation.
+function communityContentHash(graph, communityId, repoRoot) {
+  const memberFiles = [...new Set(
+    graph.nodes.filter((n) => n.community === communityId && n.source_file).map((n) => n.source_file),
+  )].sort();
+  const hash = crypto.createHash('sha256');
+  for (const file of memberFiles) {
+    hash.update(file);
+    hash.update('\0');
+    hash.update(readIfExists(path.join(repoRoot, file)) || '');
+    hash.update('\0');
+  }
+  return hash.digest('hex').slice(0, 12);
+}
+
+// Builds the actual arch_discovery task for one already-chosen community (file
+// ranking/budgeting, candidates-doc tail), given its current content hash and an
+// already-loaded graph. Extracted from nextArchDiscoveryTask() (2026-09-24) so a forced
+// full-coverage sweep (force-arch-discovery-sweep.js) can build a task per community
+// without duplicating this logic -- the one-at-a-time picker below is now just this helper
+// plus selection.
+function buildArchDiscoveryTaskForCommunity(chosen, contentHash, graph, { repoRoot, archReviewCandidatesPath, defaultDomain }) {
   const memberNodes = graph.nodes.filter((n) => n.community === chosen.id);
   if (memberNodes.length === 0) return null;
 
@@ -149,17 +162,161 @@ function nextArchDiscoveryTask({ getConfig, taskIdExistsInQueue }) {
   const existingCandidatesTail = candidatesTail ? candidatesTail.slice(-4000) : '';
 
   return {
-    id: 'arch-discovery-community-' + chosen.id,
+    // Content-hash suffix (2026-09-24, see isCommunityCovered() below): a content change
+    // produces a different hash -> a different, never-before-seen id -> eligible for
+    // re-review. Unchanged content always reproduces the exact same id -> still correctly
+    // deduped as already covered by taskIdExistsInQueue's normal permanent-by-id memory.
+    id: 'arch-discovery-community-' + chosen.id + '-' + contentHash,
     domain: defaultDomain,
     source: 'arch_discovery',
     title: 'Architecture discovery: ' + chosen.name,
     promptContext: {
       communityId: chosen.id,
       communityName: chosen.name,
+      contentHash,
       files,
       existingCandidatesTail,
     },
   };
+}
+
+function sortedCommunitiesByCoverage(communityCoveragePath) {
+  const coverageText = readIfExists(communityCoveragePath);
+  if (!coverageText) return null;
+
+  let coverage;
+  try {
+    coverage = JSON.parse(coverageText);
+  } catch {
+    return null;
+  }
+  if (!coverage || !Array.isArray(coverage.communities) || coverage.communities.length === 0) return null;
+
+  // Oldest lastReviewedAt first; null (never reviewed) sorts before any real timestamp.
+  return [...coverage.communities].sort((a, b) => {
+    const at = a.lastReviewedAt ? Date.parse(a.lastReviewedAt) : -Infinity;
+    const bt = b.lastReviewedAt ? Date.parse(b.lastReviewedAt) : -Infinity;
+    return at - bt;
+  });
+}
+
+// Pre-hash legacy id (every community reviewed before 2026-09-24): plain
+// 'arch-discovery-community-<id>', no content hash. taskIdExistsInQueue's dedup is
+// permanent-by-id with no timestamp/content comparison at all, so before this fix a
+// community whose id and file-membership stayed the same but whose CONTENT changed looked
+// "already done" forever -- confirmed live: 0 of 16 communities had ever had
+// lastReviewedAt stamped by a real review, so re-review had no signal to key off at all.
+// See SecondBrain/Research/architecture-review.md's staleness section.
+function legacyTaskId(communityId) {
+  return 'arch-discovery-community-' + communityId;
+}
+
+// --- Dirty signals from change_review (2026-09-24) ----------------------------------
+// A second, structurally independent staleness detector, alongside the content-hash
+// check above: change_review, as it walks every commit landing on the default branch for
+// its own correctness pass, ALSO flags any community whose files that commit touched
+// (change-review.js's flagDirtyCommunities()) into communityDirtySignalsPath. Read-only
+// here -- arch.js never writes this file, only change_review does, so there's exactly
+// one writer and no read-modify-write race between the two plugins' independent per-tick
+// invocations. This exists as deliberate redundancy: the hash check already recomputes
+// content fresh on every call, but that's a SINGLE code path -- a bug in it (or in
+// graph.json itself) would silently blind the whole staleness mechanism with nothing
+// to catch it. This gives a second, unrelated path (git-diff-driven, not content-hash-
+// driven) to the same "this community changed" conclusion.
+function readDirtySignals(communityDirtySignalsPath) {
+  const text = readIfExists(communityDirtySignalsPath);
+  if (!text) return {};
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+// Consumed the moment a fresh task is handed back for that community (same "task exists
+// = handled" semantics as the rest of this file) -- not at apply/completion time, so a
+// community doesn't stay flagged dirty for its whole review cycle once already picked up.
+function clearDirtySignal(communityDirtySignalsPath, communityId) {
+  const signals = readDirtySignals(communityDirtySignalsPath);
+  const key = String(communityId);
+  if (!(key in signals)) return;
+  delete signals[key];
+  writeJsonAtomicSync(communityDirtySignalsPath, signals);
+}
+
+// A community counts as covered at its CURRENT content if ALL of:
+//  (a) change_review hasn't flagged it dirty since it was last reviewed (dirty signals
+//      above always win -- a dirty flag means "not covered", full stop, regardless of
+//      what the hash check below says); AND either
+//  (b) the hash-suffixed id for that exact content already has a task (new-style, added
+//      2026-09-24) -- this exact code was already reviewed, verbatim; or
+//  (c) it has a legacy (pre-hash) terminal task AND its recorded lastReviewedContentHash
+//      (backfilled once by scripts/backfill-arch-discovery-content-hashes.js at rollout)
+//      still matches the current hash -- i.e. nothing has changed since the backfill
+//      grandfathered it in as "reviewed as of right now". Without this grandfather clause,
+//      shipping the hash suffix would make every one of the 16 already-reviewed
+//      communities look stale simultaneously and re-queue itself the moment this landed,
+//      even though nothing had actually changed.
+// Otherwise (dirty-flagged, or a legacy task exists but the hash moved past its
+// backfilled value, or nothing has ever been queued for this community at all) it is NOT
+// covered -- eligible again.
+function isCommunityCovered(community, contentHash, taskIdExistsInQueue, dirtySignals) {
+  if (dirtySignals && String(community.id) in dirtySignals) return false;
+  if (taskIdExistsInQueue('arch-discovery-community-' + community.id + '-' + contentHash)) return true;
+  if (community.lastReviewedContentHash === contentHash && taskIdExistsInQueue(legacyTaskId(community.id))) return true;
+  return false;
+}
+
+function nextArchDiscoveryTask({ getConfig, taskIdExistsInQueue }) {
+  const { repoRoot, communityCoveragePath, graphPath, archReviewCandidatesPath, communityDirtySignalsPath, defaultDomain } = getConfig();
+  const sorted = sortedCommunitiesByCoverage(communityCoveragePath);
+  if (!sorted) return null;
+  const graph = loadGraph(graphPath);
+  if (!graph) return null;
+  const dirtySignals = readDirtySignals(communityDirtySignalsPath);
+
+  for (const community of sorted) {
+    const contentHash = communityContentHash(graph, community.id, repoRoot);
+    if (isCommunityCovered(community, contentHash, taskIdExistsInQueue, dirtySignals)) continue;
+    const task = buildArchDiscoveryTaskForCommunity(community, contentHash, graph, { repoRoot, archReviewCandidatesPath, defaultDomain });
+    if (task) {
+      clearDirtySignal(communityDirtySignalsPath, community.id);
+      return task; // a community with no readable member files (build returned null) -- try the next one instead
+    }
+  }
+  return null; // every community already covered at its current content
+}
+
+// Forced full-coverage sweep (2026-09-24, user request to get back to a solid base level
+// after a large volume of unreviewed changes): the normal next() above hands back ONE
+// community per call, gated behind the generation-throttle's one-pending-task-at-a-time
+// default -- getting through every stale/uncovered community this way can take many
+// worker ticks. This returns a task for EVERY community not covered at its current
+// content (per isCommunityCovered above) all at once, so force-arch-discovery-sweep.js
+// (agent-manager scripts/) can queue the whole backlog directly into pending/ in one shot
+// and let the already-running workers (arch_discovery is priority 3, near the top of the
+// ladder -- see agent-manager.env's AGENT_MANAGER_TASK_PRIORITIES) drain it on their
+// normal cadence.
+function allPendingArchDiscoveryTasks({ getConfig, taskIdExistsInQueue }) {
+  const { repoRoot, communityCoveragePath, graphPath, archReviewCandidatesPath, communityDirtySignalsPath, defaultDomain } = getConfig();
+  const sorted = sortedCommunitiesByCoverage(communityCoveragePath);
+  if (!sorted) return [];
+  const graph = loadGraph(graphPath);
+  if (!graph) return [];
+  const dirtySignals = readDirtySignals(communityDirtySignalsPath);
+
+  const tasks = [];
+  for (const community of sorted) {
+    const contentHash = communityContentHash(graph, community.id, repoRoot);
+    if (isCommunityCovered(community, contentHash, taskIdExistsInQueue, dirtySignals)) continue;
+    const task = buildArchDiscoveryTaskForCommunity(community, contentHash, graph, { repoRoot, archReviewCandidatesPath, defaultDomain });
+    if (task) {
+      clearDirtySignal(communityDirtySignalsPath, community.id);
+      tasks.push(task);
+    }
+  }
+  return tasks;
 }
 
 // --- Source: arch_import -- promotes a deep_dive Use/Adapt finding into a real,
@@ -432,8 +589,13 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
 module.exports = {
   register,
   nextArchDiscoveryTask,
+  allPendingArchDiscoveryTasks,
   nextArchImportTask,
   applyArchImportCandidate,
+  loadGraph,
+  communityContentHash,
+  readDirtySignals,
+  clearDirtySignal,
   ARCH_DISCOVERY_CONTEXT_BUDGET_CHARS,
   ARCH_IMPORT_RETRY_COOLDOWN_MS,
 };

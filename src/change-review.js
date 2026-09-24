@@ -461,7 +461,50 @@ function lowPriorityCursorPath(highPriorityCursorPath) {
     : `${highPriorityCursorPath}${LOW_PRIORITY_LANE_SUFFIX}`;
 }
 
-function scanLane({ repoRoot, pipelineDir, defaultDomain, mainBranch, head, cursorPath, wantPipelineReviewed, taskIdExistsInQueue }) {
+// Architecture re-review trigger (2026-09-24): change_review already walks every commit
+// landing on the default branch, name-status and all, purely for its own correctness
+// pass. This piggybacks on that walk to ALSO flag any graphify community whose files the
+// commit touched into communityDirtySignalsPath -- a second, structurally independent
+// staleness detector for arch_discovery, alongside (not instead of) its own content-hash
+// recompute (see arch.js's isCommunityCovered header). Deliberately isolated behind a
+// try/catch that can never propagate: a bug here (missing/corrupt graph.json, a bad path,
+// whatever) must never affect change_review's own actual job of finding correctness
+// regressions. graph is loaded and memoized ONCE per scanLane() call (via graphCache),
+// not once per commit -- a lane can walk many commits in a single call.
+function flagDirtyCommunities(graphPath, communityDirtySignalsPath, nameStatus, sha7, graphCache) {
+  try {
+    if (graphCache.value === undefined) {
+      const { loadGraph } = require('./arch.js');
+      graphCache.value = loadGraph(graphPath); // null if missing/unparseable -- cached either way, never retried this call
+    }
+    const graph = graphCache.value;
+    if (!graph) return;
+
+    if (!graphCache.fileToCommunity) {
+      graphCache.fileToCommunity = new Map(
+        graph.nodes.filter((n) => n.source_file).map((n) => [n.source_file, n.community]),
+      );
+    }
+    const touchedCommunities = new Set(
+      nameStatus.map((f) => graphCache.fileToCommunity.get(f.path)).filter((id) => id != null),
+    );
+    if (touchedCommunities.size === 0) return;
+
+    const { readDirtySignals } = require('./arch.js');
+    const { writeJsonAtomicSync } = require('agent-manager/src/atomic-write.js');
+    const signals = readDirtySignals(communityDirtySignalsPath);
+    const nowIso = new Date().toISOString();
+    for (const communityId of touchedCommunities) {
+      signals[String(communityId)] = { dirtySince: nowIso, lastCommit: sha7 };
+    }
+    writeJsonAtomicSync(communityDirtySignalsPath, signals);
+  } catch {
+    // Never let this side channel affect change_review's own correctness pass.
+  }
+}
+
+function scanLane({ repoRoot, pipelineDir, defaultDomain, mainBranch, head, cursorPath, wantPipelineReviewed, taskIdExistsInQueue, graphPath, communityDirtySignalsPath }) {
+  const graphCache = {}; // memoizes the loaded graph + file->community map across every commit this call walks
   let cursor = readCursor(cursorPath);
   if (!cursor) {
     const seed = seedCursorSha(repoRoot, mainBranch);
@@ -526,6 +569,7 @@ function scanLane({ repoRoot, pipelineDir, defaultDomain, mainBranch, head, curs
       continue;
     }
     const nameStatus = unitNameStatus(repoRoot, sha);
+    flagDirtyCommunities(graphPath, communityDirtySignalsPath, nameStatus, sha.slice(0, 7), graphCache);
     const kind = classifyUnit(nameStatus);
     if (kind !== 'reviewable') {
       const flushed = flushBatch();
@@ -606,7 +650,7 @@ function nextChangeReviewTask({ getConfig, taskIdExistsInQueue }) {
   } catch {
     return null;
   }
-  const { repoRoot, pipelineDir, defaultDomain, changeReviewCursorPath } = cfg;
+  const { repoRoot, pipelineDir, defaultDomain, changeReviewCursorPath, graphPath, communityDirtySignalsPath } = cfg;
   if (!repoRoot || !isGitRepo(repoRoot)) return null;
 
   const mainBranch = resolveMainBranch(repoRoot);
@@ -616,7 +660,7 @@ function nextChangeReviewTask({ getConfig, taskIdExistsInQueue }) {
   const head = headSha(repoRoot, mainBranch);
   if (!head) return null;
 
-  const laneArgs = { repoRoot, pipelineDir, defaultDomain, mainBranch, head, taskIdExistsInQueue };
+  const laneArgs = { repoRoot, pipelineDir, defaultDomain, mainBranch, head, taskIdExistsInQueue, graphPath, communityDirtySignalsPath };
 
   // HIGH priority lane first, always -- see this function's own header comment above for
   // why this is two independent cursors, not a reordered single walk.

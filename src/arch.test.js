@@ -406,3 +406,83 @@ test('nextArchDiscoveryTask sends the top file truncated when nothing fits the b
   assert.ok(task.promptContext.files[0].content.length < 25000);
   assert.match(task.promptContext.files[0].content, /truncated/);
 });
+
+// Staleness fix (2026-09-24): a community whose CONTENT changes after its one and only
+// review must become eligible again, even though its id and file-membership set stay the
+// same -- taskIdExistsInQueue's dedup is otherwise permanent-by-id forever.
+test('nextArchDiscoveryTask re-opens a community once its content changes, via a new hash-suffixed id', () => {
+  const dir = discoveryFixture([1000]);
+  const { nextArchDiscoveryTask } = freshPlugin(dir);
+
+  const first = nextArchDiscoveryTask();
+  assert.match(first.id, /^arch-discovery-community-0-[0-9a-f]{12}$/);
+
+  // Mark it done exactly as the real pipeline would (queue/done/<id>.json).
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'done', `${first.id}.json`), JSON.stringify(first));
+
+  // Same content -> same hash -> same id -> still covered, nothing new to offer.
+  assert.equal(nextArchDiscoveryTask(), null);
+
+  // Now the community's only file actually changes.
+  fs.writeFileSync(path.join(dir, 'src', 'f0.js'), 'y'.repeat(1000));
+
+  const second = nextArchDiscoveryTask();
+  assert.ok(second, 'a content change must re-open the community for review');
+  assert.notEqual(second.id, first.id);
+  assert.match(second.id, /^arch-discovery-community-0-[0-9a-f]{12}$/);
+});
+
+// Grandfather clause (2026-09-24 rollout): a community reviewed under the OLD un-suffixed
+// id scheme, with its content hash backfilled as "current" in community-coverage.json,
+// must NOT look stale just because the hash suffix is new -- only a REAL content change
+// after the backfill should re-open it.
+test('nextArchDiscoveryTask treats a legacy-id task as covered when its backfilled content hash still matches', () => {
+  const dir = discoveryFixture([1000]);
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  const { getConfig } = require('agent-manager/src/config.js');
+  const { communityContentHash, loadGraph } = require('./arch.js');
+  const { communityCoveragePath, graphPath, repoRoot } = getConfig();
+
+  const legacyId = 'arch-discovery-community-0';
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'done', `${legacyId}.json`), JSON.stringify({ id: legacyId }));
+
+  const graph = loadGraph(graphPath);
+  const hash = communityContentHash(graph, 0, repoRoot);
+  const coverage = JSON.parse(fs.readFileSync(communityCoveragePath, 'utf8'));
+  coverage.communities[0].lastReviewedContentHash = hash;
+  fs.writeFileSync(communityCoveragePath, JSON.stringify(coverage));
+
+  const { nextArchDiscoveryTask } = freshPlugin(dir);
+  assert.equal(nextArchDiscoveryTask(), null, 'backfilled, unchanged content must still be covered by the legacy task');
+
+  fs.writeFileSync(path.join(dir, 'src', 'f0.js'), 'y'.repeat(1000));
+  const task = nextArchDiscoveryTask();
+  assert.ok(task, 'a real change after the backfill must re-open the community');
+});
+
+// change_review's independent dirty-signal path (2026-09-24): a flagged community must be
+// treated as uncovered even when the content-hash check alone would say it's fine (e.g. a
+// bug in the hash path, or a change the hash check doesn't yet see) -- the two detectors
+// are deliberately redundant, not one gating the other.
+test('nextArchDiscoveryTask treats a dirty-flagged community as uncovered even when its content hash is unchanged', () => {
+  const dir = discoveryFixture([1000]);
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  const { getConfig } = require('agent-manager/src/config.js');
+  const { communityDirtySignalsPath } = getConfig();
+
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'arch-discovery-community-0.json'), JSON.stringify({ id: 'arch-discovery-community-0' }));
+  fs.writeFileSync(communityDirtySignalsPath, JSON.stringify({ 0: { dirtySince: new Date().toISOString(), lastCommit: 'abc1234' } }));
+
+  const { nextArchDiscoveryTask } = freshPlugin(dir);
+  const task = nextArchDiscoveryTask();
+  assert.ok(task, 'a dirty-flagged community must be offered for review regardless of an unchanged content hash');
+
+  // Handing back the task must consume (clear) the signal, same as the hash path.
+  const signals = JSON.parse(fs.readFileSync(communityDirtySignalsPath, 'utf8'));
+  assert.equal('0' in signals, false, 'the dirty signal must be cleared once a task is created for it');
+});

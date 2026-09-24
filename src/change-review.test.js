@@ -1181,3 +1181,67 @@ test('expiry hook is registered on change_review with the change-review- id pref
   assert.equal(typeof ex.record, 'function');
   assert.equal(getRegisteredSource('change_review_fix').expiry, undefined, 'the sibling fix source (same id prefix) does not opt in');
 });
+
+// --- architecture re-review trigger (2026-09-24) ------------------------------------
+// change_review's own commit walk also flags any graphify community whose files a commit
+// touched, into community-dirty-signals.json, for arch_discovery's independent staleness
+// check (arch.js's isCommunityCovered) to consume. See that file's own tests for the
+// consumer side; these exercise the producer side, inside change_review's real walk.
+
+function writeGraphFixture(dir, nodesByCommunity) {
+  const nodes = [];
+  for (const [community, files] of Object.entries(nodesByCommunity)) {
+    for (const file of files) nodes.push({ id: file, community: Number(community), source_file: file });
+  }
+  fs.writeFileSync(path.join(dir, 'graph.json'), JSON.stringify({ nodes, links: [] }));
+  process.env.AGENT_MANAGER_GRAPH_PATH = path.join(dir, 'graph.json');
+}
+
+function readDirtySignalsFixture(dir) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(dir, 'community-dirty-signals.json'), 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+test('a commit touching a graph-tracked file flags its community dirty', () => {
+  const repo = makeGitRepo();
+  repo.commit({ 'a.js': 'v0\n' }, 'c1');
+  const c2 = repo.commit({ 'a.js': 'v1\n' }, 'edit a');
+  writeCursor(repo.dir, git(repo.dir, ['rev-parse', `${c2}^`]));
+  writeGraphFixture(repo.dir, { 5: ['a.js'] });
+
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+  mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+
+  const signals = readDirtySignalsFixture(repo.dir);
+  assert.equal('5' in signals, true);
+  assert.equal(signals['5'].lastCommit, c2.slice(0, 7));
+});
+
+test('a commit touching no graph-tracked file leaves the dirty-signals file untouched', () => {
+  const repo = makeGitRepo();
+  repo.commit({ 'a.js': 'v0\n' }, 'c1');
+  const c2 = repo.commit({ 'unrelated.js': 'v1\n' }, 'edit unrelated');
+  writeCursor(repo.dir, git(repo.dir, ['rev-parse', `${c2}^`]));
+  writeGraphFixture(repo.dir, { 5: ['a.js'] });
+
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+  mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+
+  assert.deepEqual(readDirtySignalsFixture(repo.dir), {});
+});
+
+test('a missing/corrupt graph.json does not affect change_review\'s own task output', () => {
+  const repo = makeGitRepo();
+  repo.commit({ 'a.js': 'v0\n' }, 'c1');
+  const c2 = repo.commit({ 'a.js': 'v1\n' }, 'edit a');
+  writeCursor(repo.dir, git(repo.dir, ['rev-parse', `${c2}^`]));
+  process.env.AGENT_MANAGER_GRAPH_PATH = path.join(repo.dir, 'does-not-exist.json');
+
+  const { mod, getConfig, taskIdExistsInQueue } = freshPlugin(repo.dir);
+  const task = mod.nextChangeReviewTask({ getConfig, taskIdExistsInQueue });
+  assert.equal(task.id, `change-review-${c2.slice(0, 7)}`, 'change_review must still produce its normal task despite a missing graph.json');
+  assert.deepEqual(readDirtySignalsFixture(repo.dir), {});
+});
