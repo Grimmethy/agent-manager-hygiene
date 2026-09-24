@@ -131,11 +131,21 @@ function extractExports(filePath) {
     for (const name of extractEsExports(text)) set.add(name);
   }
 
-  for (const m of text.matchAll(/module\.exports\s*=\s*\{([^}]*)\}/g)) {
+  // Comments/strings blanked first (2026-09-24 fix, found during a hand-verification
+  // sweep of the first real scan): `[^}]*` happily spans a trailing `// comment` line
+  // inside a multi-line `module.exports = { a, b, // some prose\n c }` list, and the
+  // comma-split then added fragments of that COMMENT TEXT as if they were export names
+  // (confirmed live: 13 of 251 real candidates from the first scan were comment prose,
+  // not identifiers -- e.g. "// exported for direct unit testing"). Same treatment
+  // extractEsExports already gives its own text. The identifier-shape check below is
+  // belt-and-suspenders in case a comment survives stripping in some edge case.
+  const codeForCjs = stripNonCode(text);
+  for (const m of codeForCjs.matchAll(/module\.exports\s*=\s*\{([^}]*)\}/g)) {
     const inner = m[1];
     for (const part of inner.split(',')) {
       const trimmed = part.trim();
       if (!trimmed || trimmed.includes(':')) continue; // skip computed/renamed exports
+      if (!new RegExp('^' + IDENT + '$').test(trimmed)) continue; // not a bare identifier -- skip
       set.add(trimmed);
     }
   }

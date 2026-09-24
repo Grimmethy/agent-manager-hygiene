@@ -46,6 +46,24 @@ test('extractEsExports: `export { a as default }` yields the local name', () => 
   assert.deepEqual(extractEsExports('export { widget as default };'), ['widget']);
 });
 
+// Regression (2026-09-24, found during a hand-verification sweep of the first real live
+// scan): a comment inside a multi-line `module.exports = {...}` list was being comma-split
+// and added as if it were an export name -- 13 of 251 real candidates from that first scan
+// were comment prose, not identifiers.
+test('extractExports: a comment inside module.exports = {...} is never mistaken for an export name', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'unused-export-'));
+  fs.writeFileSync(path.join(dir, 'a.js'), [
+    'function foo() {}',
+    'function bar() {}',
+    'module.exports = {',
+    '  foo,',
+    '  // exported for direct unit testing',
+    '  bar,',
+    '};',
+  ].join('\n'));
+  assert.deepEqual(extractExports(path.join(dir, 'a.js')).sort(), ['bar', 'foo']);
+});
+
 test('extractExports: ES detection applies to .ts/.tsx only; CommonJS still works for .js', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'unused-export-'));
   fs.writeFileSync(path.join(dir, 'a.tsx'), 'export const FromTsx = 1;\n');
