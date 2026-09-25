@@ -84,43 +84,27 @@ function loadGraph(graphPath) {
   return graph;
 }
 
-// Content hash of a community (2026-09-24, staleness fix -- see the long comment on
-// isCommunityCovered() below for the incident this traces back to): every member file's
-// path + current content, hashed together. Two reads of the same file set with
-// byte-identical content always produce the same hash regardless of the community's `id`
-// (an unstable enumerate() position that can shift across graph rebuilds) -- this is what
-// lets "this community's code actually changed" be distinguished from "nothing changed"
-// without any mtime/timestamp bookkeeping, which agent-manager doesn't track per-file
-// anywhere. A missing/unreadable file hashes as empty, same "skip, never throw" tolerance
-// the rest of this file uses -- it still changes the hash (a file disappearing IS a real
-// change), it just doesn't blow up the whole computation.
-function communityContentHash(graph, communityId, repoRoot) {
-  const memberFiles = [...new Set(
-    graph.nodes.filter((n) => n.community === communityId && n.source_file).map((n) => n.source_file),
-  )].sort();
-  const hash = crypto.createHash('sha256');
-  for (const file of memberFiles) {
-    hash.update(file);
-    hash.update('\0');
-    hash.update(readIfExists(path.join(repoRoot, file)) || '');
-    hash.update('\0');
-  }
-  return hash.digest('hex').slice(0, 12);
-}
-
-// Builds the actual arch_discovery task for one already-chosen community (file
-// ranking/budgeting, candidates-doc tail), given its current content hash and an
-// already-loaded graph. Extracted from nextArchDiscoveryTask() (2026-09-24) so a forced
-// full-coverage sweep (force-arch-discovery-sweep.js) can build a task per community
-// without duplicating this logic -- the one-at-a-time picker below is now just this helper
-// plus selection.
-function buildArchDiscoveryTaskForCommunity(chosen, contentHash, graph, { repoRoot, archReviewCandidatesPath, defaultDomain }) {
+// Ranks a community's member files by degree and applies the context budget -- the exact
+// file set arch_discovery actually shows the model. Extracted (2026-09-24, community-2
+// duplicate incident) so communityContentHash and buildArchDiscoveryTaskForCommunity
+// share ONE definition of "this community's reviewed content" instead of two: the hash
+// used to be computed over the community's FULL raw graph membership while the model saw
+// only the ranked/budgeted subset, so a real commit touching some peripheral, never-shown,
+// low-degree member file (a routine occurrence on a self-hosting pipeline that is
+// continuously applying its own triage-batch commits to master) changed the hash even
+// though the reviewed content was byte-identical -- confirmed live: two arch_discovery
+// runs of the same "scripts" community, 9 minutes apart, produced different hashes and
+// therefore two near-duplicate candidate write-ups for the same 4 files, despite no
+// change to any of those 4 files themselves. Returns { files } -- files is [] when the
+// community has no readable member.
+//
+// Degree = how many times a node's id appears as EITHER end of ANY link in the whole
+// graph, not just links within this community -- a file's real architectural weight
+// includes its cross-community connections.
+function selectBudgetedCommunityFiles(chosen, graph, repoRoot) {
   const memberNodes = graph.nodes.filter((n) => n.community === chosen.id);
-  if (memberNodes.length === 0) return null;
+  if (memberNodes.length === 0) return { files: [] };
 
-  // Degree = how many times a node's id appears as EITHER end of ANY link in the whole
-  // graph, not just links within this community -- a file's real architectural weight
-  // includes its cross-community connections.
   const degreeByNodeId = {};
   for (const link of graph.links) {
     degreeByNodeId[link.source] = (degreeByNodeId[link.source] || 0) + 1;
@@ -157,6 +141,38 @@ function buildArchDiscoveryTaskForCommunity(chosen, contentHash, graph, { repoRo
       content: topReadable.content.slice(0, ARCH_DISCOVERY_CONTEXT_BUDGET_CHARS) + '\n/* ...truncated to fit the context budget... */\n',
     });
   }
+  return { files };
+}
+
+// Content hash of a community's REVIEWED content (2026-09-24, staleness fix -- see the
+// long comment on isCommunityCovered() below for the incident this traces back to, and
+// selectBudgetedCommunityFiles's own header for why this hashes the budgeted `files` list
+// rather than the community's full raw graph membership): each shown file's path +
+// current content, hashed together. Two reads of the same budgeted file set with
+// byte-identical content always produce the same hash regardless of the community's `id`
+// (an unstable enumerate() position that can shift across graph rebuilds), and regardless
+// of unrelated churn in member files the model never actually sees. Sorted by path (not
+// degree) so a genuine near-tie in degree ranking can't flip hash order without changing
+// content.
+function communityContentHash(files) {
+  const hash = crypto.createHash('sha256');
+  for (const { path: file, content } of [...files].sort((a, b) => a.path.localeCompare(b.path))) {
+    hash.update(file);
+    hash.update('\0');
+    hash.update(content || '');
+    hash.update('\0');
+  }
+  return hash.digest('hex').slice(0, 12);
+}
+
+// Builds the actual arch_discovery task for one already-chosen community (candidates-doc
+// tail, id/title/promptContext shape), given its current content hash and its already-
+// selected budgeted file list (selectBudgetedCommunityFiles). Extracted from
+// nextArchDiscoveryTask() (2026-09-24) so a forced full-coverage sweep
+// (force-arch-discovery-sweep.js) can build a task per community without duplicating this
+// logic -- the one-at-a-time picker below is now just this helper plus selection.
+function buildArchDiscoveryTaskForCommunity(chosen, contentHash, files, { repoRoot, archReviewCandidatesPath, defaultDomain }) {
+  if (files.length === 0) return null;
 
   const candidatesTail = readIfExists(archReviewCandidatesPath);
   const existingCandidatesTail = candidatesTail ? candidatesTail.slice(-4000) : '';
@@ -277,12 +293,14 @@ function nextArchDiscoveryTask({ getConfig, taskIdExistsInQueue }) {
   const dirtySignals = readDirtySignals(communityDirtySignalsPath);
 
   for (const community of sorted) {
-    const contentHash = communityContentHash(graph, community.id, repoRoot);
+    const { files } = selectBudgetedCommunityFiles(community, graph, repoRoot);
+    if (files.length === 0) continue; // no readable member files -- try the next one instead
+    const contentHash = communityContentHash(files);
     if (isCommunityCovered(community, contentHash, taskIdExistsInQueue, dirtySignals)) continue;
-    const task = buildArchDiscoveryTaskForCommunity(community, contentHash, graph, { repoRoot, archReviewCandidatesPath, defaultDomain });
+    const task = buildArchDiscoveryTaskForCommunity(community, contentHash, files, { repoRoot, archReviewCandidatesPath, defaultDomain });
     if (task) {
       clearDirtySignal(communityDirtySignalsPath, community.id);
-      return task; // a community with no readable member files (build returned null) -- try the next one instead
+      return task;
     }
   }
   return null; // every community already covered at its current content
@@ -308,9 +326,11 @@ function allPendingArchDiscoveryTasks({ getConfig, taskIdExistsInQueue }) {
 
   const tasks = [];
   for (const community of sorted) {
-    const contentHash = communityContentHash(graph, community.id, repoRoot);
+    const { files } = selectBudgetedCommunityFiles(community, graph, repoRoot);
+    if (files.length === 0) continue;
+    const contentHash = communityContentHash(files);
     if (isCommunityCovered(community, contentHash, taskIdExistsInQueue, dirtySignals)) continue;
-    const task = buildArchDiscoveryTaskForCommunity(community, contentHash, graph, { repoRoot, archReviewCandidatesPath, defaultDomain });
+    const task = buildArchDiscoveryTaskForCommunity(community, contentHash, files, { repoRoot, archReviewCandidatesPath, defaultDomain });
     if (task) {
       clearDirtySignal(communityDirtySignalsPath, community.id);
       tasks.push(task);
@@ -593,6 +613,7 @@ module.exports = {
   nextArchImportTask,
   applyArchImportCandidate,
   loadGraph,
+  selectBudgetedCommunityFiles,
   communityContentHash,
   readDirtySignals,
   clearDirtySignal,

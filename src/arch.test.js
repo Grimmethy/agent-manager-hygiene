@@ -407,6 +407,32 @@ test('nextArchDiscoveryTask sends the top file truncated when nothing fits the b
   assert.match(task.promptContext.files[0].content, /truncated/);
 });
 
+// 2026-09-24, real incident: two arch_discovery runs of the same "scripts" community, 9
+// minutes apart, produced different content hashes -- and therefore two near-duplicate
+// candidate write-ups -- for the exact same 4 shown files, because a commit had landed on
+// an unrelated, never-shown, over-budget member file in between (routine on a self-hosting
+// pipeline that continuously applies its own triage-batch commits to master while a
+// discovery pass is running). The hash must track only what the model was actually shown.
+test('nextArchDiscoveryTask: a change to an over-budget, never-shown member file does NOT re-open the community', () => {
+  const dir = discoveryFixture([30000, 5000, 4000]); // f0 is ranked top but never fits the budget (see the test above)
+  const { nextArchDiscoveryTask } = freshPlugin(dir);
+
+  const first = nextArchDiscoveryTask();
+  assert.deepEqual(first.promptContext.files.map((f) => f.path), ['src/f1.js', 'src/f2.js']);
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'done', `${first.id}.json`), JSON.stringify(first));
+
+  // f0 changes -- it was never part of what was reviewed, so this must NOT look like new content.
+  fs.writeFileSync(path.join(dir, 'src', 'f0.js'), 'z'.repeat(30000));
+  assert.equal(nextArchDiscoveryTask(), null, 'a change to a file the model never saw must not re-open the community');
+
+  // f1 (actually shown) changes -- THIS must re-open it.
+  fs.writeFileSync(path.join(dir, 'src', 'f1.js'), 'z'.repeat(5000));
+  const second = nextArchDiscoveryTask();
+  assert.ok(second, 'a change to a file the model actually reviewed must re-open the community');
+  assert.notEqual(second.id, first.id);
+});
+
 // Staleness fix (2026-09-24): a community whose CONTENT changes after its one and only
 // review must become eligible again, even though its id and file-membership set stay the
 // same -- taskIdExistsInQueue's dedup is otherwise permanent-by-id forever.
@@ -442,7 +468,7 @@ test('nextArchDiscoveryTask treats a legacy-id task as covered when its backfill
   process.env.AGENT_MANAGER_REPO_ROOT = dir;
   process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
   const { getConfig } = require('agent-manager/src/config.js');
-  const { communityContentHash, loadGraph } = require('./arch.js');
+  const { communityContentHash, selectBudgetedCommunityFiles, loadGraph } = require('./arch.js');
   const { communityCoveragePath, graphPath, repoRoot } = getConfig();
 
   const legacyId = 'arch-discovery-community-0';
@@ -450,7 +476,8 @@ test('nextArchDiscoveryTask treats a legacy-id task as covered when its backfill
   fs.writeFileSync(path.join(dir, 'queue', 'done', `${legacyId}.json`), JSON.stringify({ id: legacyId }));
 
   const graph = loadGraph(graphPath);
-  const hash = communityContentHash(graph, 0, repoRoot);
+  const { files } = selectBudgetedCommunityFiles({ id: 0 }, graph, repoRoot);
+  const hash = communityContentHash(files);
   const coverage = JSON.parse(fs.readFileSync(communityCoveragePath, 'utf8'));
   coverage.communities[0].lastReviewedContentHash = hash;
   fs.writeFileSync(communityCoveragePath, JSON.stringify(coverage));
