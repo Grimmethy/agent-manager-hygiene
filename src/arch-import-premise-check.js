@@ -26,8 +26,18 @@ const path = require('path');
 
 const { call: localCall } = require('agent-manager/src/local-client.js');
 
-const PREMISE_CHECK_MODEL = process.env.AGENT_MANAGER_ARCH_IMPORT_PREMISE_MODEL || 'qwen2.5:3b';
-const PREMISE_CHECK_NUM_CTX = 8192;
+// 2026-09-25: no longer defaults to a dedicated small model or a non-standard numCtx --
+// see agent-manager/src/task-sources.js's 2026-09-18 brain_dump_sort comment for the full
+// incident this mirrors (forcing a specific small model on a lane sharing a GPU with a
+// large resident model made Ollama evict+reload it on every lane alternation, routinely
+// exceeding call timeouts; the numCtx mismatch alone forces a reload too, independent of
+// the model choice). Undefined falls through to local-client.js's own `model: model ||
+// MODEL` (the claiming worker's ambient/resident model) and its own default numCtx --
+// same "costs nothing in correctness, stops fighting other lanes for GPU residency" fix.
+// The env var override still lets an operator force a dedicated model deliberately.
+const PREMISE_CHECK_MODEL = process.env.AGENT_MANAGER_ARCH_IMPORT_PREMISE_MODEL || undefined;
+const PREMISE_CHECK_NUM_CTX = process.env.AGENT_MANAGER_ARCH_IMPORT_PREMISE_NUM_CTX
+  ? Number(process.env.AGENT_MANAGER_ARCH_IMPORT_PREMISE_NUM_CTX) : undefined;
 
 function isEnabled() {
   return process.env.AGENT_MANAGER_ARCH_IMPORT_PREMISE_CHECK !== 'false';

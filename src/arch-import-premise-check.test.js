@@ -137,7 +137,7 @@ test('runPremiseCheck: no checkable claim -> ok, zero model calls', async () => 
   assert.equal(called, false);
 });
 
-test('runPremiseCheck: a checkable-but-unsettled claim falls back to one qwen2.5:3b call via maybeLockedOn', async () => {
+test('runPremiseCheck: a checkable-but-unsettled claim falls back to one ambient-model call (no forced small model, 2026-09-25) via maybeLockedOn', async () => {
   const t = task({
     promptContext: {
       body: 'The draft cites `src/x.js:10` as containing `SOME_UNVERIFIABLE_THING` -- wait, actually the shape is ambiguous.',
@@ -150,7 +150,10 @@ test('runPremiseCheck: a checkable-but-unsettled claim falls back to one qwen2.5
     maybeLockedOn: async (model, fn, label) => { lockLabel = label; return fn(); },
   });
   assert.equal(lockLabel, 'arch-import-premise');
-  assert.equal(modelUsed, 'qwen2.5:3b');
+  // undefined (not a hardcoded 'qwen2.5:3b') -- falls through to local-client.js's own
+  // `model: model || MODEL`, i.e. whatever the claiming worker's ambient model already
+  // is, so this check no longer forces Ollama to evict+reload a large resident model.
+  assert.equal(modelUsed, undefined);
   assert.equal(r.verdict, 'invalid-premise');
 });
 
