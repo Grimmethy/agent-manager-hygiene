@@ -169,3 +169,47 @@ test('runGroundingCheck returns ok when the task has no snippet at all to ground
   assert.deepEqual(r, { verdict: 'ok' });
   assert.equal(calls, 0);
 });
+
+// --- 2026-09-26: the prompt must show the whole function (10 of 12 blocked tasks had snippets clipped at 6000 chars) ---
+
+const { buildGroundingCheckPrompt, snippetForPrompt, GROUNDING_SNIPPET_MAX_CHARS } = require('./function-length-grounding-check.js');
+
+// Shape of function-length-agent-manager-src-system-report-js-207: a ~140-line function, ~8700 chars, whose END is the part the old clip cut off.
+const longFunctionSnippet = () => {
+  const body = Array.from({ length: 130 }, (_, i) => `  lines.push('## Section ${i} -- some fairly long line of report text so this function is realistically wide');`);
+  return ['function renderMarkdown({ period, tasks }) {', "  const lines = [];", ...body, '', "  return lines.join('\\n');", '}'].join('\n');
+};
+
+test('the grounding prompt shows the END of a long function (the old 6000-char clip cut it off), with no partial-view note', () => {
+  const snippet = longFunctionSnippet();
+  assert.ok(snippet.length > 6000 && snippet.length < GROUNDING_SNIPPET_MAX_CHARS, `fixture is ${snippet.length} chars`);
+  const prompt = buildGroundingCheckPrompt(task({ promptContext: { snippet } }), 'Extract a buildSections helper; renderMarkdown still returns lines.join.');
+  assert.ok(prompt.includes("return lines.join('\\n');"), 'the return statement the model needs to see is in the prompt');
+  assert.doesNotMatch(prompt, /continues past the end of the snippet/);
+  assert.doesNotMatch(prompt, /complete text/, 'the prompt no longer promises a complete text it may not deliver');
+});
+
+test('a snippet carrying functionSnippet\'s truncation marker tells the model its view is partial', () => {
+  const snippet = `${longFunctionSnippet().slice(0, 3000)}\n// ... [truncated for review: this function continues for 40 more line(s) not shown]`;
+  const prompt = buildGroundingCheckPrompt(task({ promptContext: { snippet } }), 'sol');
+  assert.match(prompt, /the function continues past the end of the snippet/);
+  assert.match(prompt, /a claim about the unseen remainder is NOT a contradiction/);
+});
+
+test('a snippet longer than the cap is clipped AND flagged partial', () => {
+  const huge = 'x'.repeat(GROUNDING_SNIPPET_MAX_CHARS + 500);
+  const { text, partial } = snippetForPrompt(huge);
+  assert.equal(partial, true);
+  assert.ok(text.length < huge.length);
+  assert.equal(snippetForPrompt('short').partial, false);
+});
+
+test('runGroundingCheck passes the full long-function snippet to the model call', async () => {
+  const snippet = longFunctionSnippet();
+  let seenPrompt = '';
+  const call = async ({ prompt }) => { seenPrompt = prompt; return { response: 'GROUNDED' }; };
+  const impl = '### AC-1 · Split renderMarkdown\nStrength: Strong\nFiles: src/system-report.js\nProblem:\nlong.\nSolution:\nKeep the final return lines.join.\nBenefits:\nsmaller.';
+  const r = await runGroundingCheck(task({ promptContext: { snippet } }), impl, { call });
+  assert.equal(r.verdict, 'ok');
+  assert.ok(seenPrompt.includes("return lines.join('\\n');"));
+});

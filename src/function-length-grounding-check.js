@@ -55,6 +55,24 @@ function clip(s, n) {
   return str.length > n ? `${str.slice(0, n)}\n...[truncated]` : str;
 }
 
+// The model must see the whole function it is asked to check. function-length-review.js's functionSnippet() already hands the review
+// the complete body (2 lines of lead-in + up to SNIPPET_MAX_LINES = 200 lines, ending in a "[truncated for review" marker if it had to cut),
+// but this prompt used to clip that again at 6000 chars while telling the model it had "the REAL, complete text": on a long function the
+// model then flagged a true claim about the unseen tail ("the function contains no return statement") as NOT_GROUNDED. 2026-09-26: 10 of the
+// 12 blocked function_length_review tasks and 66 of 125 recorded function_length_review tasks had snippets over 6000 chars, and two of them
+// were blocked on exactly that ("no return" -- the real function ends `return lines.join('\n')`; "no [data-file] binding" -- it is wired further
+// down). 200 lines of ~100 chars is ~20000 chars, so this cap covers everything functionSnippet can emit; if a snippet still exceeds it,
+// the prompt says so and the model may only judge what it can see.
+const GROUNDING_SNIPPET_MAX_CHARS = 24000;
+const REVIEW_TRUNCATION_MARKER_RE = /\[truncated for review/;
+
+// -> { text, partial }: partial is true when the function continues past what the model is shown.
+function snippetForPrompt(snippet) {
+  const str = String(snippet || '');
+  const clipped = str.length > GROUNDING_SNIPPET_MAX_CHARS;
+  return { text: clipped ? clip(str, GROUNDING_SNIPPET_MAX_CHARS) : str, partial: clipped || REVIEW_TRUNCATION_MARKER_RE.test(str) };
+}
+
 // A GENUINE verdict's candidate block (functionLengthReviewImplementPrompt's own required
 // format: "### AC-NNN · Title" then Strength/Files/Problem/Solution/Benefits).
 const CANDIDATE_HEADER_RE = /^###\s*AC-/m;
@@ -84,12 +102,13 @@ function checkFalseNoGroundingClaim(task, implementResponse) {
 
 // --- Check 2: a GENUINE verdict's free-form Solution prose, cheap-model fallback --------
 function buildGroundingCheckPrompt(task, solution) {
-  const snippet = String((task.promptContext && task.promptContext.snippet) || '');
+  const { text: snippet, partial } = snippetForPrompt(task.promptContext && task.promptContext.snippet);
   return [
-    'A code reviewer proposed decomposing a function into smaller helpers. You are given the REAL, complete text of the function (or its full body if long) and the reviewer\'s Solution paragraph describing the proposed decomposition. Judge ONLY whether the Solution accurately describes the REAL function -- do not judge whether decomposing it is a good idea.',
+    'A code reviewer proposed decomposing a function into smaller helpers. You are given the REAL text of the function and the reviewer\'s Solution paragraph describing the proposed decomposition. Judge ONLY whether the Solution accurately describes the REAL function -- do not judge whether decomposing it is a good idea.',
     '',
+    ...(partial ? ['NOTE: the function continues past the end of the snippet below (it was cut for length). Judge ONLY claims about the code that IS shown; a claim about the unseen remainder is NOT a contradiction.', ''] : []),
     '--- REAL FUNCTION SNIPPET ---',
-    clip(snippet, 6000) || '(no snippet available)',
+    snippet || '(no snippet available)',
     '',
     '--- PROPOSED SOLUTION ---',
     clip(solution, 2000),
@@ -145,5 +164,7 @@ module.exports = {
   checkFalseNoGroundingClaim,
   extractSolution,
   buildGroundingCheckPrompt,
+  snippetForPrompt,
+  GROUNDING_SNIPPET_MAX_CHARS,
   parseGroundingVerdict,
 };
