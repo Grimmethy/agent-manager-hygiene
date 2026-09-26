@@ -172,3 +172,43 @@ test('function_length_review apply appends a candidate (and threads the snippet)
   assert.match(text, /### AC-1 · Decompose bloated\(\)/);
   assert.match(text, /Snippet:\n```\nfunction bloated\(\) \{/);
 });
+
+// --- 2026-09-26: candidate doc must live in the APPLY clone, not the live checkout ---
+
+test('function_length_review apply and function_length_fix read/write the doc under applyRepoRoot, never the live repoRoot', () => {
+  const live = makeRepo();
+  const applyClone = makeRepo();
+  const saved = { path: process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH, apply: process.env.AGENT_MANAGER_APPLY_REPO_ROOT };
+  delete process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH;
+  process.env.AGENT_MANAGER_APPLY_REPO_ROOT = applyClone;
+  try {
+    const { getRegisteredSource } = freshPlugin(live);
+    const result = getRegisteredSource('function_length_review').apply({
+      implementResponse: '### AC-001 · Decompose bloated()\nStrength: Strong\nFiles: big.js\n\nProblem:\nbloated() is long.\n\nSolution:\nSplit into helpers.\n\nBenefits:\nTestable.',
+      task: { promptContext: { snippet: 'function bloated() {}' } },
+    });
+    assert.equal(result.candidateCount, 1);
+    assert.ok(fs.existsSync(path.join(applyClone, 'Docs', 'FUNCTION_LENGTH_CANDIDATES.md')), 'entry landed in the apply clone');
+    assert.equal(fs.existsSync(path.join(live, 'Docs', 'FUNCTION_LENGTH_CANDIDATES.md')), false, 'the live checkout is not touched');
+    assert.equal(getRegisteredSource('function_length_fix').candidatesPath(), path.join(applyClone, 'Docs', 'FUNCTION_LENGTH_CANDIDATES.md'));
+  } finally {
+    if (saved.path === undefined) delete process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH; else process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH = saved.path;
+    if (saved.apply === undefined) delete process.env.AGENT_MANAGER_APPLY_REPO_ROOT; else process.env.AGENT_MANAGER_APPLY_REPO_ROOT = saved.apply;
+  }
+});
+
+test('function-length candidate path: env override wins; with no dedicated apply clone it falls back to repoRoot', () => {
+  const dir = makeRepo();
+  const saved = { path: process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH, apply: process.env.AGENT_MANAGER_APPLY_REPO_ROOT };
+  delete process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH;
+  delete process.env.AGENT_MANAGER_APPLY_REPO_ROOT;
+  try {
+    const { getRegisteredSource } = freshPlugin(dir);
+    assert.equal(getRegisteredSource('function_length_fix').candidatesPath(), path.join(dir, 'Docs', 'FUNCTION_LENGTH_CANDIDATES.md'));
+    process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH = '/tmp/explicit.md';
+    assert.equal(getRegisteredSource('function_length_fix').candidatesPath(), '/tmp/explicit.md');
+  } finally {
+    if (saved.path === undefined) delete process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH; else process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH = saved.path;
+    if (saved.apply === undefined) delete process.env.AGENT_MANAGER_APPLY_REPO_ROOT; else process.env.AGENT_MANAGER_APPLY_REPO_ROOT = saved.apply;
+  }
+});

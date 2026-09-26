@@ -286,6 +286,18 @@ function functionLengthInventory({ repoRoot, pipelineDir, taskState }) {
   });
 }
 
+// Where FUNCTION_LENGTH_CANDIDATES.md lives. It must be rooted at getConfig().applyRepoRoot -- the clone the apply loop's `git add`/commit
+// runs in -- not repoRoot (the live checkout), exactly like every candidate doc config.js defines (see the comment there: an absolute path
+// outside the apply clone makes `git add` fail with "is outside repository", the task exhausts its apply retries, and meanwhile the entry has
+// already been appended to the LIVE checkout's doc, where it stays uncommitted and blocks the dashboard's live sync). The initial extraction
+// (ae689b8) hard-coded repoRoot in three places; on 2026-09-26 the live doc held 25 uncommitted candidates (~7000 lines) and three approved
+// function_length_review tasks were stuck at apply. applyRepoRoot defaults to repoRoot, so this is a no-op without a dedicated apply clone.
+function functionLengthCandidatesPath(getConfig) {
+  if (process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH) return process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH;
+  const cfg = getConfig();
+  return path.join(cfg.applyRepoRoot || cfg.repoRoot, 'Docs', 'FUNCTION_LENGTH_CANDIDATES.md');
+}
+
 function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
   registerTaskSource('function_length_review', {
     requireCodeShapeInCandidate: true,
@@ -300,9 +312,8 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       return functionLengthInventory({ repoRoot, pipelineDir, taskState });
     },
     apply: ({ implementResponse, task }) => {
-      const { repoRoot, pipelineDir } = getConfig();
-      const candidatesPath = process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH
-        || path.join(repoRoot, 'Docs', 'FUNCTION_LENGTH_CANDIDATES.md');
+      const { pipelineDir } = getConfig();
+      const candidatesPath = functionLengthCandidatesPath(getConfig);
       // See apply-group-a.js's applyArchDiscoveryCandidates for why this real,
       // review-time-fresh snippet is threaded through deterministically.
       const res = applyArchDiscoveryCandidates({
@@ -361,10 +372,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     hygieneFamily: hygieneFamily('function_length', { candidateDoc: true }),
     priority: taskPriority('function_length_fix', 72),
     next: () => {
-      const { repoRoot } = getConfig();
-      const candidatesPath = process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH
-        || path.join(repoRoot, 'Docs', 'FUNCTION_LENGTH_CANDIDATES.md');
-      return nextCandidateFulfillmentTask(candidatesPath, 'function_length_fix');
+      return nextCandidateFulfillmentTask(functionLengthCandidatesPath(getConfig), 'function_length_fix');
     },
     // No emptyApproval (2026-08-28): a Strong candidate legitimately resolving to "no real
     // decomposition after all" is rare, and it was letting the common case -- an empty
@@ -389,8 +397,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     // function_length_review) -- unrelated to the disabled re-split path above. Same
     // env-var-or-default resolution as this source's own `next` above, duplicated rather
     // than shared per this file's own stated convention for tiny same-file helpers.
-    candidatesPath: () => process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH
-      || path.join(getConfig().repoRoot, 'Docs', 'FUNCTION_LENGTH_CANDIDATES.md'),
+    candidatesPath: () => functionLengthCandidatesPath(getConfig),
     candidateDocTitle: '# Function Length Decomposition Candidates',
   });
   updateTaskSource('function_length_fix', { buildPlanPrompt: functionLengthFixPlanPrompt, buildImplementPrompt: functionLengthFixImplementPrompt });
