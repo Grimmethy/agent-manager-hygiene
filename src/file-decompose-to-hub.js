@@ -58,6 +58,7 @@ const { getConfig } = require('agent-manager/src/config.js');
 const { planIsFullyMechanicalHtml } = require('./decompose-one-pass.js');
 const { planIsFullyMechanicalNodeModule, buildNodeModuleOnePassChanges } = require('./decompose-node-module.js');
 const { planIsFullyMechanicalBlueprint, buildBlueprintOnePassChanges } = require('./decompose-flask-blueprint.js');
+const { planIsFullyMechanicalPythonModule, buildPythonModuleOnePassChanges } = require('./decompose-python-module.js');
 const { fileHasRecentCommits, HOT_FILE_DAYS } = require('./hot-file-guard.js');
 
 function slugify(s) {
@@ -229,6 +230,33 @@ function validatePlan(repoRoot, request) {
     return { ok: hardProblems.length === 0, hardProblems, moveMeta };
   }
 
+  // A .py source whose plan is ALL python-module-extract moves (2026-09-26): the plain,
+  // non-route sibling of the flask-blueprint branch above -- for helper functions with no
+  // @app.route to anchor a Blueprint on (traced live: computeRoutelessSections in
+  // file-decompose-plan-pass.js was excluding these from every candidate set entirely, so
+  // app.py's plan pass returned null on every tick with 193/194 symbols routeless and
+  // nothing ever filed). Same AST-extract + py_compile discipline, no wiring step -- a
+  // plain module has nothing to register. A MIXED .py plan still falls through below.
+  if (process.env.AGENT_MANAGER_DECOMPOSE_PY_MODULE !== 'false'
+      && /\.py$/.test(request.sourceFile || '') && request.moves.length
+      && request.moves.every((m) => m.kind === 'python-module-extract')) {
+    let sourceText = null;
+    try { sourceText = fs.readFileSync(path.join(repoRoot, request.sourceFile), 'utf8'); } catch { /* unreadable -> advisory only */ }
+    if (sourceText != null) {
+      const built = buildPythonModuleOnePassChanges(sourceText, request.sourceFile,
+        request.moves.map((m) => ({ newFile: m.newFile, symbols: m.symbols || [] })));
+      if (built.ok) {
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [], pythonModuleApplyOk: true });
+      } else {
+        hardProblems.push(`${request.sourceFile}: ${built.reason}`);
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+      }
+    } else {
+      for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+    }
+    return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+  }
+
   for (const move of request.moves) {
     const symbols = move.symbols || [];
     const meta = { sharedDeps: [], neededImports: [] };
@@ -336,22 +364,27 @@ function wiringRawText(request, moves, moveMetas = []) {
   ];
   const isPy = /\.py$/.test(src);
   const isTemplate = /\.html$/.test(src);
+  const anyBlueprint = moves.some((m) => m.kind === 'flask-blueprint');
   for (const m of moves) {
     if (m.kind === 'flask-blueprint') {
       lines.push(`- \`from ${slugify(path.basename(path.dirname(m.newFile)))}.${path.basename(m.newFile, '.py')} import ${m.blueprint}\` (match the real package path) then \`app.register_blueprint(${m.blueprint})\`.`);
     } else if (m.kind === 'script-extract') {
       lines.push(`- ${src}: add \`<script src="/static/js/${path.basename(m.newFile)}"></script>\` just before the final \`</body>\`, after any core.js it depends on.`);
+    } else if (m.kind === 'python-module-extract') {
+      lines.push(`- \`from ${path.basename(m.newFile, '.py')} import ${(m.symbols || []).join(', ')}\` at the top of ${src} (no registration -- these are plain helpers, not a Blueprint).`);
     } else {
       lines.push(`- ${src}: \`require('./${path.relative(path.dirname(src), m.newFile).replace(/\\.js$/, '')}')\` (or import) and use the moved symbols from there.`);
     }
   }
   if (isPy) {
     lines.push('');
-    if (anySharedDep) {
+    if (anySharedDep && anyBlueprint) {
       lines.push(
         `PLACEMENT (required): one or more of the new modules imports back from \`${moduleNameFor(src)}\` (${moveMetas.flatMap((m) => (m && m.sharedDeps) || []).filter((v, i, a) => a.indexOf(v) === i).join(', ')}). Put ALL the \`from ... import <bp>\` lines and ALL the \`app.register_blueprint(...)\` calls in ONE block at the very BOTTOM of ${src}, after every module-level definition (right before \`if __name__ == "__main__":\` if present). Do NOT put them right after \`app = Flask(...)\` -- the back-import is unresolved that early and \`import ${moduleNameFor(src)}\` will raise ImportError.`);
-    } else {
+    } else if (anyBlueprint) {
       lines.push(`PLACEMENT: put the import + \`register_blueprint\` calls together, either right after \`app = Flask(...)\` or in a block at the bottom of ${src}. If any \`${moduleNameFor(src)}.something\` used by a new module is defined later in the file than \`app = Flask(...)\`, use the bottom.`);
+    } else if (anySharedDep) {
+      lines.push(`PLACEMENT: put the plain-module import lines at the top of ${src}, in a block after the existing imports.`);
     }
   }
   lines.push('',
@@ -405,15 +438,18 @@ function fileOnePassTask({ pipelineDir, requestFile, request, now, kind = 'html'
   const id = `adhoc-decompose-${planSlug}-onepass`.slice(0, 120);
   const isNode = kind === 'node-module';
   const isBlueprint = kind === 'flask-blueprint';
+  const isPythonModule = kind === 'python-module';
   const moves = request.moves.map((m) => (isBlueprint
     ? { newFile: m.newFile, blueprint: m.blueprint, symbols: m.symbols }
     : { newFile: m.newFile, symbols: m.symbols }));
-  const deterministicApply = isBlueprint ? 'blueprint-decompose' : isNode ? 'node-module-decompose' : 'one-pass-decompose';
+  const deterministicApply = isBlueprint ? 'blueprint-decompose' : isNode ? 'node-module-decompose' : isPythonModule ? 'python-module-decompose' : 'one-pass-decompose';
   const rawText = isBlueprint
     ? `Deterministic one-pass Flask-Blueprint decomposition of ${request.sourceFile}: move each listed @app.route view verbatim into routes/<x>.py, rewrite only its decorator to @<bp>.route, give it a lazy \`from app import ...\` first line, delete from the source, and splice the \`register_blueprint\` lines. No judgement -- validatePlan already ran the AST extraction + py_compile. If a route no longer resolves cleanly (the file drifted), this falls through to the normal drafting path.`
     : isNode
       ? `Deterministic one-pass CommonJS decomposition of ${request.sourceFile}: move each listed function set verbatim into its new module (with the require() lines it needs + a module.exports), delete from the source, and add \`const { ... } = require('./<module>.js')\` after the require prelude. module.exports stays as-is. No judgement -- validatePlan already confirmed every move is self-contained. If a symbol no longer resolves or a move stopped being self-contained (the file drifted), this falls through to the normal drafting path.`
-      : `Deterministic one-pass decomposition of ${request.sourceFile}: move each listed symbol set verbatim into its new module, delete from the source, and add the <script> tags. No judgement -- validatePlan already confirmed every symbol resolves. If a symbol no longer resolves cleanly (the file drifted), this falls through to the normal drafting path.`;
+      : isPythonModule
+        ? `Deterministic one-pass plain-module decomposition of ${request.sourceFile}: move each listed function set verbatim into its new .py module (with the imports it needs, and a lazy in-function \`from ${moduleNameFor(request.sourceFile)} import ...\` for anything it still reads from the source), delete from the source. No Blueprint, no wiring -- these are routeless helpers, not views. No judgement -- validatePlan already ran the AST extraction + py_compile. If a symbol no longer resolves or a move stopped being self-contained (the file drifted), this falls through to the normal drafting path.`
+        : `Deterministic one-pass decomposition of ${request.sourceFile}: move each listed symbol set verbatim into its new module, delete from the source, and add the <script> tags. No judgement -- validatePlan already confirmed every symbol resolves. If a symbol no longer resolves cleanly (the file drifted), this falls through to the normal drafting path.`;
   const record = {
     id,
     domain: 'adhoc',
@@ -431,7 +467,7 @@ function fileOnePassTask({ pipelineDir, requestFile, request, now, kind = 'html'
     },
     ...(request.premiumPriority ? { premiumPriority: true } : {}),
     ...(request.parentHub ? { parentHub: request.parentHub } : {}),
-    history: [{ stage: 'created', at: nowIso, detail: `file-decompose-to-hub: fully-mechanical ${isBlueprint ? 'Flask-Blueprint' : isNode ? 'CommonJS' : 'HTML'} plan -> single deterministic one-pass task (no hub, no stacked branch)` }],
+    history: [{ stage: 'created', at: nowIso, detail: `file-decompose-to-hub: fully-mechanical ${isBlueprint ? 'Flask-Blueprint' : isNode ? 'CommonJS' : isPythonModule ? 'plain Python module' : 'HTML'} plan -> single deterministic one-pass task (no hub, no stacked branch)` }],
   };
   fs.writeFileSync(path.join(adhocDir, `${id}.json`), `${JSON.stringify(record, null, 2)}\n`);
 
@@ -474,6 +510,14 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
   // register_blueprint splice + py_compile), no hub, no per-move 27B agentic pass.
   if (planIsFullyMechanicalBlueprint(request, validation)) {
     return fileOnePassTask({ pipelineDir, requestFile, request, now, kind: 'flask-blueprint' });
+  }
+
+  // Same, for an all-python-module-extract .py plan: one deterministic task (AST extract +
+  // py_compile, no register_blueprint wiring since there's nothing to register). This is
+  // what finally lets a routeless-helper-heavy file like app.py's current shape be
+  // decomposed at all -- until now the only deterministic .py path required an @app.route.
+  if (planIsFullyMechanicalPythonModule(request, validation)) {
+    return fileOnePassTask({ pipelineDir, requestFile, request, now, kind: 'python-module' });
   }
 
   // Hot-file exclusion applies ONLY here, past every Tier-1 short-circuit above (2026-09-14

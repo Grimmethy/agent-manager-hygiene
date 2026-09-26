@@ -401,6 +401,95 @@ function packSections(kept, maxBins) {
   return bins.map((bin) => [bin.labels.length > 1 ? `${bin.labels[0]} + ${bin.labels.length - 1} more` : bin.labels[0], bin.syms]);
 }
 
+// --- routeless-Python name-pattern fallback ------------------------------------------
+
+// 2026-09-26, screaminggoatclubmt: "hunt that [hot-file guard] down and kill it" ->
+// traced instead to computeRoutelessSections excluding a whole non-route .py section from
+// `candidates` before tiers A/B/C above ever run -- for app.py specifically, 193 of 194
+// top-level symbols came back routeless (every actual route had already been extracted
+// into python/dashboard/routes/*.py over ~10 prior rounds), leaving zero candidates, so
+// this whole pass returned null on every tick, silently, with no ghost-debt escalation
+// (a null plan never even reaches a filed request -- see
+// proactive-file-decompose-sweep.js's filePlanRepeatedlyFailedIdentically, which can only
+// compare TWO FILED requests' signatures).
+//
+// A flask-blueprint move can't fix this even if it saw these symbols: a Blueprint needs a
+// URL to register, and routeless helpers have none. This is a deterministic, no-model
+// fallback that groups them by NAME keyword instead of by route or comment banner --
+// borrowed from Egonex-AI/Understand-Anything's layer-detector.ts LAYER_PATTERNS
+// (scouted repo, UsefulProjectIndex), which buckets whole FILES by directory-path keyword
+// for its knowledge-graph layers; here the same first-match-wins keyword-bucket idea
+// applies to SYMBOL NAMES within one already-identified file, since routeless helpers have
+// no directory of their own to key off. Produces `kind: 'python-module-extract'` moves --
+// decompose-python-module.js's plain (non-Blueprint) apply path.
+const PY_NAME_PATTERNS = [
+  { layer: 'cache', keywords: ['cache', 'memo'] },
+  { layer: 'locking', keywords: ['lock', 'mutex', 'semaphore'] },
+  { layer: 'logging', keywords: ['log', 'audit'] },
+  { layer: 'config', keywords: ['config', 'setting', 'env'] },
+  { layer: 'background', keywords: ['queue', 'job', 'worker', 'schedule', 'cron', 'task'] },
+  { layer: 'external', keywords: ['client', 'http', 'request', 'fetch', 'api'] },
+  { layer: 'validation', keywords: ['validate', 'sanitize', 'check', 'verify'] },
+];
+const MIN_NAME_PATTERN_GROUP = 3; // below this, a new module isn't worth the split
+
+function matchNamePattern(symbolName) {
+  const lower = String(symbolName || '').toLowerCase();
+  for (const { layer, keywords } of PY_NAME_PATTERNS) {
+    if (keywords.some((kw) => lower.includes(kw))) return layer;
+  }
+  return null;
+}
+
+// Unmatched symbols stay behind in the source rather than landing in a catch-all "misc"
+// bucket -- a name-keyword miss is common and forcing every leftover into one module would
+// just reintroduce a smaller god-object one level down.
+function planFromNamePatterns(sourceFile, candidates, repoRoot) {
+  if (process.env.AGENT_MANAGER_DECOMPOSE_PY_NAME_PATTERN === 'false') return null;
+  const buckets = new Map();
+  for (const s of candidates) {
+    const layer = matchNamePattern(s.name);
+    if (!layer) continue;
+    if (!buckets.has(layer)) buckets.set(layer, []);
+    buckets.get(layer).push(s);
+  }
+  // Self-containment: a name-keyword bucket is a DIFFERENT partition than the banner
+  // sections computeFanOutSymbols already ran against above (`routeless` was computed
+  // per-SECTION) -- a symbol clean relative to its own section can still be referenced
+  // from outside its NAME bucket (caught live on app.py's first real dry run:
+  // read_dashboard_settings and _active_project_setting landed in the "config" bucket but
+  // are called from other, non-config sections). Rerun the same fan-out check against
+  // these buckets specifically and drop what it flags -- as a FIXED POINT, not a single
+  // pass: dropping a fan-out symbol can orphan one of ITS OWN callees in turn (also caught
+  // live: removing project_cache_paths from the "cache" bucket turned its own callee
+  // _cache_paths_for_dir into a NEW external reference on the next check, since the caller
+  // that used to make it internal was itself just removed). Capped at 5 rounds -- each
+  // round can only shrink a bucket, never grow one, so it converges quickly or bottoms out.
+  for (let round = 0; round < 5; round += 1) {
+    const bucketFanOut = computeFanOutSymbols(repoRoot, sourceFile, buckets, null);
+    if (bucketFanOut.size === 0) break;
+    let changed = false;
+    for (const [layer, syms] of buckets) {
+      const kept = syms.filter((s) => !bucketFanOut.has(s.name));
+      if (kept.length !== syms.length) { buckets.set(layer, kept); changed = true; }
+    }
+    if (!changed) break;
+  }
+  const dir = path.dirname(sourceFile);
+  const base = path.basename(sourceFile, path.extname(sourceFile));
+  const moves = [];
+  for (const [layer, syms] of buckets) {
+    if (syms.length < MIN_NAME_PATTERN_GROUP) continue;
+    moves.push({
+      newFile: path.join(dir, `${base}_${layer}.py`).split(path.sep).join('/'),
+      kind: 'python-module-extract',
+      symbols: syms.map((s) => s.name),
+      notes: `Auto-grouped by name-keyword match (${layer}) -- deterministic fallback for routeless helpers with no @app.route to anchor a blueprint.`,
+    });
+  }
+  return moves.length >= 2 ? moves : null;
+}
+
 // --- move construction --------------------------------------------------------------
 
 function slugify(s) {
@@ -609,7 +698,28 @@ async function runFileDecomposePlanPass(sourceFile, {
   const routeless = computeRoutelessSections(sourceFile, rawGroups);
   const appHooks = computeAppHookSymbols(symbols);
   const candidates = symbols.filter((s) => !fanOut.has(s.name) && !routeless.has(s.name) && !appHooks.has(s.name));
-  if (candidates.length < minSymbols) return null; // nothing safe enough left to split
+  if (candidates.length < minSymbols) {
+    // Routeless-Python fallback (see the header note above `PY_NAME_PATTERNS`): candidates
+    // excludes the whole `routeless` set for a .py source, so a file whose routes have
+    // already been extracted (app.py's current shape) lands here with zero candidates on
+    // every tick. Try grouping the discarded routeless symbols by name keyword before
+    // giving up -- isolated from tiers A/B/C above (different symbol set, different move
+    // kind), so it can't change behavior for any file that still has real candidates.
+    if (/\.py$/.test(sourceFile)) {
+      const routelessCandidates = symbols.filter((s) => routeless.has(s.name) && !fanOut.has(s.name) && !appHooks.has(s.name));
+      const nameMoves = planFromNamePatterns(sourceFile, routelessCandidates, repoRoot);
+      if (nameMoves) {
+        return {
+          id: requestId || `autodecomp-${slugify(sourceFile)}`,
+          sourceFile,
+          moves: nameMoves,
+          autoAuthored: true,
+          planPassNote: `${nameMoves.length} module(s) via name patterns (deterministic, routeless fallback) from ${routelessCandidates.length} routeless symbol(s)`,
+        };
+      }
+    }
+    return null; // nothing safe enough left to split
+  }
 
   const headText = text.split('\n').slice(0, 80).join('\n');
   const doCall = (prompt) => call({ prompt, think: false, temperature: 0.2, source: 'file_decompose_plan' });
@@ -711,4 +821,5 @@ module.exports = {
   runFileDecomposePlanPass, extractTopLevelSymbols, assignSections, groupBySection,
   planFromSections, planFromSectionMerge, parseMovesJson, bannerLabel, routeFamily,
   computeFanOutSymbols, computeJsFanOutSymbols, computeRoutelessSections, computeAppHookSymbols, hasNonRouteAppHook, packSections,
+  matchNamePattern, planFromNamePatterns, PY_NAME_PATTERNS,
 };

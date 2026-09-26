@@ -10,6 +10,7 @@ const {
   extractTopLevelSymbols, assignSections, groupBySection, planFromSections, planFromSectionMerge,
   parseMovesJson, bannerLabel, routeFamily, runFileDecomposePlanPass, computeFanOutSymbols,
   computeJsFanOutSymbols, computeRoutelessSections, computeAppHookSymbols, hasNonRouteAppHook, packSections,
+  matchNamePattern, planFromNamePatterns,
 } = M;
 
 test('extractTopLevelSymbols: python + html <script> functions, nested excluded', () => {
@@ -669,3 +670,164 @@ test('runFileDecomposePlanPass: Tier C hardening removes a symbol whose caller l
   const built = buildNodeModuleOnePassChanges(sourceText, 'src/prompts-fixture.js', plan.moves.map((m) => ({ newFile: m.newFile, symbols: m.symbols })), dir);
   assert.ok(built.ok, built.ok ? '' : built.reason);
 });
+
+// --- routeless-Python name-pattern fallback (2026-09-26) -----------------------------
+// Traced live from "why hasn't the sweep been decomposing these files already?": app.py's
+// own routes had already been extracted over ~10 prior rounds, leaving 193/194 top-level
+// symbols routeless -- computeRoutelessSections excludes them from `candidates` entirely,
+// so this whole pass returned null on every tick with nothing left to group by. This
+// fallback groups the discarded routeless set by name keyword instead of route/banner.
+
+test('matchNamePattern: keyword substring match, first-match-wins, no match returns null', () => {
+  assert.equal(matchNamePattern('_cache_paths_for_dir'), 'cache');
+  assert.equal(matchNamePattern('read_dashboard_settings'), 'config');
+  assert.equal(matchNamePattern('acquire_lock'), 'locking');
+  assert.equal(matchNamePattern('schedule_worker_job'), 'background');
+  assert.equal(matchNamePattern('totally_unrelated_helper'), null);
+});
+
+test('planFromNamePatterns: groups routeless helpers by name keyword, drops unmatched, needs >= 2 real modules', { skip: process.platform === 'win32' }, () => {
+  const symbols = extractTopLevelSymbols([
+    'def totally_unrelated_helper():',
+    '    return 1',
+    '',
+    'def cache_helper_a():',
+    '    return 2',
+    '',
+    'def cache_helper_b():',
+    '    return 3',
+    '',
+    'def cache_helper_c():',
+    '    return 4',
+    '',
+    'def acquire_lock():',
+    '    return True',
+    '',
+    'def release_lock():',
+    '    return True',
+    '',
+    'def lock_status():',
+    '    return False',
+  ].join('\n'), '.py');
+  const moves = planFromNamePatterns('app.py', symbols, '/nonexistent-repo-root-no-python3-check-possible');
+  assert.ok(moves, 'produced a plan');
+  assert.equal(moves.length, 2);
+  const cacheMove = moves.find((m) => m.newFile.includes('cache'));
+  const lockMove = moves.find((m) => m.newFile.includes('locking'));
+  assert.deepEqual(new Set(cacheMove.symbols), new Set(['cache_helper_a', 'cache_helper_b', 'cache_helper_c']));
+  assert.deepEqual(new Set(lockMove.symbols), new Set(['acquire_lock', 'release_lock', 'lock_status']));
+  for (const m of moves) assert.ok(!m.symbols.includes('totally_unrelated_helper'), 'unmatched symbol stays behind, never forced into a catch-all bucket');
+});
+
+test('planFromNamePatterns: below MIN_NAME_PATTERN_GROUP or fewer than 2 real modules returns null', () => {
+  const symbols = extractTopLevelSymbols([
+    'def cache_helper_a():',
+    '    return 1',
+    '',
+    'def cache_helper_b():',
+    '    return 2',
+  ].join('\n'), '.py');
+  assert.equal(planFromNamePatterns('app.py', symbols, '/nonexistent'), null);
+});
+
+test('planFromNamePatterns: kill switch AGENT_MANAGER_DECOMPOSE_PY_NAME_PATTERN=false', () => {
+  const symbols = extractTopLevelSymbols([
+    'def cache_helper_a():\n    return 1',
+    'def cache_helper_b():\n    return 2',
+    'def cache_helper_c():\n    return 3',
+    'def acquire_lock():\n    return 1',
+    'def release_lock():\n    return 2',
+    'def lock_status():\n    return 3',
+  ].join('\n\n'), '.py');
+  process.env.AGENT_MANAGER_DECOMPOSE_PY_NAME_PATTERN = 'false';
+  try {
+    assert.equal(planFromNamePatterns('app.py', symbols, '/nonexistent'), null);
+  } finally {
+    delete process.env.AGENT_MANAGER_DECOMPOSE_PY_NAME_PATTERN;
+  }
+});
+
+test('planFromNamePatterns: fixed-point self-containment -- dropping an orphaned caller can orphan its own callee in turn', { skip: !pyOk() }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'namepattern-fixedpoint-'));
+  const src = [
+    'def outside_caller():',
+    '    return cache_helper_b()',
+    '',
+    'def cache_helper_a():',
+    '    return 1',
+    '',
+    'def cache_helper_b():',
+    '    return cache_helper_a()',
+    '',
+    'def cache_helper_c():',
+    '    return 2',
+    '',
+    'def cache_helper_d():',
+    '    return 3',
+    '',
+    'def cache_helper_e():',
+    '    return 4',
+    '',
+    'def acquire_lock():',
+    '    return True',
+    '',
+    'def release_lock():',
+    '    return True',
+    '',
+    'def lock_status():',
+    '    return False',
+    '',
+  ].join('\n');
+  writePy(dir, 'app.py', src);
+  const symbols = extractTopLevelSymbols(src, '.py');
+  const moves = planFromNamePatterns('app.py', symbols, dir);
+  assert.ok(moves, 'produced a plan');
+  const cacheMove = moves.find((m) => m.newFile.includes('cache'));
+  assert.ok(cacheMove, 'cache bucket survived with its remaining self-contained members');
+  // cache_helper_b is called by outside_caller (round 1 drop); once dropped, its own
+  // callee cache_helper_a's only caller is gone too, so a NAIVE single-pass filter would
+  // have wrongly kept cache_helper_a -- the fixed point must catch it on round 2.
+  assert.ok(!cacheMove.symbols.includes('cache_helper_b'));
+  assert.ok(!cacheMove.symbols.includes('cache_helper_a'));
+  assert.deepEqual(new Set(cacheMove.symbols), new Set(['cache_helper_c', 'cache_helper_d', 'cache_helper_e']));
+  const lockMove = moves.find((m) => m.newFile.includes('locking'));
+  assert.deepEqual(new Set(lockMove.symbols), new Set(['acquire_lock', 'release_lock', 'lock_status']));
+
+  // Prove it against the real deterministic builder, not just plausible-looking output.
+  const { buildPythonModuleOnePassChanges } = require('./decompose-python-module.js');
+  const built = buildPythonModuleOnePassChanges(src, 'app.py', moves.map((m) => ({ newFile: m.newFile, symbols: m.symbols })));
+  assert.ok(built.ok, built.ok ? '' : JSON.stringify(built));
+});
+
+test('runFileDecomposePlanPass: routeless .py file with zero candidates falls back to name patterns instead of returning null', { skip: !pyOk() }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routeless-plan-'));
+  const sections = [
+    '# --- Helpers (no routes) ---',
+    'def cache_helper_a():',
+    '    return 1',
+    '',
+    'def cache_helper_b():',
+    '    return 2',
+    '',
+    'def cache_helper_c():',
+    '    return 3',
+    '',
+    'def acquire_lock():',
+    '    return True',
+    '',
+    'def release_lock():',
+    '    return True',
+    '',
+    'def lock_status():',
+    '    return False',
+  ];
+  writePy(dir, 'app.py', sections.join('\n'));
+  const plan = await runFileDecomposePlanPass('app.py', { repoRoot: dir, call: async () => ({ response: '[]' }) });
+  assert.ok(plan, 'the fallback must produce a plan, not null, when routeless helpers can be grouped by name');
+  assert.match(plan.planPassNote, /routeless fallback/);
+  for (const m of plan.moves) assert.equal(m.kind, 'python-module-extract');
+});
+
+function pyOk() {
+  try { require('child_process').execFileSync('python3', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; }
+}
