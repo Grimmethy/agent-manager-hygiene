@@ -307,6 +307,76 @@ test('all-flask-blueprint plan: files ONE deterministic one-pass task (no hub, n
   assert.equal(req.onePassTaskId, task.id);
 });
 
+test('all-python-module-extract plan: files ONE deterministic one-pass task (no hub, no wiring child)', () => {
+  const dir = tmpRepo();
+  const srcDir = path.join(dir, 'python', 'dashboard');
+  fs.mkdirSync(srcDir, { recursive: true });
+  fs.writeFileSync(path.join(srcDir, 'app.py'), [
+    'from flask import Flask, jsonify',
+    'app = Flask(__name__)',
+    'def cache_helper_a():',
+    '    return 1',
+    'def cache_helper_b():',
+    '    return 2',
+    'def cache_helper_c():',
+    '    return 3',
+    '@app.route("/api/keep")',
+    'def api_keep():',
+    '    return jsonify({})',
+    '',
+    'if __name__ == "__main__":',
+    '    app.run()',
+    '',
+  ].join('\n'));
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'w.json'), JSON.stringify({
+    id: 'decompose-app-cache',
+    sourceFile: 'python/dashboard/app.py',
+    moves: [{ newFile: 'python/dashboard/app_cache.py', kind: 'python-module-extract',
+      symbols: ['cache_helper_a', 'cache_helper_b', 'cache_helper_c'] }],
+  }));
+  withEnv(dir, {}, ({ sweep }) => { sweep({ pipelineDir: dir }); });
+
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'coordinating')) && fs.readdirSync(path.join(dir, 'queue', 'coordinating')).length || 0, 0, 'no hub');
+  const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc'));
+  assert.equal(adhoc.length, 1);
+  assert.match(adhoc[0], /-onepass\.json$/);
+  const task = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', adhoc[0]), 'utf8'));
+  assert.equal(task.promptContext.deterministicApply, 'python-module-decompose');
+  assert.equal(task.promptContext.sourceFile, 'python/dashboard/app.py');
+  assert.deepEqual(task.promptContext.moves[0].symbols, ['cache_helper_a', 'cache_helper_b', 'cache_helper_c']);
+  assert.equal(task.promptContext.moves[0].blueprint, undefined, 'a plain module move carries no blueprint field');
+  assert.equal(task.atomic, true);
+  const req = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'w.json'), 'utf8'));
+  assert.equal(req.onePassTaskId, task.id);
+});
+
+test('python-module-extract: an @app.route view among the symbols is a hard problem, not a Tier-1 plan (belongs in flask-blueprint instead)', () => {
+  const dir = tmpRepo();
+  const srcDir = path.join(dir, 'python', 'dashboard');
+  fs.mkdirSync(srcDir, { recursive: true });
+  fs.writeFileSync(path.join(srcDir, 'app.py'), [
+    'from flask import Flask, jsonify',
+    'app = Flask(__name__)',
+    '@app.route("/api/widget")',
+    'def api_widget():',
+    '    return jsonify({})',
+    'def helper_b():',
+    '    return 1',
+  ].join('\n'));
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'w.json'), JSON.stringify({
+    id: 'decompose-app-bad',
+    sourceFile: 'python/dashboard/app.py',
+    moves: [{ newFile: 'python/dashboard/app_x.py', kind: 'python-module-extract', symbols: ['api_widget', 'helper_b'] }],
+  }));
+  withEnv(dir, {}, ({ sweep }) => { sweep({ pipelineDir: dir }); });
+
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'adhoc')) && fs.readdirSync(path.join(dir, 'queue', 'adhoc')).length || 0, 0, 'no one-pass task -- not fully mechanical');
+  const coord = fs.readdirSync(path.join(dir, 'queue', 'coordinating'));
+  assert.equal(coord.length, 1, 'blocked hub filed instead');
+  const hub = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'coordinating', coord[0]), 'utf8'));
+  assert.match(hub.blockedReason, /flask-blueprint move/);
+});
+
 test('preflight hard-stops a plan with a stray external reference to a moved symbol', () => {
   const dir = tmpRepo();
   const srcDir = path.join(dir, 'python', 'dashboard');
