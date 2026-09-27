@@ -212,3 +212,20 @@ test('function-length candidate path: env override wins; with no dedicated apply
     if (saved.apply === undefined) delete process.env.AGENT_MANAGER_APPLY_REPO_ROOT; else process.env.AGENT_MANAGER_APPLY_REPO_ROOT = saved.apply;
   }
 });
+
+test('function_length_review apply skips a candidate whose file + function is already in the doc (AC-187 vs AC-51), leaving the doc untouched', () => {
+  const dir = makeRepo();
+  const candidatesPath = path.join(dir, 'Docs', 'FUNCTION_LENGTH_CANDIDATES.md');
+  process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH = candidatesPath;
+  const { getRegisteredSource } = freshPlugin(dir);
+  const block = (n, title) => [`### AC-00${n} · ${title}`, 'Strength: Strong', 'Files: big.js', '', 'Problem:', 'too long.', '', 'Solution:', 'Split it.', '', 'Benefits:', 'Testable.'].join('\n');
+  const task = { promptContext: { rule: 'function-too-long', file: 'big.js', snippet: 'function bloated() {\n  // ...\n}' } };
+  const apply = (implementResponse) => getRegisteredSource('function_length_review').apply({ implementResponse, task });
+
+  assert.equal(apply(block(1, 'Decompose `bloated` into helpers')).candidateCount, 1);
+  const before = fs.readFileSync(candidatesPath, 'utf8');
+  const second = apply(block(2, 'Decompose `bloated` into four single-purpose helpers'));
+  assert.equal(second.skipped, true);
+  assert.equal(second.duplicateOf, 'AC-1');
+  assert.equal(fs.readFileSync(candidatesPath, 'utf8'), before);
+});

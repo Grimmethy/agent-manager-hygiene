@@ -198,3 +198,29 @@ test('classifyReviewOutcome: genuine / dismissed / inconclusive', () => {
   assert.equal(classifyReviewOutcome({ applyResult: { skipped: true }, implementResponse: 'GENUINE but I could not produce a safe candidate.' }), 'inconclusive');
   assert.equal(classifyReviewOutcome({ applyResult: { skipped: true }, implementResponse: '' }), 'inconclusive');
 });
+
+test('a duplicateOf skip (candidate-docs dedupe) counts as produced: no inconclusive-review attempt is recorded', () => {
+  const dir = tmpDir();
+  const task = { id: 'fl-1', promptContext: { rule: 'function-too-long', file: 'src/a.js', snippet: 'function a() {\n  return 1;\n}' } };
+  const dup = { skipped: true, duplicateOf: 'AC-51', reason: 'skipped: candidate already exists as AC-51 (master) -- not appended again' };
+  for (let i = 0; i < MAX_INCONCLUSIVE_REVIEW_ATTEMPTS + 1; i += 1) {
+    assert.equal(recordInconclusiveReview({ applyResult: dup, implementResponse: 'candidate text', task, pipelineDir: dir }), null);
+  }
+  assert.equal(readAttemptRows(dir).length, 0);
+  assert.equal(isSuppressed(dir, 'function-too-long', task.promptContext.snippet), false);
+  // a plain skip (no duplicateOf) is still an inconclusive review
+  const plain = recordInconclusiveReview({ applyResult: { skipped: true, reason: 'no candidates' }, implementResponse: 'GENUINE but no block', task, pipelineDir: dir });
+  assert.equal(plain.count, 1);
+});
+
+test('a duplicateOf skip is never recorded as a false-positive dismissal, even if the text says "false positive"', () => {
+  const dir = tmpDir();
+  const task = { id: 'fl-2', promptContext: { rule: 'function-too-long', file: 'src/a.js', snippet: 'function a() {\n  return 1;\n}' } };
+  const out = recordFalsePositiveIfVerdict({
+    applyResult: { skipped: true, duplicateOf: 'AC-51', reason: 'skipped: candidate already exists' },
+    implementResponse: 'This is not a false positive; the function is genuinely too long.',
+    task, pipelineDir: dir,
+  });
+  assert.equal(out, null);
+  assert.equal(readRows(dir).length, 0);
+});
