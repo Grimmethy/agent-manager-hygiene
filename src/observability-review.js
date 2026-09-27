@@ -581,6 +581,9 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
         candidatesPath: observabilityFixCandidatesPath,
         docTitle: '# Observability Fix Candidates',
         snippet: task && task.promptContext && task.promptContext.snippet,
+        // Opt-in dedupe (agent-manager candidate-docs.js): a re-drafted/requeued finding whose file + function is already
+        // in the doc (master, an unmerged agent/* branch, or this tree) is skipped instead of appended again (2026-09-26, AC-187 vs AC-51).
+        dedupe: true,
       });
       // A "false positive" verdict wrote no candidate -- remember the flagged construct
       // so the scanner never re-emits it (suppression-store.js).

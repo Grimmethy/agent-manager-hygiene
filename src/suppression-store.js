@@ -135,6 +135,7 @@ function recordSuppression(pipelineDir, { rule, file, snippet, taskId, at, cause
 // recordable false positive.
 function recordFalsePositiveIfVerdict({ applyResult, implementResponse, task, pipelineDir }) {
   if (!applyResult || !applyResult.skipped) return null;            // a candidate was written -> genuine
+  if (applyResult.duplicateOf) return null;                          // already in the doc (dedupe) -> never a dismissal
   if (!/false[\s-]*positive/i.test(implementResponse || '')) return null; // uncertain/other -> leave re-examinable
   const pc = (task && task.promptContext) || {};
   if (!pc.snippet) return null;
@@ -177,7 +178,9 @@ function writeAttemptRows(pipelineDir, rows) {
 // real result; a historical replay (backfill) has only the text, so fall back to looking
 // for the candidate header the parser requires.
 function reviewProducedCandidate({ applyResult, implementResponse }) {
-  if (applyResult) return !applyResult.skipped;
+  // A duplicate-skip (candidate-docs.js `dedupe`) means the candidate already exists in the doc -- the review DID produce one,
+  // it just was not appended twice, so it must not count toward the 'unproducible' suppression.
+  if (applyResult) return !applyResult.skipped || !!applyResult.duplicateOf;
   return /^\s*#{2,3}\s*AC-\d+\b/m.test(implementResponse || '');
 }
 
