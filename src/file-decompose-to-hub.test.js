@@ -752,6 +752,39 @@ test('looksLikeNodeCommonJsModule: true for a real require()/module.exports sour
   assert.equal(looksLikeNodeCommonJsModule(undefined), false);
 });
 
+test('looksLikeNodeCommonJsModule: a guarded test-export tail (typeof module) and a static/ path do not make a browser script look like CommonJS', () => {
+  const { looksLikeNodeCommonJsModule } = require('./file-decompose-to-hub.js');
+  const guarded = "function f() {}\nif (typeof module !== 'undefined') module.exports = { f };\n";
+  assert.equal(looksLikeNodeCommonJsModule(guarded), false, 'single-line guard');
+  assert.equal(looksLikeNodeCommonJsModule("function f() {}\nif (typeof module === 'object' && module.exports) { module.exports = { f }; }\n"), false, 'braced guard');
+  assert.equal(looksLikeNodeCommonJsModule("function f() {}\nif (typeof exports !== 'undefined') exports.f = f;\n"), false, 'exports guard');
+  // a real require() elsewhere still wins over the guard
+  assert.equal(looksLikeNodeCommonJsModule("const fs = require('fs');\n" + guarded), true, 'require() plus a guard is still CommonJS');
+  // an UNguarded export next to a guarded one is still CommonJS
+  assert.equal(looksLikeNodeCommonJsModule(guarded + 'module.exports.g = 1;\n'), true);
+  // path rule: static/ is browser-served whatever the text says
+  assert.equal(looksLikeNodeCommonJsModule("const x = require('y');\n", 'python/dashboard/static/js/a.js'), false);
+  assert.equal(looksLikeNodeCommonJsModule("const x = require('y');\n", 'src/static-analysis.js'), true, 'a name merely containing "static" is not a static/ directory');
+  assert.equal(looksLikeNodeCommonJsModule("const x = require('y');\n", 'src/a.js'), true);
+});
+
+test('validatePlan: a browser script with a guarded test export is NOT routed through decompose-node-module (the core-ui.js shape)', () => {
+  const dir = tmpRepo();
+  writeJs(dir, 'python/dashboard/static/js/tab.js',
+    'function alpha() {\n  return 1;\n}\n\nfunction beta() {\n  return 2;\n}\n\nfunction gamma() {\n  return 3;\n}\n\n'
+    + "if (typeof module !== 'undefined') module.exports = { alpha };\n");
+  const request = { id: 'decompose-guarded', sourceFile: 'python/dashboard/static/js/tab.js', moves: [
+    { newFile: 'python/dashboard/static/js/lib/b.js', kind: 'script-extract', symbols: ['beta'] },
+    { newFile: 'python/dashboard/static/js/lib/g.js', kind: 'script-extract', symbols: ['gamma'] },
+  ] };
+  withEnv(dir, {}, ({ validatePlan: vp }) => {
+    const v = vp(dir, request);
+    assert.equal(v.ok, true);
+    for (const meta of v.moveMeta) assert.equal(meta.nodeModuleApplyOk, undefined, 'must not take the CommonJS builder');
+    for (const meta of v.moveMeta) assert.equal(meta.deterministicApplyOk, true, 'falls through to the browser-safe script-extract path');
+  });
+});
+
 test('validatePlan + fileHub: a .js plan whose move is NOT self-contained is filed BLOCKED with the exact external name', () => {
   const dir = tmpRepo();
   writeJs(dir, 'src/m.js',

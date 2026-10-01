@@ -94,8 +94,22 @@ function readRequests(requestsDir) {
 // (confirmed live 2026-09-14: 0 occurrences across every python/dashboard/static/js/*.js
 // file, 20+ each across a src/*.js sample) -- cheap, reliable, and doesn't depend on a
 // directory-naming convention that could drift.
-function looksLikeNodeCommonJsModule(text) {
-  return /\brequire\s*\(/.test(text || '') || /\bmodule\.exports\b/.test(text || '');
+//
+// 2026-10-01: a browser script can carry a GUARDED test-export tail --
+// `if (typeof module !== 'undefined') module.exports = { ... };` -- so a node:test file can
+// require() it (core-ui.js, concepts-and-adhoc-tab.js and branch-verdicts.js all do). That
+// line is still a `module.exports`, so the check above called core-ui.js a Node module and
+// decompose-node-module.js produced `require('./lib/x.js')` wiring for a file the browser
+// loads with a plain <script src> (the 2026-09-30 core-ui split, caught in verification).
+// A `module.exports` behind a `typeof module` / `typeof exports` guard is the opposite of
+// evidence for CommonJS -- it is the standard way a browser script says "I am not one" --
+// so those lines are blanked before testing. A file under a static/ directory is served to
+// browsers as-is, so it is never treated as a Node module whatever its text says.
+const GUARDED_EXPORT_RE = /^[ \t]*if\s*\(\s*typeof\s+(?:module|exports)\b[^)]*\)\s*(?:\{[^}]*\}|[^\n]*)$/gm;
+function looksLikeNodeCommonJsModule(text, sourceFile) {
+  if (/(^|[\\/])static[\\/]/.test(sourceFile || '')) return false;
+  const unguarded = String(text || '').replace(GUARDED_EXPORT_RE, '');
+  return /\brequire\s*\(/.test(unguarded) || /\bmodule\.exports\b/.test(unguarded);
 }
 
 // Runs scripts/decompose-plan-check.py for one .py move. Returns null when the check can't
@@ -190,7 +204,7 @@ function validatePlan(repoRoot, request) {
   if (/\.(js|mjs|cjs)$/.test(request.sourceFile || '')) {
     let sourceText = null;
     try { sourceText = fs.readFileSync(path.join(repoRoot, request.sourceFile), 'utf8'); } catch { /* unreadable -> advisory only */ }
-    if (sourceText != null && looksLikeNodeCommonJsModule(sourceText)) {
+    if (sourceText != null && looksLikeNodeCommonJsModule(sourceText, request.sourceFile)) {
       const built = buildNodeModuleOnePassChanges(sourceText, request.sourceFile, request.moves.map((m) => ({ newFile: m.newFile, symbols: m.symbols || [] })), repoRoot);
       if (built.ok) {
         for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [], nodeModuleApplyOk: true });
