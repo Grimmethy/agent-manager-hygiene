@@ -60,6 +60,19 @@ function functionSnippet(content, line, lengthLines) {
   return body;
 }
 
+// A flagged function's own name, read off the scanner's finding.detail -- function-length-scan.js emits it only
+// inside that text (`function "<name>" is N lines long ...`), never as its own field. Returns null for the
+// scanner's no-name form ("this function is N lines long") and for anything that is not a string carrying a
+// quoted name. Passed to applyArchDiscoveryCandidates as `symbol` so the candidate-dedupe key comes from the
+// scanner, not from whether the model happened to backtick the function in its title (agent-manager brain-dump
+// #1739 / core PR #508).
+function functionSymbolFromDetail(detail) {
+  if (typeof detail !== 'string') return null;
+  const m = detail.match(/function "([^"]+)"/);
+  const name = m ? m[1].trim() : '';
+  return name || null;
+}
+
 function findingIsSuppressed(pipelineDir, repoRoot, finding) {
   if (!finding.file) return false;
   const content = readIfExists(path.join(repoRoot, finding.file));
@@ -324,6 +337,9 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
         // in the doc (master, an unmerged agent/* branch, or this tree) is skipped instead of appended again (2026-09-26, AC-187 vs AC-51).
         dedupe: true,
         snippet: task && task.promptContext && task.promptContext.snippet,
+        // The scanner's own function name keys the dedupe ahead of any title parsing. An older agent-manager core
+        // that predates the `symbol` parameter simply ignores it.
+        symbol: functionSymbolFromDetail(task && task.promptContext && task.promptContext.detail),
       });
       // A "false positive" verdict wrote no candidate -- remember the flagged construct
       // so the scanner never re-emits it (suppression-store.js).
@@ -410,6 +426,7 @@ module.exports = {
   register,
   nextFunctionLengthReviewTask,
   functionSnippet,
+  functionSymbolFromDetail,
   functionLengthReviewPlanPrompt,
   functionLengthReviewImplementPrompt,
   functionLengthFixPlanPrompt,
