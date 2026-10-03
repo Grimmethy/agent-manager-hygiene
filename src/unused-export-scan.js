@@ -203,19 +203,54 @@ function countCallSites(symbol, definingFile, searchRoots, repoRoot) {
   return hits.slice(0, MAX_CALL_SITES);
 }
 
+// How many times `symbol` is really USED inside its own defining file -- the one place countCallSites
+// deliberately never looks. A symbol with a same-file use is not dead code: at most its EXPORT is unused (brain-dump
+// #1742: 10 of 10 TaxHarvest triage candidates were used only by a sibling function or a require.main CLI block in
+// their own file, and acting on "remove the function" would have broken the file).
+//
+// Counted on stripNonCode(text), so a mention in a comment, string or template text is not a use. Not counted: the
+// symbol's own definition token, and the export surface (a `module.exports = { ... }` list, `exports.sym`, an ES
+// `export { ... }` list, `export default sym`). Everything else counts -- a call from another function, a use inside a
+// `require.main === module` block, recursion, and a member access `x.sym` (errs toward NOT flagging). Known blind spot:
+// stripNonCode blanks template-literal text including `${...}` interpolations, so a use only inside one is missed, which
+// just leaves the flag in place (no worse than before this check existed).
+function countSameFileUses(text, symbol) {
+  const sym = String(symbol || '');
+  if (!new RegExp('^' + IDENT + '$').test(sym)) return 0; // not an identifier: cannot reason about it, never suppress
+  const code = stripNonCode(String(text || ''));
+  const esc = sym.replace(/\$/g, '\\$');
+  const ignore = [];
+  const mark = (re) => { for (const m of code.matchAll(re)) ignore.push([m.index, m.index + m[0].length]); };
+  mark(/module\.exports\s*=\s*\{[^}]*\}/g); // same region extractExports read the export names from
+  mark(ES_EXPORT_LIST_RE);
+  mark(ES_DEFAULT_IDENTIFIER_RE);
+  mark(new RegExp('(?<![\\w$.])(?:module\\.)?exports\\.' + esc + '(?![\\w$])', 'g'));
+  mark(new RegExp('(?<![\\w$])(?:function\\s*\\*?|abstract\\s+class|class|const\\s+enum|const|let|var|interface|type|enum)\\s+' + esc + '(?![\\w$])', 'g'));
+  let uses = 0;
+  for (const m of code.matchAll(new RegExp('(?<![\\w$])' + esc + '(?![\\w$])', 'g'))) {
+    if (!ignore.some(([a, b]) => m.index >= a && m.index < b)) uses++;
+  }
+  return uses;
+}
+
 function scan() {
   const { repoRoot, unusedScanDirs, unusedSearchDirs } = getConfig();
   const scanRoots = unusedScanDirs.map((d) => path.join(repoRoot, d));
   const searchRoots = unusedSearchDirs.map((d) => path.join(repoRoot, d));
 
   const candidates = [];
+  let skippedInternal = 0;
   const scannedAt = new Date().toISOString();
   for (const dir of scanRoots) {
     for (const file of listSourceFiles(dir, DEFINE_EXTENSIONS)) {
       if (file.endsWith('.d.ts')) continue; // ambient declarations, not definitions
+      let fileText = null; // read lazily, once per file
       for (const name of extractExports(file)) {
         const callSites = countCallSites(name, file, searchRoots, repoRoot);
         if (callSites.length <= LOW_USAGE_THRESHOLD) {
+          // Used inside its own file => not dead code (see countSameFileUses). An unreadable file counts as 0 uses: fail open.
+          if (fileText === null) { try { fileText = fs.readFileSync(file, 'utf8'); } catch { fileText = ''; } }
+          if (countSameFileUses(fileText, name) > 0) { skippedInternal++; continue; }
           candidates.push({
             symbol: name,
             definedIn: path.relative(repoRoot, file).replace(/\\/g, '/'),
@@ -226,6 +261,8 @@ function scan() {
       }
     }
   }
+  // Still a plain array (callers and tests deep-equal it, JSON.stringify ignores extra properties); the count rides along.
+  candidates.skippedInternal = skippedInternal;
   return candidates;
 }
 
@@ -243,9 +280,10 @@ function main() {
   fs.mkdirSync(path.dirname(resultsPath), { recursive: true });
   fs.writeFileSync(resultsPath, JSON.stringify(candidates, null, 2));
   markChecked(instancesDir);
-  console.log(`scanned, found ${candidates.length} low-usage export candidate(s), written to ${resultsPath}`);
+  const skipped = candidates.skippedInternal ? `, ${candidates.skippedInternal} skipped (used inside their own file)` : '';
+  console.log(`scanned, found ${candidates.length} low-usage export candidate(s)${skipped}, written to ${resultsPath}`);
 }
 
 if (require.main === module) { main(); }
 
-module.exports = { scan, extractExports, extractEsExports, countCallSites, isDue, markChecked };
+module.exports = { scan, extractExports, extractEsExports, countCallSites, countSameFileUses, isDue, markChecked };

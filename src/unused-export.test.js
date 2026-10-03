@@ -53,6 +53,32 @@ test('nextUnusedExportTask turns the oldest not-yet-queued flag entry into a tas
   assert.deepEqual(task.promptContext.callSites, [{ file: 'src/c.js', line: 3 }]);
 });
 
+test('nextUnusedExportTask skips a STALE flag whose defining file shows a same-file use and takes the next one (brain-dump #1742)', () => {
+  const dir = makeRepo();
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'queue'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'a.js'), 'function helper() {}\nfunction main() { return helper(); }\nmodule.exports = { main, helper };\n');
+  fs.writeFileSync(path.join(dir, 'src', 'b.js'), 'function lone() {}\nmodule.exports = { lone };\n');
+  fs.writeFileSync(path.join(dir, 'queue', 'dead-code-flags.json'), JSON.stringify([
+    { symbol: 'helper', definedIn: 'src/a.js', callSites: [], scannedAt: '2026-09-01T00:00:00.000Z' }, // oldest, but used by main() in its own file
+    { symbol: 'lone', definedIn: 'src/b.js', callSites: [], scannedAt: '2026-09-02T00:00:00.000Z' },
+  ]));
+  const { nextUnusedExportTask, getConfig, taskIdExistsInQueue } = freshPlugin(dir);
+  const task = nextUnusedExportTask({ getConfig, taskIdExistsInQueue });
+  assert.equal(task.promptContext.symbol, 'lone');
+});
+
+test('nextUnusedExportTask is fail-open: a flag whose defining file cannot be read is still turned into a task', () => {
+  const dir = makeRepo();
+  fs.mkdirSync(path.join(dir, 'queue'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'dead-code-flags.json'), JSON.stringify([
+    { symbol: 'ghost', definedIn: 'src/does-not-exist.js', callSites: [], scannedAt: '2026-09-01T00:00:00.000Z' },
+  ]));
+  const { nextUnusedExportTask, getConfig, taskIdExistsInQueue } = freshPlugin(dir);
+  const task = nextUnusedExportTask({ getConfig, taskIdExistsInQueue });
+  assert.equal(task.promptContext.symbol, 'ghost');
+});
+
 test('unused_export declares its own dead-code review guidance, directToMain, and groundingFields on callSites', () => {
   const dir = makeRepo();
   const { getRegisteredSource } = freshPlugin(dir);
