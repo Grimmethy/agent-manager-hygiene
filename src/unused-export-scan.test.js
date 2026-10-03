@@ -9,7 +9,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { extractEsExports, extractExports, scan, isDue, markChecked } = require('./unused-export-scan.js');
+const { extractEsExports, extractExports, countSameFileUses, scan, isDue, markChecked } = require('./unused-export-scan.js');
 
 test('extractEsExports: declarations, defaults, and export lists', () => {
   const names = extractEsExports([
@@ -87,6 +87,47 @@ test('scan: flags an unused TS export with its (empty) call sites, skips .d.ts, 
   assert.deepEqual(flagged.map((c) => c.symbol), ['dead']);
   assert.equal(flagged[0].definedIn, 'src/lib.ts');
   assert.deepEqual(flagged[0].callSites, []);
+});
+
+// --- brain-dump #1742 (2026-10-03): a symbol used inside its own file is not dead code ----------------------------------
+// 10 of 10 TaxHarvest triage candidates were used only by a sibling function or a require.main CLI block in their own
+// file; countCallSites never looks at the defining file, so each looked unused and "remove the function" was proposed.
+
+test('countSameFileUses: a call from another function, a require.main block, and recursion are real uses', () => {
+  assert.equal(countSameFileUses('function a(){ return b(); }\nfunction b(){ return 1; }\nmodule.exports = { a, b };', 'b'), 1);
+  assert.equal(countSameFileUses('function c(){}\nif (require.main === module) { c(); }\nmodule.exports = { c };', 'c'), 1);
+  assert.equal(countSameFileUses('function k(n){ return n ? k(n - 1) : 0; }\nmodule.exports = { k };', 'k'), 1);
+});
+
+test('countSameFileUses: comments, strings, the definition and the export surface are not uses', () => {
+  assert.equal(countSameFileUses('// d is never called\nfunction d(){}\nmodule.exports = { d };', 'd'), 0);
+  assert.equal(countSameFileUses('function e(){}\nconst s = "e";\nconst t = `e`;\nmodule.exports = { e };', 'e'), 0);
+  assert.equal(countSameFileUses('function f(){}\nmodule.exports = { f, g };', 'f'), 0);
+  assert.equal(countSameFileUses('exports.h = function h(){};', 'h'), 0);
+  assert.equal(countSameFileUses('function i(){}\nexport { i };', 'i'), 0);
+  assert.equal(countSameFileUses('function j(){}\nexport default j;', 'j'), 0);
+  assert.equal(countSameFileUses('export function dead() {}\nexport function alive() {}\n', 'dead'), 0);
+  assert.equal(countSameFileUses('anything', 'not-an-identifier'), 0, 'a non-identifier symbol is never suppressed');
+});
+
+test('scan: an export used only inside its own file is skipped and counted; a genuinely unused export is still flagged', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'unused-export-internal-'));
+  fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'src', 'lib.js'), [
+    'function used() { return 1; }',
+    'function caller() { return used(); }',
+    'function unused() { return 2; }',
+    'module.exports = { caller, used, unused };',
+    '',
+  ].join('\n'));
+  process.env.AGENT_MANAGER_REPO_ROOT = repo;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = repo;
+  process.env.AGENT_MANAGER_UNUSED_SCAN_DIRS = 'src';
+  process.env.AGENT_MANAGER_UNUSED_SEARCH_DIRS = 'src';
+  const flagged = scan();
+  assert.ok(Array.isArray(flagged), 'scan() must still return a plain array');
+  assert.deepEqual(flagged.map((c) => c.symbol).sort(), ['caller', 'unused']);
+  assert.equal(flagged.skippedInternal, 1, '`used` is called by `caller` in its own file');
 });
 
 // Throttle (2026-09-24): this scanner is O(exports x repo size), unlike its cheap siblings

@@ -23,6 +23,7 @@ const { registerTaskSource, updateTaskSource, registerSourceAlias } = require('a
 const { applyArchDiscoveryCandidates } = require('agent-manager/src/candidate-docs.js');
 const { unusedExportPlanPrompt, unusedExportImplementPrompt, archReviewPlanPrompt, archReviewImplementPrompt } = require('agent-manager/src/prompts.js');
 const { buildFlagInventory } = require('./flag-inventory.js');
+const { countSameFileUses } = require('./unused-export-scan.js');
 
 function deadCodeCandidatesPath(repoRoot) {
   return process.env.AGENT_MANAGER_DEAD_CODE_CANDIDATES_PATH || path.join(repoRoot, 'Docs', 'DEAD_CODE_CANDIDATES.md');
@@ -42,8 +43,22 @@ function readIfExists(filePath) {
   }
 }
 
+// Stale-flag guard (brain-dump #1742). queue/dead-code-flags.json is only rewritten by the next scan (24h throttle), so it
+// can still hold entries written before the scanner learned to skip symbols that are used inside their own file. Such an
+// entry is not dead code and must never become a triage task. FAIL OPEN: an unreadable file, a definedIn recorded
+// relative to a different root, or anything unexpected keeps the entry. No cache: the generator runs as a fresh
+// `node task-sources.js` on every worker tick, so a module-level memo would never survive between ticks.
+function usedInsideOwnFile(repoRoot, entry) {
+  try {
+    const text = fs.readFileSync(path.join(repoRoot, entry.definedIn), 'utf8');
+    return countSameFileUses(text, entry.symbol) > 0;
+  } catch {
+    return false;
+  }
+}
+
 function nextUnusedExportTask({ getConfig, taskIdExistsInQueue }) {
-  const { pipelineDir, defaultDomain } = getConfig();
+  const { pipelineDir, defaultDomain, repoRoot } = getConfig();
   const flagsPath = path.join(pipelineDir, 'queue', 'dead-code-flags.json');
   let entries;
   try {
@@ -59,6 +74,7 @@ function nextUnusedExportTask({ getConfig, taskIdExistsInQueue }) {
   for (const entry of entries) {
     const taskId = `deadcode-${slugifyForId(entry.symbol)}-${slugifyForId(entry.definedIn)}`;
     if (taskIdExistsInQueue(taskId)) continue;
+    if (usedInsideOwnFile(repoRoot, entry)) continue;
 
     return {
       id: taskId,
