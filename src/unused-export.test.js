@@ -161,3 +161,94 @@ test('deadcode_fix consumes a Strong dead-code candidate via the generic candida
   assert.equal(task.id, 'deadcode-fix-ac-1');
   assert.match(task.title, /Remove dead helper oldHelper/);
 });
+
+// --- brain-dump #1752 (2026-10-03): whole-file flags --------------------------------------------------------------------
+const FILE_FLAG = { symbol: '(file)', kind: 'file', definedIn: 'src/ui/accordion.tsx', exports: ['Accordion', 'AccordionItem', 'AccordionTrigger', 'AccordionContent'], callSites: [], scannedAt: '2026-09-01T00:00:00.000Z' };
+
+function writeFlags(dir, entries) {
+  fs.mkdirSync(path.join(dir, 'queue'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'dead-code-flags.json'), JSON.stringify(entries));
+}
+
+test('nextUnusedExportTask turns a whole-file flag into a file-level task with its own id, title and promptContext', () => {
+  const dir = makeRepo();
+  fs.mkdirSync(path.join(dir, 'src', 'ui'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'ui', 'accordion.tsx'), 'export function Accordion() {}\n');
+  writeFlags(dir, [FILE_FLAG]);
+  const { nextUnusedExportTask, getConfig, taskIdExistsInQueue } = freshPlugin(dir);
+  const task = nextUnusedExportTask({ getConfig, taskIdExistsInQueue });
+  assert.equal(task.id, 'deadcode-file-src-ui-accordion-tsx');
+  assert.equal(task.source, 'deadcode_triage');
+  assert.match(task.title, /whole-file dead-code candidate: src\/ui\/accordion\.tsx \(4 export\(s\), no importer\)/);
+  assert.equal(task.promptContext.kind, 'file');
+  assert.deepEqual(task.promptContext.exports, FILE_FLAG.exports);
+  assert.deepEqual(task.promptContext.callSites, []);
+});
+
+test('the inventory id for a whole-file flag equals the id the generator gives the task (one shared formula)', () => {
+  const dir = makeRepo();
+  fs.mkdirSync(path.join(dir, 'src', 'ui'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'ui', 'accordion.tsx'), 'export function Accordion() {}\n');
+  const exportFlag = { symbol: 'lone', definedIn: 'src/b.js', callSites: [], scannedAt: '2026-09-02T00:00:00.000Z' };
+  writeFlags(dir, [FILE_FLAG, exportFlag]);
+  const mod = require('./unused-export.js');
+  freshPlugin(dir);
+  assert.equal(mod.taskIdForEntry(FILE_FLAG), 'deadcode-file-src-ui-accordion-tsx');
+  assert.equal(mod.taskIdForEntry(exportFlag), 'deadcode-lone-src-b-js', 'per-export ids are unchanged');
+  const seen = [];
+  mod.unusedExportInventory({ pipelineDir: dir, repoRoot: dir, taskState: (id) => { seen.push(id); return null; } });
+  assert.ok(seen.includes('deadcode-file-src-ui-accordion-tsx'), `inventory asked about ${JSON.stringify(seen)}`);
+});
+
+test('the stale guard drops a whole-file entry that gained an importer (or whose file is gone) and keeps one that did not', () => {
+  const dir = makeRepo();
+  fs.mkdirSync(path.join(dir, 'src', 'ui'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'ui', 'accordion.tsx'), 'export function Accordion() {}\n');
+  fs.writeFileSync(path.join(dir, 'src', 'ui', 'alert.tsx'), 'export function Alert() {}\n');
+  fs.writeFileSync(path.join(dir, 'src', 'page.tsx'), "import { Accordion } from './ui/accordion';\n");
+  writeFlags(dir, [
+    FILE_FLAG,
+    { ...FILE_FLAG, definedIn: 'src/ui/gone.tsx', scannedAt: '2026-09-02T00:00:00.000Z' },
+    { ...FILE_FLAG, definedIn: 'src/ui/alert.tsx', exports: ['Alert'], scannedAt: '2026-09-03T00:00:00.000Z' },
+  ]);
+  const { nextUnusedExportTask, getConfig, taskIdExistsInQueue } = freshPlugin(dir);
+  const task = nextUnusedExportTask({ getConfig, taskIdExistsInQueue });
+  assert.equal(task.promptContext.definedIn, 'src/ui/alert.tsx', 'accordion gained an importer, gone.tsx no longer exists');
+});
+
+test('the whole-file stale guard fails open: an entry it cannot reason about is kept', () => {
+  const dir = makeRepo();
+  const mod = require('./unused-export.js');
+  freshPlugin(dir);
+  assert.equal(mod.fileEntryIsStale(dir, { kind: 'file' }), false, 'no definedIn -> keep');
+});
+
+test('prompt dispatch: per-export tasks get the core prompts unchanged; kind:file tasks get the whole-file pair', () => {
+  const dir = makeRepo();
+  const mod = require('./unused-export.js');
+  freshPlugin(dir);
+  const core = require('agent-manager/src/prompts.js');
+  const perExport = { promptContext: { symbol: 'lone', definedIn: 'src/b.js', callSites: [], note: 'n' } };
+  assert.equal(mod.buildPlanPromptFor(perExport), core.unusedExportPlanPrompt(perExport));
+  assert.equal(mod.buildImplementPromptFor(perExport, 'PLAN'), core.unusedExportImplementPrompt(perExport, 'PLAN'));
+  const fileTask = { promptContext: { kind: 'file', symbol: '(file)', definedIn: 'src/ui/accordion.tsx', exports: FILE_FLAG.exports, callSites: [], note: 'n' } };
+  const plan = mod.buildPlanPromptFor(fileTask);
+  assert.match(plan, /WHOLE FILE/);
+  assert.match(plan, /src\/ui\/accordion\.tsx/);
+  assert.match(plan, /Accordion, AccordionItem, AccordionTrigger, AccordionContent/);
+  const impl = mod.buildImplementPromptFor(fileTask, 'PLAN');
+  assert.match(impl, /### AC-NNN · Remove unused file <path>/);
+  assert.match(impl, /Files: src\/ui\/accordion\.tsx/);
+  assert.match(impl, /DELETE the file src\/ui\/accordion\.tsx entirely with a single delete action/);
+  assert.doesNotMatch(impl, /remove the export itself/);
+});
+
+test('unused_export is registered with the dispatching prompt builders and review guidance that allows a one-file Solution', () => {
+  const dir = makeRepo();
+  const { getRegisteredSource } = freshPlugin(dir);
+  const src = getRegisteredSource('unused_export');
+  const fileTask = { promptContext: { kind: 'file', symbol: '(file)', definedIn: 'src/x.tsx', exports: ['X'], callSites: [], note: '' } };
+  assert.match(src.buildPlanPrompt(fileTask), /WHOLE FILE/);
+  assert.match(src.reviewGuidance, /broader than this one file/);
+  assert.match(src.reviewCompletenessQuestion, /deleting exactly this one file/);
+});
