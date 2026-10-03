@@ -74,6 +74,23 @@ test('functionSnippet falls back to the fixed window when lengthLines is missing
   assert.ok(narrow.split('\n').length <= 2 + 30 + 2);
 });
 
+test('functionSymbolFromDetail reads the function name off the scanner detail string', () => {
+  const { functionSymbolFromDetail } = require('./function-length-review.js');
+  assert.equal(functionSymbolFromDetail('function "nextArchImportTask" is 110 lines long (threshold 100) -- consider decomposing into smaller, single-purpose functions'), 'nextArchImportTask');
+  assert.equal(functionSymbolFromDetail('function "_start_pipeline" is 108 lines long (threshold 100) -- consider decomposing'), '_start_pipeline');
+  assert.equal(functionSymbolFromDetail('function "$el" is 101 lines long (threshold 100)'), '$el');
+});
+
+test('functionSymbolFromDetail returns null for the no-name form and for missing, non-string or malformed input', () => {
+  const { functionSymbolFromDetail } = require('./function-length-review.js');
+  assert.equal(functionSymbolFromDetail('this function is 120 lines long (threshold 100) -- consider decomposing'), null);
+  assert.equal(functionSymbolFromDetail('function "   " is 5 lines long'), null);
+  assert.equal(functionSymbolFromDetail('function "abc is unterminated'), null);
+  assert.equal(functionSymbolFromDetail(undefined), null);
+  assert.equal(functionSymbolFromDetail(null), null);
+  assert.equal(functionSymbolFromDetail(42), null);
+});
+
 test('nextFunctionLengthReviewTask truncates the snippet for a pathologically long function, with an explicit marker', () => {
   const dir = makeRepo();
   const deps = freshPlugin(dir);
@@ -171,6 +188,37 @@ test('function_length_review apply appends a candidate (and threads the snippet)
   const text = fs.readFileSync(candidatesPath, 'utf8');
   assert.match(text, /### AC-1 · Decompose bloated\(\)/);
   assert.match(text, /Snippet:\n```\nfunction bloated\(\) \{/);
+});
+
+test('function_length_review apply passes the scanner function name (promptContext.detail) as symbol, and null when there is none', () => {
+  // Spies on core's applyArchDiscoveryCandidates instead of reading the written doc: the installed agent-manager core
+  // may predate the `symbol` parameter (and so never write a Symbol: line), so this asserts the WIRING, not core.
+  const dir = makeRepo();
+  process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH = path.join(dir, 'Docs', 'FUNCTION_LENGTH_CANDIDATES.md');
+  const core = require('agent-manager/src/candidate-docs.js');
+  const original = core.applyArchDiscoveryCandidates;
+  const calls = [];
+  core.applyArchDiscoveryCandidates = (args) => { calls.push(args); return { skipped: true, reason: 'spy' }; };
+  try {
+    // freshPlugin() drops function-length-review.js from the require cache and re-requires it, so its top-level
+    // destructure of applyArchDiscoveryCandidates picks up the spy installed above.
+    const { getRegisteredSource } = freshPlugin(dir);
+    const apply = getRegisteredSource('function_length_review').apply;
+    apply({
+      implementResponse: 'x',
+      task: { promptContext: { snippet: 'function bloated() {}', detail: 'function "bloated" is 140 lines long (threshold 100) -- consider decomposing into smaller, single-purpose functions' } },
+    });
+    apply({ implementResponse: 'x', task: { promptContext: { snippet: 's' } } });
+  } finally {
+    core.applyArchDiscoveryCandidates = original;
+    // Do not leave a module that captured the spy in the require cache.
+    delete require.cache[require.resolve('./function-length-review.js')];
+  }
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].symbol, 'bloated');
+  assert.equal(calls[0].dedupe, true);
+  assert.equal(calls[0].snippet, 'function bloated() {}');
+  assert.equal(calls[1].symbol, null);
 });
 
 // --- 2026-09-26: candidate doc must live in the APPLY clone, not the live checkout ---
