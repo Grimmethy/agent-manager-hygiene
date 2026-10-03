@@ -269,3 +269,82 @@ test('isWholeFileDead: reports why a file was kept (reason strings are for human
   assert.match(v.reason, /imported or referenced/);
   assert.equal(isWholeFileDead({ file: path.join(repo, 'src/a.tsx'), text: '', exportNames: [], corpus, repoRoot: repo }).reason, 'no exports');
 });
+
+// --- brain-dump #1754 (2026-10-03): the importer corpus is SOURCE only ----------------------------------------------------
+// On the real TaxHarvest repo the whole-file scan found 0 files: tool/pipeline artifacts INSIDE the repo (.agent-manager-cache/,
+// task-logs/, graphify-out/) name every file and quote `import.meta.glob`, so every file looked imported and the glob-loader
+// safety switch disabled whole-file flags repo-wide.
+
+const DEAD_PANEL = { 'src/ui/panel.tsx': 'export function Panel() {}\nexport function PanelItem() {}\n' };
+
+test('buildFileCorpus reads source and config files only: not dot-directories, task-logs, graphify-out, data json or node_modules', () => {
+  const repo = wholeFileRepo({
+    'src/a.ts': 'export const a = 1;\n',
+    'src/b.tsx': 'export const b = 1;\n',
+    'scripts/run.sh': 'node build/x.js\n',
+    'package.json': '{"name":"p"}\n',
+    'tsconfig.app.json': '{}\n',
+    'components.json': '{}\n',
+    'jsconfig.json': '{}\n',
+    'data.json': '{"x":1}\n',
+    'package-lock.json': '{}\n',
+    '.cache/graph.json': '{}\n',
+    '.cache/inner.ts': 'export const hidden = 1;\n',
+    'task-logs/log.json': '{}\n',
+    'graphify-out/graph.html': '<html></html>\n',
+    'node_modules/pkg/index.js': 'x\n',
+    'Docs/notes.json': '{}\n',
+  });
+  const read = buildFileCorpus(repo).map((e) => path.relative(repo, e.file)).sort();
+  assert.deepEqual(read, ['components.json', 'jsconfig.json', 'package.json', 'scripts/run.sh', 'src/a.ts', 'src/b.tsx', 'tsconfig.app.json']);
+});
+
+test('buildFileCorpus: a pipelineDir that lies inside the repo is skipped, and one outside it changes nothing', () => {
+  const repo = wholeFileRepo({ 'src/a.ts': 'export const a = 1;\n', 'pipe/state/x.ts': 'export const noise = 1;\n', 'pipe/queue/q.ts': 'export const q = 1;\n' });
+  const inside = buildFileCorpus(repo, { pipelineDir: path.join(repo, 'pipe') }).map((e) => path.relative(repo, e.file)).sort();
+  assert.deepEqual(inside, ['src/a.ts']);
+  const outside = buildFileCorpus(repo, { pipelineDir: path.join(os.tmpdir(), 'somewhere-else') }).map((e) => path.relative(repo, e.file)).sort();
+  assert.deepEqual(outside, ['pipe/state/x.ts', 'src/a.ts'], 'queue/ is skipped by name as before; other dirs under pipe/ are read when pipelineDir is elsewhere');
+});
+
+test('scan: a dead file mentioned only inside task-logs, a dot-directory, graphify-out or a data json is still ONE file-level flag', () => {
+  wholeFileRepo({
+    ...DEAD_PANEL,
+    'task-logs/panel.json': '{"note":"remove \\"src/ui/panel.tsx\\" and ./panel"}\n',
+    '.cache/graph.json': '{"nodes":["../ui/panel"]}\n',
+    '.claude/hook.sh': 'node src/ui/panel.tsx\n',
+    'graphify-out/graph.html': '<script>import { Panel } from "./panel";</script>\n',
+    'data.json': '{"file":"./panel"}\n',
+    'src/App.tsx': 'export function App() {}\n',
+    'src/main.ts': "import { App } from './App';\nApp();\nApp();\nApp();\n",
+  });
+  const flagged = scan();
+  assert.equal(flagged.fileLevel, 1);
+  assert.equal(flagged.find((c) => c.kind === 'file').definedIn, 'src/ui/panel.tsx');
+});
+
+test('scan: glob-loader words inside artifacts or a data json do NOT disable whole-file flags (the same words in real source still do)', () => {
+  wholeFileRepo({
+    ...DEAD_PANEL,
+    'task-logs/log.json': '{"prose":"check import.meta.glob and require.context(...)"}\n',
+    '.cache/note.json': '{"prose":"import.meta.glob"}\n',
+    'data.json': '{"prose":"require.context("}\n',
+  });
+  assert.equal(scan().fileLevel, 1);
+  wholeFileRepo({ ...DEAD_PANEL, 'src/loader.ts': "const m = import.meta.glob('./ui/*.tsx');\n" });
+  assert.equal(scan().fileLevel, 0, 'a real glob loader in source keeps the safety switch');
+});
+
+test('scan: a tsconfig path mapping or a package.json script string still counts as an importer', () => {
+  wholeFileRepo({ ...DEAD_PANEL, 'tsconfig.json': '{"compilerOptions":{"paths":{"@p":["src/ui/panel.tsx"]}}}\n' });
+  assert.equal(scan().fileLevel, 0, 'tsconfig.json is config that names modules');
+  wholeFileRepo({ ...DEAD_PANEL, 'package.json': '{"scripts":{"p":"tsx src/ui/panel.tsx"}}\n' });
+  assert.equal(scan().fileLevel, 0, 'package.json is config that names modules');
+});
+
+test('scan: a pipelineDir inside the repo is ignored when scanning (self-hosted layout)', () => {
+  const repo = wholeFileRepo({ ...DEAD_PANEL, 'pipe/state/notes.html': '<script src="./src/ui/panel.tsx"></script>\n' });
+  assert.equal(scan().fileLevel, 0, 'without pipelineDir the html under pipe/state/ is read as an importer');
+  process.env.AGENT_MANAGER_PIPELINE_DIR = path.join(repo, 'pipe');
+  try { assert.equal(scan().fileLevel, 1, 'with pipelineDir inside the repo it is skipped'); } finally { process.env.AGENT_MANAGER_PIPELINE_DIR = repo; }
+});

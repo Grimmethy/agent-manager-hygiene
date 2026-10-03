@@ -170,7 +170,13 @@ function extractExports(filePath) {
 // components/ui flags sat in 29 files nothing imports). A file is flagged ONCE, as a whole, only when every guard below
 // holds; any doubt falls back to today's per-export behavior.
 const FILE_CORPUS_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.json', '.html', '.sh', '.yml', '.yaml', '.css'];
-const FILE_CORPUS_SKIP_DIRS = new Set([...SKIP_DIRS, 'Docs']);
+// The importer corpus is built from SOURCE only (brain-dump #1754). Tool and pipeline artifacts live inside real repos --
+// .agent-manager-cache/ (graph.json, file-cache.json), task-logs/ (drafted triage prose), graphify-out/ -- and they name every file
+// and quote words like `import.meta.glob`, so with them in the corpus every file looked imported and the glob-loader safety switch
+// disabled whole-file flags repo-wide (0 file-level flags on the real TaxHarvest repo). Skipped: every dot-directory, these two output
+// directories, the pipeline directory when it lies inside the repo, and every .json except config files that really name modules.
+const FILE_CORPUS_SKIP_DIRS = new Set([...SKIP_DIRS, 'Docs', 'task-logs', 'graphify-out']);
+const FILE_CORPUS_JSON_RE = /^(?:package|components)\.json$|^(?:tsconfig|jsconfig)(?:\.[\w-]+)?\.json$/;
 const FILE_CORPUS_SKIP_NAMES = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
 const FILE_CORPUS_MAX_BYTES = 2 * 1024 * 1024;
 // Never a whole-file candidate: tests, config files, directory entry points, ambient declarations.
@@ -186,17 +192,20 @@ function fileStem(file) {
 // Every text file under repoRoot, read once (RAW text: import specifiers live in strings, which stripNonCode blanks).
 // Build ONE per scan() call; fileImporters takes it as an argument. Unreadable files are skipped (errs toward "no importer
 // seen", but isWholeFileDead has its own guards, and an unreadable corpus entry can only be a file we could not have parsed).
-function buildFileCorpus(repoRoot) {
+function buildFileCorpus(repoRoot, { pipelineDir = null } = {}) {
   const out = [];
+  const skipPipeline = pipelineDir ? path.resolve(pipelineDir) : null;
   (function walk(dir) {
     let entries;
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        if (FILE_CORPUS_SKIP_DIRS.has(entry.name)) continue;
+        if (entry.name.startsWith('.') || FILE_CORPUS_SKIP_DIRS.has(entry.name)) continue;
+        if (skipPipeline && path.resolve(full) === skipPipeline) continue;
         walk(full);
-      } else if (entry.isFile() && FILE_CORPUS_EXTENSIONS.some((e) => entry.name.endsWith(e)) && !FILE_CORPUS_SKIP_NAMES.has(entry.name) && !entry.name.endsWith('.min.js')) {
+      } else if (entry.isFile() && FILE_CORPUS_EXTENSIONS.some((e) => entry.name.endsWith(e)) && !FILE_CORPUS_SKIP_NAMES.has(entry.name) && !entry.name.endsWith('.min.js')
+        && (!entry.name.endsWith('.json') || FILE_CORPUS_JSON_RE.test(entry.name))) {
         try {
           if (fs.statSync(full).size > FILE_CORPUS_MAX_BYTES) continue;
           out.push({ file: path.resolve(full), text: fs.readFileSync(full, 'utf8') });
@@ -317,7 +326,7 @@ function countSameFileUses(text, symbol) {
 }
 
 function scan() {
-  const { repoRoot, unusedScanDirs, unusedSearchDirs } = getConfig();
+  const { repoRoot, unusedScanDirs, unusedSearchDirs, pipelineDir } = getConfig();
   const scanRoots = unusedScanDirs.map((d) => path.join(repoRoot, d));
   const searchRoots = unusedSearchDirs.map((d) => path.join(repoRoot, d));
 
@@ -338,7 +347,7 @@ function scan() {
       const sites = names.map((name) => countCallSites(name, file, searchRoots, repoRoot));
       // Whole file first: when nothing uses any export and nothing imports the file, ONE flag replaces N export flags.
       if (names.length > 0 && WHOLE_FILE_EXTENSIONS.some((e) => file.endsWith(e))) {
-        if (corpus === null) corpus = buildFileCorpus(repoRoot);
+        if (corpus === null) corpus = buildFileCorpus(repoRoot, { pipelineDir });
         const verdict = isWholeFileDead({ file, text: readText(), exportNames: names, corpus, repoRoot });
         if (verdict.dead) {
           fileLevel++;

@@ -252,3 +252,20 @@ test('unused_export is registered with the dispatching prompt builders and revie
   assert.match(src.reviewGuidance, /broader than this one file/);
   assert.match(src.reviewCompletenessQuestion, /deleting exactly this one file/);
 });
+
+// brain-dump #1754: the stale guard uses the same source-only corpus
+test('the whole-file stale guard keeps an entry mentioned only in an artifact directory and still drops one with a real importer', () => {
+  const dir = makeRepo();
+  fs.mkdirSync(path.join(dir, 'src', 'ui'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'task-logs'), { recursive: true });
+  fs.mkdirSync(path.join(dir, '.cache'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'ui', 'accordion.tsx'), 'export function Accordion() {}\n');
+  fs.writeFileSync(path.join(dir, 'src', 'ui', 'alert.tsx'), 'export function Alert() {}\n');
+  fs.writeFileSync(path.join(dir, 'task-logs', 'x.json'), '{"note":"src/ui/accordion.tsx and ./accordion"}\n');
+  fs.writeFileSync(path.join(dir, '.cache', 'graph.json'), '{"nodes":["./accordion"]}\n');
+  fs.writeFileSync(path.join(dir, 'src', 'page.tsx'), "import { Alert } from './ui/alert';\n");
+  const mod = require('./unused-export.js');
+  freshPlugin(dir);
+  assert.equal(mod.fileEntryIsStale(dir, { kind: 'file', definedIn: 'src/ui/accordion.tsx' }), false, 'artifact mentions are not importers');
+  assert.equal(mod.fileEntryIsStale(dir, { kind: 'file', definedIn: 'src/ui/alert.tsx' }), true, 'a real importer makes it stale');
+});
