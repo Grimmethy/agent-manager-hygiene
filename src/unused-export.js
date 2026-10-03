@@ -23,14 +23,14 @@ const { registerTaskSource, updateTaskSource, registerSourceAlias } = require('a
 const { applyArchDiscoveryCandidates } = require('agent-manager/src/candidate-docs.js');
 const { unusedExportPlanPrompt, unusedExportImplementPrompt, archReviewPlanPrompt, archReviewImplementPrompt } = require('agent-manager/src/prompts.js');
 const { buildFlagInventory } = require('./flag-inventory.js');
-const { countSameFileUses } = require('./unused-export-scan.js');
+const { countSameFileUses, buildFileCorpus, fileImporters, FILE_FLAG_SYMBOL } = require('./unused-export-scan.js');
 
 function deadCodeCandidatesPath(repoRoot) {
   return process.env.AGENT_MANAGER_DEAD_CODE_CANDIDATES_PATH || path.join(repoRoot, 'Docs', 'DEAD_CODE_CANDIDATES.md');
 }
 
-const DEAD_CODE_REVIEW_GUIDANCE = 'This is a dead-code triage verdict for a low-usage export in OUR OWN project, NOT itself a code change. A valid draft is EXACTLY ONE of: (a) "GENUINE" + a correctly-formatted `### AC-NNN` candidate block (Strength: Strong / Files / Problem / Solution / Benefits) describing exactly what to remove; or (b) "FALSE POSITIVE" / "UNCERTAIN" + one short paragraph (2-4 sentences) explaining why, grounded in the call sites shown. There is deliberately NO diff, no code, and no "steps" here -- do NOT reject the draft for lacking them. REJECT only if: the draft refuses to reach a verdict ("a human should look", "cannot determine"); a GENUINE verdict\'s candidate block is malformed or missing a required section; a GENUINE verdict\'s Solution proposes removing something broader than this one symbol; or a FALSE POSITIVE/UNCERTAIN verdict\'s stated reason actually contradicts the call sites shown (e.g. claims a barrel re-export exists when none of the shown sites are one).';
-const DEAD_CODE_REVIEW_COMPLETENESS_QUESTION = 'Does the draft reach a decisive GENUINE-or-FALSE-POSITIVE-or-UNCERTAIN verdict and, if GENUINE, is it followed by a well-formed `### AC-NNN` candidate block whose Solution is scoped to removing exactly this one symbol (and its real call sites, if any)?';
+const DEAD_CODE_REVIEW_GUIDANCE = 'This is a dead-code triage verdict for a low-usage export in OUR OWN project, NOT itself a code change. A valid draft is EXACTLY ONE of: (a) "GENUINE" + a correctly-formatted `### AC-NNN` candidate block (Strength: Strong / Files / Problem / Solution / Benefits) describing exactly what to remove; or (b) "FALSE POSITIVE" / "UNCERTAIN" + one short paragraph (2-4 sentences) explaining why, grounded in the call sites shown. There is deliberately NO diff, no code, and no "steps" here -- do NOT reject the draft for lacking them. REJECT only if: the draft refuses to reach a verdict ("a human should look", "cannot determine"); a GENUINE verdict\'s candidate block is malformed or missing a required section; a GENUINE verdict\'s Solution proposes removing something broader than this one symbol (or, for a WHOLE-FILE task, broader than this one file); or a FALSE POSITIVE/UNCERTAIN verdict\'s stated reason actually contradicts the call sites shown (e.g. claims a barrel re-export exists when none of the shown sites are one).';
+const DEAD_CODE_REVIEW_COMPLETENESS_QUESTION = 'Does the draft reach a decisive GENUINE-or-FALSE-POSITIVE-or-UNCERTAIN verdict and, if GENUINE, is it followed by a well-formed `### AC-NNN` candidate block whose Solution is scoped to removing exactly this one symbol (and its real call sites, if any) -- or, for a whole-file task, deleting exactly this one file?';
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -72,8 +72,25 @@ function nextUnusedExportTask({ getConfig, taskIdExistsInQueue }) {
   entries.sort((a, b) => new Date(a.scannedAt) - new Date(b.scannedAt));
 
   for (const entry of entries) {
-    const taskId = `deadcode-${slugifyForId(entry.symbol)}-${slugifyForId(entry.definedIn)}`;
+    const taskId = taskIdForEntry(entry);
     if (taskIdExistsInQueue(taskId)) continue;
+    if (isFileEntry(entry)) {
+      if (fileEntryIsStale(repoRoot, entry)) continue;
+      return {
+        id: taskId,
+        domain: defaultDomain,
+        source: 'deadcode_triage',
+        title: `Triage whole-file dead-code candidate: ${entry.definedIn} (${(entry.exports || []).length} export(s), no importer)`,
+        promptContext: {
+          kind: 'file',
+          symbol: FILE_FLAG_SYMBOL,
+          definedIn: entry.definedIn,
+          exports: entry.exports || [],
+          callSites: [],
+          note: 'Judge genuine-dead vs false-positive for the WHOLE FILE (loaded by a convention, glob or loader the search cannot see, or deliberately kept). Use a majority-vote judgment, not a single verdict.',
+        },
+      };
+    }
     if (usedInsideOwnFile(repoRoot, entry)) continue;
 
     return {
@@ -93,17 +110,100 @@ function nextUnusedExportTask({ getConfig, taskIdExistsInQueue }) {
   return null;
 }
 
+// A flag entry is either one export (the original shape) or, since brain-dump #1752, a WHOLE FILE: { kind: 'file', symbol: '(file)',
+// exports: [...] }. ONE id formula for the generator and the inventory so they cannot drift.
+function isFileEntry(entry) {
+  return Boolean(entry) && entry.kind === 'file';
+}
+function taskIdForEntry(entry) {
+  return isFileEntry(entry)
+    ? `deadcode-file-${slugifyForId(entry.definedIn)}`
+    : `deadcode-${slugifyForId(entry.symbol)}-${slugifyForId(entry.definedIn)}`;
+}
+
+// Stale-flag guard for a whole-file entry (same fail-open rule as usedInsideOwnFile): stale when the file is gone or something now
+// imports it. Anything unexpected keeps the entry. Builds a fresh corpus on purpose -- the generator is a fresh `node` per tick and
+// only reaches this for a file entry.
+function fileEntryIsStale(repoRoot, entry) {
+  try {
+    const abs = path.join(repoRoot, entry.definedIn);
+    if (!fs.existsSync(abs)) return true;
+    return fileImporters(abs, buildFileCorpus(repoRoot)).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+// ---- whole-file triage prompts (brain-dump #1752) ------------------------------------------------------------------------
+// The per-export prompts (agent-manager core prompts.js) say "remove the export itself", which is the wrong ask for a dead file.
+// These are used only for kind:'file' tasks; everything else is delegated to core unchanged.
+function fileLevelPlanPrompt(task) {
+  const ctx = task.promptContext;
+  return [
+    'This is a judgment call, NOT a code-change task (yet). Determine whether the WHOLE FILE shown below is genuinely dead code or a false positive.',
+    'The scanner found NO module specifier, script or config anywhere in the project that names this file, and NO call site for any of its exports. Judge what that search cannot see: a framework convention that loads the file by location (routes/pages), a directory loader, a bundler glob, a documented public entry point, or an intentionally kept UI-kit/scaffold file you would want to keep for later.',
+    'Write a numbered PLAN that is actually a REASONED VERDICT:',
+    '- "GENUINE -- here\'s why this whole file is really unused and safe to delete"',
+    '- "FALSE POSITIVE -- here\'s why it is loaded some way the search cannot see"',
+    '- "UNCERTAIN -- here\'s what would need to be checked that isn\'t given here"',
+    'A file that holds several exports is judged as ONE unit: the verdict is for the file, never for one export of it.',
+    '',
+    `File: ${ctx.definedIn}`,
+    `Exports in this file (all unused): ${(ctx.exports || []).join(', ') || '(none listed)'}`,
+    '',
+    'NOTE (verbatim from task source):',
+    ctx.note || '',
+  ].join('\n');
+}
+
+function fileLevelImplementPrompt(task, planText) {
+  const ctx = task.promptContext;
+  return [
+    'Your plan above is the final REASONED VERDICT for this WHOLE-FILE dead-code candidate in OUR OWN project.',
+    '',
+    planText,
+    '',
+    'If the verdict is FALSE POSITIVE or UNCERTAIN: write ONE short paragraph (2-4 sentences) recording why, for a human to read later. Plain prose only -- no JSON, no code fence, no "steps", no candidate block.',
+    '',
+    'If the verdict is GENUINE: write ONE removal candidate for the whole file, in EXACTLY this format (must match this parser exactly or it cannot be consumed downstream):',
+    '',
+    '### AC-NNN · Remove unused file <path>',
+    'Strength: Strong',
+    `Files: ${ctx.definedIn}`,
+    '',
+    'Problem:',
+    'A paragraph describing why this whole file is genuinely dead, grounded in the fact that no import, script or config names it and none of its exports is used.',
+    '',
+    'Solution:',
+    `A paragraph saying to DELETE the file ${ctx.definedIn} entirely with a single delete action, and to change nothing else (no other file references it).`,
+    '',
+    'Benefits:',
+    'A paragraph describing what improves once removed (no unused scaffold for a future reader to puzzle over, no half-removed component).',
+    '',
+    '(Pick an AC-NNN number that looks reasonable; the harness re-derives the real one deterministically regardless of what you write here.)',
+  ].join('\n');
+}
+
+// Per-export tasks keep the core prompts byte for byte; only kind:'file' tasks get the file-level pair.
+function buildPlanPromptFor(task) {
+  return isFileEntry(task && task.promptContext) ? fileLevelPlanPrompt(task) : unusedExportPlanPrompt(task);
+}
+function buildImplementPromptFor(task, planText) {
+  return isFileEntry(task && task.promptContext) ? fileLevelImplementPrompt(task, planText) : unusedExportImplementPrompt(task, planText);
+}
+
 // Read-only inventory for the dashboard's Hygiene tab (see flag-inventory.js). Same id formula as nextUnusedExportTask.
 function unusedExportInventory({ pipelineDir, repoRoot, taskState }) {
   let entries;
   try { entries = JSON.parse(readIfExists(path.join(pipelineDir, 'queue', 'dead-code-flags.json')) || '[]'); } catch { entries = []; }
   const flags = (Array.isArray(entries) ? entries : []).map((e) => ({
     rule: 'unused-export', file: e.definedIn, line: 0, scannedAt: e.scannedAt,
-    detail: `${e.symbol} -- ${(e.callSites || []).length} call site(s)`, _symbol: e.symbol,
+    detail: isFileEntry(e) ? `whole file -- ${(e.exports || []).length} export(s), no importer` : `${e.symbol} -- ${(e.callSites || []).length} call site(s)`,
+    _entry: e,
   }));
   return buildFlagInventory({
     flags, projectTag: null, repoRoot, taskState,
-    idFor: (f) => `deadcode-${slugifyForId(f._symbol)}-${slugifyForId(f.file)}`,
+    idFor: (f) => taskIdForEntry(f._entry),
   });
 }
 
@@ -136,7 +236,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     groundingFields: ['callSites'],
     reportClass: 'benefit', // a surfaced, human-reviewed dead-code candidate is a real outcome (system-report.js)
   });
-  updateTaskSource('unused_export', { buildPlanPrompt: unusedExportPlanPrompt, buildImplementPrompt: unusedExportImplementPrompt });
+  updateTaskSource('unused_export', { buildPlanPrompt: buildPlanPromptFor, buildImplementPrompt: buildImplementPromptFor });
   // Generated tasks stamp source: 'deadcode_triage' (not 'unused_export') -- declare that
   // here rather than relying on agent-manager's legacy hardcoded fallback in
   // resolveSourceName(). Guarded: registerSourceAlias landed in agent-manager Stage A1;
@@ -174,4 +274,4 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
   updateTaskSource('deadcode_fix', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
 }
 
-module.exports = { register, nextUnusedExportTask };
+module.exports = { register, nextUnusedExportTask, unusedExportInventory, taskIdForEntry, fileEntryIsStale, buildPlanPromptFor, buildImplementPromptFor };

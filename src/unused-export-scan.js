@@ -39,6 +39,7 @@ const DEFINE_EXTENSIONS = [...CJS_DEFINE_EXTENSIONS, ...ES_DEFINE_EXTENSIONS];
 const SEARCH_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx'];
 const SKIP_DIRS = new Set(['node_modules', '.git', 'queue', 'instances', 'dist', 'build', 'coverage']);
 const MAX_CALL_SITES = 20;
+const FILE_FLAG_SYMBOL = '(file)'; // `symbol` of a whole-file flag (entry.kind === 'file'); not an identifier, so symbol-level checks never apply to it
 const LOW_USAGE_THRESHOLD = 2; // flag exports with this many or fewer external call sites
 
 // Throttle (2026-09-24, wiring this scanner into queue-watcher.sh for the first time):
@@ -163,6 +164,88 @@ function extractExports(filePath) {
   return Array.from(set).filter((n) => n.trim().length > 0);
 }
 
+// ---- whole-file dead code (brain-dump #1752) ----------------------------------------------------------------------------
+// Per-export flags turn one dead FILE into N independent candidates; applied together they can leave a half-component
+// (shadcn's accordion.tsx: AccordionTrigger and AccordionContent were separate removal tasks, 162 of 183 TaxHarvest
+// components/ui flags sat in 29 files nothing imports). A file is flagged ONCE, as a whole, only when every guard below
+// holds; any doubt falls back to today's per-export behavior.
+const FILE_CORPUS_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.json', '.html', '.sh', '.yml', '.yaml', '.css'];
+const FILE_CORPUS_SKIP_DIRS = new Set([...SKIP_DIRS, 'Docs']);
+const FILE_CORPUS_SKIP_NAMES = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
+const FILE_CORPUS_MAX_BYTES = 2 * 1024 * 1024;
+// Never a whole-file candidate: tests, config files, directory entry points, ambient declarations.
+// Whole-file flags are limited to ES-module files (.ts/.tsx/.jsx). CommonJS .js files are routinely loaded by directory loaders,
+// CLIs and shell scripts that no static scan can see, so they keep today's per-export behavior.
+const WHOLE_FILE_EXTENSIONS = ['.ts', '.tsx', '.jsx'];
+const NEVER_WHOLE_FILE_RE = /(\.(test|spec)\.[^./]+$)|(__tests__\/)|(\.config\.[^./]+$)|((^|\/)index\.[^./]+$)|(\.d\.ts$)/;
+
+function fileStem(file) {
+  return path.basename(file).replace(/\.[^.]+$/, '');
+}
+
+// Every text file under repoRoot, read once (RAW text: import specifiers live in strings, which stripNonCode blanks).
+// Build ONE per scan() call; fileImporters takes it as an argument. Unreadable files are skipped (errs toward "no importer
+// seen", but isWholeFileDead has its own guards, and an unreadable corpus entry can only be a file we could not have parsed).
+function buildFileCorpus(repoRoot) {
+  const out = [];
+  (function walk(dir) {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (FILE_CORPUS_SKIP_DIRS.has(entry.name)) continue;
+        walk(full);
+      } else if (entry.isFile() && FILE_CORPUS_EXTENSIONS.some((e) => entry.name.endsWith(e)) && !FILE_CORPUS_SKIP_NAMES.has(entry.name) && !entry.name.endsWith('.min.js')) {
+        try {
+          if (fs.statSync(full).size > FILE_CORPUS_MAX_BYTES) continue;
+          out.push({ file: path.resolve(full), text: fs.readFileSync(full, 'utf8') });
+        } catch { /* unreadable: skip */ }
+      }
+    }
+  })(repoRoot);
+  return out;
+}
+
+// Files whose raw text names `file` the way a module, script or config would: a quoted path ending in the stem (any
+// extension or none -- relative and alias specifiers, dynamic import(), require(), barrel `export ... from`, side-effect and
+// CSS imports, package.json fields), a quoted `stem.ext` filename, or an unquoted `stem.ext` path (shell, yaml, html).
+// Deliberately over-inclusive: any file matching the last path segment counts, so no alias resolution is needed.
+function fileImporters(file, corpus) {
+  const abs = path.resolve(file);
+  const stem = fileStem(file).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const quotedPath = new RegExp('[\'"`][^\'"`\\n]*[/@~#]' + stem + '(?:\\.[A-Za-z0-9]+)?[\'"`]');
+  const quotedFilename = new RegExp('[\'"`]' + stem + '\\.(?:js|jsx|ts|tsx|mjs|cjs|css|json)[\'"`]');
+  const barePath = new RegExp('(?:^|[\\s/=(:,])' + stem + '\\.(?:js|jsx|ts|tsx|mjs|cjs)(?![\\w])', 'm');
+  const hits = [];
+  for (const entry of corpus) {
+    if (entry.file === abs) continue;
+    if (quotedPath.test(entry.text) || quotedFilename.test(entry.text) || barePath.test(entry.text)) hits.push(entry.file);
+  }
+  return hits;
+}
+
+// Bundler-level directory loading (`import.meta.glob`, `require.context`) anywhere in the repo means files can be loaded with no
+// path naming them, so no file is declared dead as a whole.
+function corpusHasGlobLoader(corpus) {
+  return corpus.some((e) => /import\.meta\.glob|require\.context\s*\(/.test(e.text));
+}
+
+// Returns { dead: true } or { dead: false, reason }.
+// An export NAME appearing in another file is deliberately NOT a blocker: a file nothing imports cannot have its export used, and a
+// same-named local (a `Breadcrumb` or `Avatar` defined elsewhere) is the normal case for scaffolded UI kits.
+function isWholeFileDead({ file, text, exportNames, corpus, repoRoot }) {
+  const rel = path.relative(repoRoot, file).replace(/\\/g, '/');
+  if (NEVER_WHOLE_FILE_RE.test(rel)) return { dead: false, reason: 'test/config/index/declaration file' };
+  if (!exportNames || exportNames.length === 0) return { dead: false, reason: 'no exports' };
+  if (!WHOLE_FILE_EXTENSIONS.some((e) => file.endsWith(e))) return { dead: false, reason: 'CommonJS file: per-export only' };
+  if (corpusHasGlobLoader(corpus)) return { dead: false, reason: 'repo uses a glob/context loader' };
+  const raw = String(text || '');
+  if (/require\.main\s*===?\s*module/.test(raw) || /^#!/.test(raw) || /import\.meta\.glob/.test(raw)) return { dead: false, reason: 'CLI/entry or glob-loaded file' };
+  if (fileImporters(file, corpus).length > 0) return { dead: false, reason: 'imported or referenced' };
+  return { dead: true };
+}
+
 function countCallSites(symbol, definingFile, searchRoots, repoRoot) {
   const escapedSymbol = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const wordBoundaryRe = new RegExp('\\b' + escapedSymbol + '\\b', 'm');
@@ -240,17 +323,41 @@ function scan() {
 
   const candidates = [];
   let skippedInternal = 0;
+  let fileLevel = 0;
+  let corpus = null; // every text file under repoRoot, read once and only if a file has exports with no external call sites
   const scannedAt = new Date().toISOString();
   for (const dir of scanRoots) {
     for (const file of listSourceFiles(dir, DEFINE_EXTENSIONS)) {
       if (file.endsWith('.d.ts')) continue; // ambient declarations, not definitions
       let fileText = null; // read lazily, once per file
-      for (const name of extractExports(file)) {
-        const callSites = countCallSites(name, file, searchRoots, repoRoot);
+      const readText = () => {
+        if (fileText === null) { try { fileText = fs.readFileSync(file, 'utf8'); } catch { fileText = ''; } }
+        return fileText;
+      };
+      const names = extractExports(file);
+      const sites = names.map((name) => countCallSites(name, file, searchRoots, repoRoot));
+      // Whole file first: when nothing uses any export and nothing imports the file, ONE flag replaces N export flags.
+      if (names.length > 0 && WHOLE_FILE_EXTENSIONS.some((e) => file.endsWith(e))) {
+        if (corpus === null) corpus = buildFileCorpus(repoRoot);
+        const verdict = isWholeFileDead({ file, text: readText(), exportNames: names, corpus, repoRoot });
+        if (verdict.dead) {
+          fileLevel++;
+          candidates.push({
+            symbol: FILE_FLAG_SYMBOL,
+            kind: 'file',
+            definedIn: path.relative(repoRoot, file).replace(/\\/g, '/'),
+            exports: names,
+            callSites: [],
+            scannedAt,
+          });
+          continue;
+        }
+      }
+      names.forEach((name, i) => {
+        const callSites = sites[i];
         if (callSites.length <= LOW_USAGE_THRESHOLD) {
           // Used inside its own file => not dead code (see countSameFileUses). An unreadable file counts as 0 uses: fail open.
-          if (fileText === null) { try { fileText = fs.readFileSync(file, 'utf8'); } catch { fileText = ''; } }
-          if (countSameFileUses(fileText, name) > 0) { skippedInternal++; continue; }
+          if (countSameFileUses(readText(), name) > 0) { skippedInternal++; return; }
           candidates.push({
             symbol: name,
             definedIn: path.relative(repoRoot, file).replace(/\\/g, '/'),
@@ -258,11 +365,12 @@ function scan() {
             scannedAt,
           });
         }
-      }
+      });
     }
   }
-  // Still a plain array (callers and tests deep-equal it, JSON.stringify ignores extra properties); the count rides along.
+  // Still a plain array (callers and tests deep-equal it, JSON.stringify ignores extra properties); the counts ride along.
   candidates.skippedInternal = skippedInternal;
+  candidates.fileLevel = fileLevel;
   return candidates;
 }
 
@@ -281,9 +389,10 @@ function main() {
   fs.writeFileSync(resultsPath, JSON.stringify(candidates, null, 2));
   markChecked(instancesDir);
   const skipped = candidates.skippedInternal ? `, ${candidates.skippedInternal} skipped (used inside their own file)` : '';
-  console.log(`scanned, found ${candidates.length} low-usage export candidate(s)${skipped}, written to ${resultsPath}`);
+  const wholeFiles = candidates.fileLevel ? `, ${candidates.fileLevel} of them whole-file` : '';
+  console.log(`scanned, found ${candidates.length} low-usage export candidate(s)${wholeFiles}${skipped}, written to ${resultsPath}`);
 }
 
 if (require.main === module) { main(); }
 
-module.exports = { scan, extractExports, extractEsExports, countCallSites, countSameFileUses, isDue, markChecked };
+module.exports = { scan, extractExports, extractEsExports, countCallSites, countSameFileUses, buildFileCorpus, fileImporters, isWholeFileDead, FILE_FLAG_SYMBOL, isDue, markChecked };

@@ -9,7 +9,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { extractEsExports, extractExports, countSameFileUses, scan, isDue, markChecked } = require('./unused-export-scan.js');
+const { extractEsExports, extractExports, countSameFileUses, scan, isDue, markChecked, fileImporters, buildFileCorpus, isWholeFileDead } = require('./unused-export-scan.js');
 
 test('extractEsExports: declarations, defaults, and export lists', () => {
   const names = extractEsExports([
@@ -144,4 +144,128 @@ test('isDue: true when never checked before, false right after markChecked, true
 
   const oneDayLater = new Date(now.getTime() + 24 * 60 * 60 * 1000);
   assert.equal(isDue(instancesDir, oneDayLater), true, 'interval elapsed -- due again');
+});
+
+// --- brain-dump #1752 (2026-10-03): a wholly dead FILE is flagged once, not once per export --------------------------------
+// shadcn's accordion.tsx became four independent removal candidates (AccordionTrigger, AccordionContent, ...) that could be
+// applied separately and leave a half-component; 162 of 183 TaxHarvest components/ui flags sat in 29 files nothing imports.
+
+function wholeFileRepo(files) {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'unused-export-wholefile-'));
+  for (const [rel, text] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(repo, rel)), { recursive: true });
+    fs.writeFileSync(path.join(repo, rel), text);
+  }
+  process.env.AGENT_MANAGER_REPO_ROOT = repo;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = repo;
+  process.env.AGENT_MANAGER_UNUSED_SCAN_DIRS = 'src';
+  process.env.AGENT_MANAGER_UNUSED_SEARCH_DIRS = 'src';
+  return repo;
+}
+const ACCORDION = 'function Accordion() {}\nfunction AccordionItem() {}\nfunction AccordionTrigger() {}\nfunction AccordionContent() {}\nexport { Accordion, AccordionItem, AccordionTrigger, AccordionContent };\n';
+
+test('scan: a fully dead 4-export compound file with no importer is ONE file-level flag and no per-export flags', () => {
+  wholeFileRepo({ 'src/components/ui/accordion.tsx': ACCORDION, 'src/App.tsx': 'export function App() { return null; }\n', 'src/main.ts': "import { App } from './App';\nApp();\nApp();\nApp();\n" });
+  const flagged = scan();
+  const forAccordion = flagged.filter((c) => c.definedIn === 'src/components/ui/accordion.tsx');
+  assert.equal(forAccordion.length, 1);
+  assert.equal(forAccordion[0].kind, 'file');
+  assert.equal(forAccordion[0].symbol, '(file)');
+  assert.deepEqual(forAccordion[0].exports.sort(), ['Accordion', 'AccordionContent', 'AccordionItem', 'AccordionTrigger']);
+  assert.equal(flagged.fileLevel, 1);
+});
+
+test('scan: a partly used file (one export imported elsewhere) stays per-export and never gets a file flag', () => {
+  wholeFileRepo({
+    'src/components/ui/dialog.tsx': 'export function Dialog() {}\nexport function DialogTrigger() {}\nexport function DialogClose() {}\n',
+    'src/Page.tsx': "import { Dialog } from './components/ui/dialog';\nDialog();\nDialog();\nDialog();\nDialog();\n",
+  });
+  const flagged = scan();
+  assert.equal(flagged.fileLevel, 0);
+  assert.ok(flagged.every((c) => c.kind === undefined), 'per-export flags carry no kind');
+  assert.deepEqual(flagged.filter((c) => c.definedIn.endsWith('dialog.tsx')).map((c) => c.symbol).sort(), ['DialogClose', 'DialogTrigger']);
+});
+
+test('scan: a file imported only through a barrel re-export is NOT file-level', () => {
+  wholeFileRepo({
+    'src/ui/button.tsx': 'export function Button() {}\n',
+    'src/ui/barrel.ts': "export { Button } from './button';\n",
+  });
+  assert.equal(scan().fileLevel, 0);
+});
+
+test('fileImporters: relative, alias, dynamic import(), require(), side-effect and quoted-filename references all count', () => {
+  const repo = wholeFileRepo({
+    'src/x/thing.tsx': 'export function Thing() {}\n',
+    'src/rel.ts': "import { Thing } from './x/thing';\n",
+    'src/alias.ts': "import { Thing } from '@/components/x/thing';\n",
+    'src/dyn.ts': "const m = () => import('./x/thing.tsx');\n",
+    'src/req.js': "const t = require('../src/x/thing');\n",
+    'src/side.ts': "import './x/thing';\n",
+    'src/named.ts': "const f = 'thing.tsx';\n",
+    'src/pathalias.ts': "import { Thing } from '@thing';\n",
+  });
+  const corpus = buildFileCorpus(repo);
+  const hits = fileImporters(path.join(repo, 'src/x/thing.tsx'), corpus).map((f) => path.basename(f)).sort();
+  assert.deepEqual(hits, ['alias.ts', 'dyn.ts', 'named.ts', 'pathalias.ts', 'rel.ts', 'req.js', 'side.ts']);
+});
+
+test('scan: a file imported via a dynamic import() only, or via an alias specifier only, is NOT file-level', () => {
+  wholeFileRepo({
+    'src/lazy/Page.tsx': 'export default function Page() {}\nexport const meta = {};\n',
+    'src/router.ts': "const routes = [() => import('./lazy/Page')];\n",
+    'src/aliased/Panel.tsx': 'export function Panel() {}\n',
+    'src/use.ts': "import { Panel } from '@/aliased/Panel';\n",
+  });
+  assert.equal(scan().fileLevel, 0);
+});
+
+test('scan: a package.json script string or a shell reference keeps a file from being file-level', () => {
+  wholeFileRepo({
+    'src/tool.ts': 'export function run() {}\n',
+    'src/other.tsx': 'export function Other() {}\n',
+    'package.json': '{ "scripts": { "tool": "tsx src/tool.ts" } }\n',
+    'scripts/go.sh': 'node build/other.tsx\n',
+  });
+  assert.equal(scan().fileLevel, 0);
+});
+
+test('scan: CLI, test, config and index files are never file-level (and CommonJS .js stays per-export)', () => {
+  wholeFileRepo({
+    'src/cli.ts': 'export function main() {}\nif (require.main === module) { main(); }\n',
+    'src/thing.test.ts': 'export function helperForTest() {}\n',
+    'src/vite.config.ts': 'export const cfg = {};\n',
+    'src/widgets/index.ts': 'export function Widget() {}\n',
+    'src/legacy.js': 'function oldFn() {}\nmodule.exports = { oldFn };\n',
+  });
+  const flagged = scan();
+  assert.equal(flagged.fileLevel, 0);
+  assert.ok(flagged.some((c) => c.symbol === 'oldFn'), 'a CommonJS file keeps its per-export flag');
+});
+
+test('scan: a same-named symbol in another file does NOT keep an unimported file per-export', () => {
+  wholeFileRepo({
+    'src/ui/breadcrumb.tsx': 'export function Breadcrumb() {}\nexport function BreadcrumbItem() {}\n',
+    'src/Nav.tsx': 'function Breadcrumb() {}\nBreadcrumb();\nBreadcrumb();\nBreadcrumb();\n',
+  });
+  const flagged = scan();
+  assert.equal(flagged.fileLevel, 1);
+  assert.equal(flagged.filter((c) => c.definedIn === 'src/ui/breadcrumb.tsx').length, 1);
+});
+
+test('scan: when the repo loads files by glob (import.meta.glob / require.context), no file is declared dead as a whole', () => {
+  wholeFileRepo({
+    'src/ui/card.tsx': 'export function Card() {}\n',
+    'src/loader.ts': "const mods = import.meta.glob('./ui/*.tsx');\n",
+  });
+  assert.equal(scan().fileLevel, 0);
+});
+
+test('isWholeFileDead: reports why a file was kept (reason strings are for humans, the boolean is what scan uses)', () => {
+  const repo = wholeFileRepo({ 'src/a.tsx': 'export function A() {}\n', 'src/b.ts': "import { A } from './a';\n" });
+  const corpus = buildFileCorpus(repo);
+  const v = isWholeFileDead({ file: path.join(repo, 'src/a.tsx'), text: 'export function A() {}\n', exportNames: ['A'], corpus, repoRoot: repo });
+  assert.equal(v.dead, false);
+  assert.match(v.reason, /imported or referenced/);
+  assert.equal(isWholeFileDead({ file: path.join(repo, 'src/a.tsx'), text: '', exportNames: [], corpus, repoRoot: repo }).reason, 'no exports');
 });
