@@ -159,8 +159,8 @@ test('the scanner-review sources declare groundingFields: ["snippet"]; the fix c
   for (const name of ['performance_review', 'function_length_review']) {
     assert.deepEqual(registry.getRegisteredSource(name).groundingFields, ['snippet'], `${name} must ground review on its snippet`);
   }
-  assert.deepEqual(registry.getRegisteredSource('unused_export').groundingFields, ['callSites'],
-    'unused_export must ground review on the real call sites the drafter saw');
+  assert.deepEqual(registry.getRegisteredSource('unused_export').groundingFields, ['callSites', 'sourceContext'],
+    'unused_export must ground review on the real call sites and the source excerpt the drafter saw');
   for (const name of ['observability_fix', 'performance_fix', 'function_length_fix', 'deadcode_fix', 'arch_discovery', 'arch_import', 'arch_review']) {
     assert.equal(registry.getRegisteredSource(name).groundingFields, undefined, `${name} must not set groundingFields`);
   }

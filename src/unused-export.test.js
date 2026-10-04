@@ -79,14 +79,14 @@ test('nextUnusedExportTask is fail-open: a flag whose defining file cannot be re
   assert.equal(task.promptContext.symbol, 'ghost');
 });
 
-test('unused_export declares its own dead-code review guidance, directToMain, and groundingFields on callSites', () => {
+test('unused_export declares its own dead-code review guidance, directToMain, and groundingFields on callSites and sourceContext', () => {
   const dir = makeRepo();
   const { getRegisteredSource } = freshPlugin(dir);
   const src = getRegisteredSource('unused_export');
   assert.equal(src.directToMain, true);
-  assert.deepEqual(src.groundingFields, ['callSites']);
+  assert.deepEqual(src.groundingFields, ['callSites', 'sourceContext']);
   assert.match(src.reviewGuidance, /NOT itself a code change/);
-  assert.match(src.reviewCompletenessQuestion, /decisive GENUINE-or-FALSE-POSITIVE-or-UNCERTAIN verdict/);
+  assert.match(src.reviewCompletenessQuestion, /decisive verdict -- GENUINE, FALSE POSITIVE, or a grounded UNCERTAIN/);
 });
 
 test('unused_export apply: a GENUINE verdict appends a real candidate to the dead-code candidates doc', () => {
@@ -268,4 +268,112 @@ test('the whole-file stale guard keeps an entry mentioned only in an artifact di
   freshPlugin(dir);
   assert.equal(mod.fileEntryIsStale(dir, { kind: 'file', definedIn: 'src/ui/accordion.tsx' }), false, 'artifact mentions are not importers');
   assert.equal(mod.fileEntryIsStale(dir, { kind: 'file', definedIn: 'src/ui/alert.tsx' }), true, 'a real importer makes it stale');
+});
+
+// ---- source excerpt + grounded-UNCERTAIN guidance (brain-dump #1762) -------------------------------------------------------
+function writeFile(dir, rel, text) {
+  fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+  fs.writeFileSync(path.join(dir, rel), text);
+}
+
+test('buildSourceContext shows a small file whole, line-numbered, and lists the files that name the module', () => {
+  const dir = makeRepo();
+  writeFile(dir, 'src/parsers/index.js', 'const a = 1;\nfunction getParser(k) { return a; }\nmodule.exports = { getParser };\n');
+  writeFile(dir, 'src/routes/parse.js', "const p = require('../parsers');\nconst x = p.getParser('a');\n");
+  const mod = require('./unused-export.js');
+  const out = mod.buildSourceContext(dir, { symbol: 'getParser', definedIn: 'src/parsers/index.js' });
+  assert.match(out, /^SOURCE EXCERPT of src\/parsers\/index\.js \(the file the symbol is defined in\) --/);
+  assert.match(out, /2: function getParser\(k\)/);
+  assert.match(out, /3: module\.exports = \{ getParser \};/);
+  assert.match(out, /Files that name this module: src\/routes\/parse\.js/);
+});
+
+test('buildSourceContext says "none found" when nothing names the module', () => {
+  const dir = makeRepo();
+  writeFile(dir, 'src/lone.js', 'function lone() {}\nmodule.exports = { lone };\n');
+  const mod = require('./unused-export.js');
+  assert.match(mod.buildSourceContext(dir, { symbol: 'lone', definedIn: 'src/lone.js' }), /Files that name this module: none found/);
+});
+
+test('buildSourceContext windows a large file around the definition, keeps export lines, and caps with a marker', () => {
+  const dir = makeRepo();
+  const filler = (n, tag) => Array.from({ length: n }, (_, i) => `// ${tag} filler line ${i} ${'x'.repeat(40)}`);
+  const lines = [...filler(200, 'top'), 'function target() { return 1; }', ...filler(200, 'bottom'), 'module.exports = { target };'];
+  writeFile(dir, 'src/big.js', lines.join('\n'));
+  const mod = require('./unused-export.js');
+  const out = mod.buildSourceContext(dir, { symbol: 'target', definedIn: 'src/big.js' });
+  assert.match(out, /201: function target\(\)/);
+  assert.match(out, /module\.exports = \{ target \};/, 'export lines survive the window');
+  assert.doesNotMatch(out, /top filler line 0 /, 'far-away lines are cut');
+  assert.match(out, /\.\.\./);
+  const body = out.split('\nFiles that name')[0];
+  assert.ok(body.length <= 6200, `bounded, got ${body.length}`);
+  const huge = ['function target() {}', ...Array.from({ length: 400 }, (_, i) => `export const e${i} = ${'y'.repeat(60)};`)].join('\n');
+  writeFile(dir, 'src/huge.js', huge);
+  assert.match(mod.buildSourceContext(dir, { symbol: 'target', definedIn: 'src/huge.js' }), /\[truncated\]/);
+});
+
+test('buildSourceContext for a whole-file entry shows the head and the export list', () => {
+  const dir = makeRepo();
+  const lines = [...Array.from({ length: 100 }, (_, i) => `// line ${i}`), 'export function Late() {}'];
+  writeFile(dir, 'src/ui/late.tsx', lines.join('\n'));
+  const mod = require('./unused-export.js');
+  const out = mod.buildSourceContext(dir, { kind: 'file', symbol: '(file)', definedIn: 'src/ui/late.tsx', exports: ['Late'] });
+  assert.match(out, /1: \/\/ line 0/);
+  assert.match(out, /101: export function Late\(\) \{\}/);
+  assert.doesNotMatch(out, /80: \/\/ line 79/);
+});
+
+test('buildSourceContext fails open: an unreadable file gives an empty string and the task is still created', () => {
+  const dir = makeRepo();
+  const mod = require('./unused-export.js');
+  assert.equal(mod.buildSourceContext(dir, { symbol: 'gone', definedIn: 'src/missing.js' }), '');
+  writeFlags(dir, [{ symbol: 'gone', definedIn: 'src/missing.js', callSites: [], scannedAt: '2026-09-01T00:00:00.000Z' }]);
+  const { nextUnusedExportTask, getConfig, taskIdExistsInQueue } = freshPlugin(dir);
+  const task = nextUnusedExportTask({ getConfig, taskIdExistsInQueue });
+  assert.ok(task);
+  assert.equal(task.promptContext.sourceContext, '');
+});
+
+test('nextUnusedExportTask puts the source excerpt on promptContext for both entry shapes', () => {
+  const dir = makeRepo();
+  writeFile(dir, 'src/ui/accordion.tsx', 'export function Accordion() {}\n');
+  writeFile(dir, 'src/b.js', 'function lone() {}\nmodule.exports = { lone };\n');
+  writeFlags(dir, [FILE_FLAG, { symbol: 'lone', definedIn: 'src/b.js', callSites: [], scannedAt: '2026-09-02T00:00:00.000Z' }]);
+  const { nextUnusedExportTask, getConfig, taskIdExistsInQueue } = freshPlugin(dir);
+  const fileTask = nextUnusedExportTask({ getConfig, taskIdExistsInQueue });
+  assert.match(fileTask.promptContext.sourceContext, /SOURCE EXCERPT of src\/ui\/accordion\.tsx/);
+  const exists = (id) => id === fileTask.id;
+  const exportTask = nextUnusedExportTask({ getConfig, taskIdExistsInQueue: exists });
+  assert.match(exportTask.promptContext.sourceContext, /SOURCE EXCERPT of src\/b\.js/);
+});
+
+test('prompt wrappers append (per-export) or print (file-level) the source block, and are byte-identical when it is empty', () => {
+  const dir = makeRepo();
+  const mod = require('./unused-export.js');
+  freshPlugin(dir);
+  const core = require('agent-manager/src/prompts.js');
+  const base = { promptContext: { symbol: 'lone', definedIn: 'src/b.js', callSites: [], note: 'n' } };
+  const withCtx = { promptContext: { ...base.promptContext, sourceContext: 'SOURCE EXCERPT of src/b.js (x) --\n1: code' } };
+  assert.equal(mod.buildPlanPromptFor(base), core.unusedExportPlanPrompt(base));
+  assert.equal(mod.buildImplementPromptFor(base, 'P'), core.unusedExportImplementPrompt(base, 'P'));
+  assert.equal(mod.buildPlanPromptFor({ promptContext: { ...base.promptContext, sourceContext: '' } }), core.unusedExportPlanPrompt(base));
+  assert.equal(mod.buildPlanPromptFor(withCtx), `${core.unusedExportPlanPrompt(withCtx)}\n\n${withCtx.promptContext.sourceContext}`);
+  assert.ok(mod.buildImplementPromptFor(withCtx, 'P').endsWith(withCtx.promptContext.sourceContext));
+  const fileTask = { promptContext: { kind: 'file', symbol: '(file)', definedIn: 'src/x.tsx', exports: ['X'], callSites: [], sourceContext: 'SOURCE EXCERPT of src/x.tsx (x) --\n1: code', note: 'NOTE-LINE' } };
+  const plan = mod.buildPlanPromptFor(fileTask);
+  assert.ok(plan.indexOf('SOURCE EXCERPT') > -1 && plan.indexOf('SOURCE EXCERPT') < plan.indexOf('NOTE-LINE'), 'printed before NOTE');
+});
+
+test('review guidance accepts a grounded UNCERTAIN and no longer rejects "cannot determine" as such', () => {
+  const dir = makeRepo();
+  const { getRegisteredSource } = freshPlugin(dir);
+  const src = getRegisteredSource('unused_export');
+  assert.match(src.reviewGuidance, /grounded UNCERTAIN/);
+  assert.match(src.reviewGuidance, /do NOT reject it as hedging or refusal/);
+  assert.match(src.reviewGuidance, /speculation not tied to the shown material/);
+  assert.match(src.reviewGuidance, /gives no verdict at all/);
+  assert.doesNotMatch(src.reviewGuidance, /cannot determine/);
+  assert.match(src.reviewGuidance, /malformed or missing a required section/);
+  assert.match(src.reviewGuidance, /broader than this one file/);
 });
