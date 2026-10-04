@@ -302,10 +302,15 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     },
     apply: ({ implementResponse }) => {
       const { repoRoot } = getConfig();
+      // requireStrength: 'Strong' (brain-dump #1764, core PR #515): the dead-code prompts only ever ask for a Strong block, and only
+      // for a GENUINE verdict, so a FALSE POSITIVE / UNCERTAIN verdict must write no block. One written anyway
+      // (deadcode-getparser: "Strength: Not actionable (false positive)", filed as AC-110) is dropped here instead of becoming a
+      // candidate. An older core ignores the unknown key.
       return applyArchDiscoveryCandidates({
         implementResponse,
         candidatesPath: deadCodeCandidatesPath(repoRoot),
         docTitle: '# Dead Code Removal Candidates',
+        requireStrength: 'Strong',
       });
     },
     // No emptyApproval (same reasoning as function_length_fix's own candidate-doc source):

@@ -130,6 +130,52 @@ test('unused_export apply: a FALSE POSITIVE/UNCERTAIN verdict (no candidate bloc
   assert.equal(fs.existsSync(candidatesPath), false);
 });
 
+// brain-dump #1764: deadcode-getparser answered FALSE POSITIVE but still wrote a block whose Strength was "Not actionable (false positive)"
+// and it was filed as a candidate. unused_export's apply now passes requireStrength: 'Strong' (core PR #515).
+test('unused_export apply: a block whose Strength is not Strong (a FALSE POSITIVE written as a candidate) is skipped and writes nothing', () => {
+  const dir = makeRepo();
+  const candidatesPath = path.join(dir, 'Docs', 'DEAD_CODE_CANDIDATES.md');
+  process.env.AGENT_MANAGER_DEAD_CODE_CANDIDATES_PATH = candidatesPath;
+  const { getRegisteredSource } = freshPlugin(dir);
+
+  const result = getRegisteredSource('unused_export').apply({
+    implementResponse: [
+      '### AC-001 · getParser factory in parsers/index.js',
+      'Strength: Not actionable (false positive)',
+      'Files: src/x.js',
+      '',
+      'Problem:',
+      'getParser is live production code.',
+      '',
+      'Solution:',
+      'No code change is warranted.',
+      '',
+      'Benefits:',
+      'None.',
+    ].join('\n'),
+  });
+  assert.equal(result.skipped, true);
+  assert.match(result.reason, /not Strength: Strong \(Not actionable \(false positive\)\)/);
+  assert.equal(fs.existsSync(candidatesPath), false);
+});
+
+test('unused_export apply: a response with one Strong and one non-Strong block appends only the Strong one', () => {
+  const dir = makeRepo();
+  const candidatesPath = path.join(dir, 'Docs', 'DEAD_CODE_CANDIDATES.md');
+  process.env.AGENT_MANAGER_DEAD_CODE_CANDIDATES_PATH = candidatesPath;
+  const { getRegisteredSource } = freshPlugin(dir);
+  const block = (n, strength, file) => ['### AC-00' + n + ' · Remove ' + file, 'Strength: ' + strength, 'Files: ' + file, '', 'Problem:', 'p', '', 'Solution:', 's', '', 'Benefits:', 'b'].join('\n');
+
+  const result = getRegisteredSource('unused_export').apply({
+    implementResponse: block(1, 'Strong', 'src/real.js') + '\n\n' + block(2, 'Uncertain (Plan verdict: UNCERTAIN)', 'src/maybe.js'),
+  });
+  assert.equal(result.candidateCount, 1);
+  assert.equal(result.droppedNonStrong, 1);
+  const text = fs.readFileSync(candidatesPath, 'utf8');
+  assert.match(text, /Files: src\/real\.js/);
+  assert.doesNotMatch(text, /src\/maybe\.js/);
+});
+
 test('deadcode_fix consumes a Strong dead-code candidate via the generic candidate-fulfillment path', () => {
   const dir = makeRepo();
   const candidatesPath = path.join(dir, 'Docs', 'DEAD_CODE_CANDIDATES.md');
