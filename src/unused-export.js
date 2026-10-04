@@ -29,8 +29,8 @@ function deadCodeCandidatesPath(repoRoot) {
   return process.env.AGENT_MANAGER_DEAD_CODE_CANDIDATES_PATH || path.join(repoRoot, 'Docs', 'DEAD_CODE_CANDIDATES.md');
 }
 
-const DEAD_CODE_REVIEW_GUIDANCE = 'This is a dead-code triage verdict for a low-usage export in OUR OWN project, NOT itself a code change. A valid draft is EXACTLY ONE of: (a) "GENUINE" + a correctly-formatted `### AC-NNN` candidate block (Strength: Strong / Files / Problem / Solution / Benefits) describing exactly what to remove; or (b) "FALSE POSITIVE" / "UNCERTAIN" + one short paragraph (2-4 sentences) explaining why, grounded in the call sites shown. There is deliberately NO diff, no code, and no "steps" here -- do NOT reject the draft for lacking them. REJECT only if: the draft refuses to reach a verdict ("a human should look", "cannot determine"); a GENUINE verdict\'s candidate block is malformed or missing a required section; a GENUINE verdict\'s Solution proposes removing something broader than this one symbol (or, for a WHOLE-FILE task, broader than this one file); or a FALSE POSITIVE/UNCERTAIN verdict\'s stated reason actually contradicts the call sites shown (e.g. claims a barrel re-export exists when none of the shown sites are one).';
-const DEAD_CODE_REVIEW_COMPLETENESS_QUESTION = 'Does the draft reach a decisive GENUINE-or-FALSE-POSITIVE-or-UNCERTAIN verdict and, if GENUINE, is it followed by a well-formed `### AC-NNN` candidate block whose Solution is scoped to removing exactly this one symbol (and its real call sites, if any) -- or, for a whole-file task, deleting exactly this one file?';
+const DEAD_CODE_REVIEW_GUIDANCE = 'This is a dead-code triage verdict for a low-usage export in OUR OWN project, NOT itself a code change. The task shows the defining file\'s source (SOURCE EXCERPT) and the call sites found. A valid draft is EXACTLY ONE of: (a) "GENUINE" + a correctly-formatted `### AC-NNN` candidate block (Strength: Strong / Files / Problem / Solution / Benefits) describing exactly what to remove; or (b) "FALSE POSITIVE" / "UNCERTAIN" + one short paragraph (2-4 sentences) explaining why, grounded in the source or call sites shown. A grounded UNCERTAIN -- one that names a concrete observation about the SHOWN source or call sites (for example a dynamic lookup, a re-export or a convention the shown material hints at) and says what would settle it -- is a valid, decisive verdict; do NOT reject it as hedging or refusal. There is deliberately NO diff, no code, and no "steps" here -- do NOT reject the draft for lacking them. REJECT only if: the draft gives no verdict at all (it only says "a human should look"); a GENUINE verdict\'s candidate block is malformed or missing a required section; a GENUINE verdict\'s Solution proposes removing something broader than this one symbol (or, for a WHOLE-FILE task, broader than this one file); or the stated reason is speculation not tied to the shown material, or actually contradicts it (e.g. claims a barrel re-export exists when none of the shown sites or the shown source is one).';
+const DEAD_CODE_REVIEW_COMPLETENESS_QUESTION = 'Does the draft reach a decisive verdict -- GENUINE, FALSE POSITIVE, or a grounded UNCERTAIN that cites something concrete in the shown source or call sites -- and, if GENUINE, is it followed by a well-formed `### AC-NNN` candidate block whose Solution is scoped to removing exactly this one symbol (and its real call sites, if any) -- or, for a whole-file task, deleting exactly this one file?';
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -54,6 +54,82 @@ function usedInsideOwnFile(repoRoot, entry) {
     return countSameFileUses(text, entry.symbol) > 0;
   } catch {
     return false;
+  }
+}
+
+// ---- source excerpt for the triage prompts and the reviewers' grounding ----------------------------------------------------
+// The drafter and the reviewers used to see only a symbol name and call-site lines, never the file the symbol lives in, so
+// they could not tell a used-in-file helper or a dynamic lookup from dead code. buildSourceContext renders a bounded,
+// line-numbered excerpt plus the files that name the module. Pure and FAIL OPEN: any failure returns '' (the task is then
+// created exactly as before); a failing importer walk drops only the importer line.
+const SOURCE_CONTEXT_MAX_CHARS = 6000;
+const SOURCE_WINDOW_LINES = 40;
+const FILE_EXCERPT_HEAD_LINES = 60;
+const IMPORTER_LIST_MAX = 8;
+const EXPORT_LINE_RE = /^\s*(?:export\b|module\.exports\b|exports\.[A-Za-z_$])/;
+
+function numberLines(lines, from) {
+  return lines.map((l, i) => `${from + i + 1}: ${l}`);
+}
+
+function excerptLines(text, entry) {
+  const lines = text.replace(/\s+$/, '').split('\n');
+  if (isFileEntry(entry)) {
+    const head = lines.slice(0, FILE_EXCERPT_HEAD_LINES);
+    const out = numberLines(head, 0);
+    const exportLines = [];
+    lines.forEach((l, i) => { if (i >= FILE_EXCERPT_HEAD_LINES && EXPORT_LINE_RE.test(l)) exportLines.push(`${i + 1}: ${l}`); });
+    if (lines.length > FILE_EXCERPT_HEAD_LINES) out.push('...', ...exportLines);
+    return out;
+  }
+  if (text.length <= SOURCE_CONTEXT_MAX_CHARS) return numberLines(lines, 0);
+  const re = new RegExp(`\\b${String(entry.symbol).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
+  let def = lines.findIndex((l) => re.test(l));
+  if (def < 0) def = 0;
+  const from = Math.max(0, def - SOURCE_WINDOW_LINES);
+  const to = Math.min(lines.length, def + SOURCE_WINDOW_LINES + 1);
+  const keep = new Set();
+  for (let i = from; i < to; i++) keep.add(i);
+  lines.forEach((l, i) => { if (EXPORT_LINE_RE.test(l)) keep.add(i); });
+  const out = [];
+  let prev = -2;
+  for (const i of [...keep].sort((a, b) => a - b)) {
+    if (i !== prev + 1) out.push('...');
+    out.push(`${i + 1}: ${lines[i]}`);
+    prev = i;
+  }
+  return out;
+}
+
+// fileImporters matches on the file stem, so `require('../parsers')` never names `parsers/index.js`. For an index file also match
+// on the directory name (a directory import), via a pseudo path whose stem is the directory.
+function modulePathImporters(abs, corpus) {
+  const hits = new Set(fileImporters(abs, corpus));
+  if (/^index\.[^.]+$/.test(path.basename(abs))) {
+    const dir = path.dirname(abs);
+    for (const f of fileImporters(path.join(dir, path.basename(dir) + path.extname(abs)), corpus)) if (f !== abs) hits.add(f);
+  }
+  return [...hits];
+}
+
+function buildSourceContext(repoRoot, entry, { pipelineDir = null } = {}) {
+  try {
+    const abs = path.join(repoRoot, entry.definedIn);
+    const text = fs.readFileSync(abs, 'utf8');
+    let body = excerptLines(text, entry).join('\n');
+    if (body.length > SOURCE_CONTEXT_MAX_CHARS) body = body.slice(0, SOURCE_CONTEXT_MAX_CHARS) + '\n[truncated]';
+    const out = [`SOURCE EXCERPT of ${entry.definedIn} (the file the symbol is defined in) --`, body];
+    try {
+      const names = modulePathImporters(abs, buildFileCorpus(repoRoot, { pipelineDir }))
+        .map((f) => path.relative(repoRoot, f)).sort();
+      const shown = names.slice(0, IMPORTER_LIST_MAX).join(', ');
+      out.push(names.length
+        ? `Files that name this module: ${shown}${names.length > IMPORTER_LIST_MAX ? ` (+${names.length - IMPORTER_LIST_MAX} more)` : ''}`
+        : 'Files that name this module: none found');
+    } catch { /* corpus walk failed: omit only this line */ }
+    return out.join('\n');
+  } catch {
+    return '';
   }
 }
 
@@ -87,6 +163,7 @@ function nextUnusedExportTask({ getConfig, taskIdExistsInQueue }) {
           definedIn: entry.definedIn,
           exports: entry.exports || [],
           callSites: [],
+          sourceContext: buildSourceContext(repoRoot, entry, { pipelineDir }),
           note: 'Judge genuine-dead vs false-positive for the WHOLE FILE (loaded by a convention, glob or loader the search cannot see, or deliberately kept). Use a majority-vote judgment, not a single verdict.',
         },
       };
@@ -102,6 +179,7 @@ function nextUnusedExportTask({ getConfig, taskIdExistsInQueue }) {
         symbol: entry.symbol,
         definedIn: entry.definedIn,
         callSites: entry.callSites,
+        sourceContext: buildSourceContext(repoRoot, entry, { pipelineDir }),
         note: 'Judge genuine-dead vs false-positive (barrel/re-export, factory pattern, etc.). Use a majority-vote judgment, not a single verdict.',
       },
     };
@@ -151,6 +229,7 @@ function fileLevelPlanPrompt(task) {
     `File: ${ctx.definedIn}`,
     `Exports in this file (all unused): ${(ctx.exports || []).join(', ') || '(none listed)'}`,
     '',
+    ...(ctx.sourceContext ? [ctx.sourceContext, ''] : []),
     'NOTE (verbatim from task source):',
     ctx.note || '',
   ].join('\n');
@@ -184,12 +263,17 @@ function fileLevelImplementPrompt(task, planText) {
   ].join('\n');
 }
 
-// Per-export tasks keep the core prompts byte for byte; only kind:'file' tasks get the file-level pair.
+// Per-export tasks keep the core prompts byte for byte and only gain the source block appended (core's prompt says "both shown
+// below" but prints no source); kind:'file' tasks get the file-level pair, which prints the block itself.
+function withSourceContext(prompt, task) {
+  const block = task && task.promptContext && task.promptContext.sourceContext;
+  return block ? `${prompt}\n\n${block}` : prompt;
+}
 function buildPlanPromptFor(task) {
-  return isFileEntry(task && task.promptContext) ? fileLevelPlanPrompt(task) : unusedExportPlanPrompt(task);
+  return isFileEntry(task && task.promptContext) ? fileLevelPlanPrompt(task) : withSourceContext(unusedExportPlanPrompt(task), task);
 }
 function buildImplementPromptFor(task, planText) {
-  return isFileEntry(task && task.promptContext) ? fileLevelImplementPrompt(task, planText) : unusedExportImplementPrompt(task, planText);
+  return isFileEntry(task && task.promptContext) ? fileLevelImplementPrompt(task, planText) : withSourceContext(unusedExportImplementPrompt(task, planText), task);
 }
 
 // Read-only inventory for the dashboard's Hygiene tab (see flag-inventory.js). Same id formula as nextUnusedExportTask.
@@ -231,9 +315,9 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     directToMain: true, // additive candidate-doc append, same reasoning as arch_discovery/function_length_review
     reviewGuidance: DEAD_CODE_REVIEW_GUIDANCE,
     reviewCompletenessQuestion: DEAD_CODE_REVIEW_COMPLETENESS_QUESTION,
-    // Grounds the reviewer in the same real call-site data the drafter saw -- same
+    // Grounds the reviewer in the same real call-site data and source excerpt the drafter saw -- same
     // reasoning as function_length_review's `groundingFields: ['snippet']`.
-    groundingFields: ['callSites'],
+    groundingFields: ['callSites', 'sourceContext'],
     reportClass: 'benefit', // a surfaced, human-reviewed dead-code candidate is a real outcome (system-report.js)
   });
   updateTaskSource('unused_export', { buildPlanPrompt: buildPlanPromptFor, buildImplementPrompt: buildImplementPromptFor });
@@ -274,4 +358,4 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
   updateTaskSource('deadcode_fix', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
 }
 
-module.exports = { register, nextUnusedExportTask, unusedExportInventory, taskIdForEntry, fileEntryIsStale, buildPlanPromptFor, buildImplementPromptFor };
+module.exports = { register, nextUnusedExportTask, unusedExportInventory, taskIdForEntry, fileEntryIsStale, buildPlanPromptFor, buildImplementPromptFor, buildSourceContext };
