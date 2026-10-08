@@ -196,3 +196,24 @@ test('stripNonCode: real division is left alone', () => {
   assert.ok(s.includes('total / count'), 'a / after an identifier stays as division');
   assert.ok(s.includes('for (const x of xs) { await y(x); }'), 'the following real loop is untouched');
 });
+
+// --- archived directories (2026-10-08): retired code is never scanned ---------------------------------------------------------------------------------------------
+// The retired TaxHarvest per-client deliverables flow moved to TaxHarvest/archive/client-deliverables/. A directory named archive / archived (optional leading underscore,
+// any case) is skipped by every scanner that walks through listSourceFiles; the same rule lives in agent-manager core's src/lib/archived-dirs.js.
+const { isArchivedDirName } = require('./scan-utils.js');
+
+test('isArchivedDirName matches archive / archived in any case with an optional underscore, and nothing that merely contains the word', () => {
+  for (const n of ['archive', 'archived', 'Archive', 'ARCHIVED', '_archive', '_archived']) assert.equal(isArchivedDirName(n), true, n);
+  for (const n of ['archives', 'archiver', 'my-archive', 'archive2', 'src', '', null, undefined, '.archive']) assert.equal(isArchivedDirName(n), false, String(n));
+});
+
+test('listSourceFiles never descends into an archive/ directory at any depth, but still walks one that only resembles the word', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scan-archive-'));
+  const put = (rel) => { fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true }); fs.writeFileSync(path.join(dir, rel), 'x'); };
+  put('src/live.js');
+  put('archive/client/backend/dead.js');
+  put('src/Archived/deep/dead2.js');
+  put('src/archives/real.js');
+  const files = listSourceFiles(dir, ['.js']).map((f) => path.relative(dir, f)).sort();
+  assert.deepEqual(files, [path.join('src', 'archives', 'real.js'), path.join('src', 'live.js')]);
+});

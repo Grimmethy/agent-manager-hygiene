@@ -31,7 +31,7 @@
 const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('agent-manager/src/config.js');
-const { stripNonCode } = require('./scan-utils.js');
+const { stripNonCode, isArchivedDirName } = require('./scan-utils.js');
 
 const CJS_DEFINE_EXTENSIONS = ['.js', '.jsx'];
 const ES_DEFINE_EXTENSIONS = ['.ts', '.tsx'];
@@ -78,7 +78,7 @@ function listSourceFiles(dir, extensions) {
     const result = [];
     for (const entry of entries) {
       if (entry.isDirectory()) {
-        if (SKIP_DIRS.has(entry.name)) continue;
+        if (SKIP_DIRS.has(entry.name) || isArchivedDirName(entry.name)) continue;
         result.push(...listSourceFiles(path.join(dir, entry.name), extensions));
       } else if (entry.isFile() && extensions.some((e) => entry.name.endsWith(e))) {
         result.push(path.resolve(dir, entry.name));
@@ -201,7 +201,7 @@ function buildFileCorpus(repoRoot, { pipelineDir = null } = {}) {
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        if (entry.name.startsWith('.') || FILE_CORPUS_SKIP_DIRS.has(entry.name)) continue;
+        if (entry.name.startsWith('.') || FILE_CORPUS_SKIP_DIRS.has(entry.name) || isArchivedDirName(entry.name)) continue;
         if (skipPipeline && path.resolve(full) === skipPipeline) continue;
         walk(full);
       } else if (entry.isFile() && FILE_CORPUS_EXTENSIONS.some((e) => entry.name.endsWith(e)) && !FILE_CORPUS_SKIP_NAMES.has(entry.name) && !entry.name.endsWith('.min.js')
@@ -268,7 +268,7 @@ function countCallSites(symbol, definingFile, searchRoots, repoRoot) {
         if (hits.length >= MAX_CALL_SITES) return;
         const fullPath = path.join(dir, entry.name);
         if (entry.isDirectory()) {
-          if (SKIP_DIRS.has(entry.name)) continue;
+          if (SKIP_DIRS.has(entry.name) || isArchivedDirName(entry.name)) continue;
           walk(fullPath);
         } else if (entry.isFile() && SEARCH_EXTENSIONS.some((e) => entry.name.endsWith(e))) {
           if (fullPath === absDefiningFile) continue; // never count the definition itself
