@@ -13,6 +13,12 @@
 const fs = require('fs');
 const path = require('path');
 
+// A directory named archive / archived (optional leading underscore, any case) is retired code: never scan it. Same rule as agent-manager core's
+// src/lib/archived-dirs.js (this repo cannot import core, so the one-line rule is repeated; both have a test pinning the same names).
+// 2026-10-08: the retired TaxHarvest per-client deliverables flow moved to TaxHarvest/archive/client-deliverables/ and must not keep generating work.
+const ARCHIVED_DIR_RE = /^_?archived?$/i;
+const isArchivedDirName = (name) => ARCHIVED_DIR_RE.test(String(name || ''));
+
 const SKIP_DIRS = new Set(['node_modules', '.git', 'queue', 'instances', 'dist', 'build', 'coverage', 'venv', '.venv', '__pycache__', 'vendor']);
 
 function listSourceFiles(dir, extensions) {
@@ -25,7 +31,7 @@ function listSourceFiles(dir, extensions) {
         // state, never a project's own reviewable source -- confirmed live scanning
         // this repo itself, which picked up stray .claude/worktrees/*/*.js copies
         // before this check existed.
-        if (entry.name.startsWith('.') || SKIP_DIRS.has(entry.name)) continue;
+        if (entry.name.startsWith('.') || SKIP_DIRS.has(entry.name) || isArchivedDirName(entry.name)) continue;
         result.push(...listSourceFiles(path.join(dir, entry.name), extensions));
       } else if (entry.isFile() && extensions.some((e) => entry.name.endsWith(e))) {
         result.push(path.resolve(dir, entry.name));
@@ -319,4 +325,5 @@ module.exports = {
   windowFromContent,
   MINIFIED_LINE_LENGTH_THRESHOLD,
   SKIP_DIRS,
+  isArchivedDirName,
 };

@@ -9,7 +9,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { extractEsExports, extractExports, countSameFileUses, scan, isDue, markChecked, fileImporters, buildFileCorpus, isWholeFileDead } = require('./unused-export-scan.js');
+const { extractEsExports, extractExports, countSameFileUses, scan, isDue, markChecked, fileImporters, buildFileCorpus, isWholeFileDead, countCallSites } = require('./unused-export-scan.js');
 
 test('extractEsExports: declarations, defaults, and export lists', () => {
   const names = extractEsExports([
@@ -347,4 +347,30 @@ test('scan: a pipelineDir inside the repo is ignored when scanning (self-hosted 
   assert.equal(scan().fileLevel, 0, 'without pipelineDir the html under pipe/state/ is read as an importer');
   process.env.AGENT_MANAGER_PIPELINE_DIR = path.join(repo, 'pipe');
   try { assert.equal(scan().fileLevel, 1, 'with pipelineDir inside the repo it is skipped'); } finally { process.env.AGENT_MANAGER_PIPELINE_DIR = repo; }
+});
+
+// 2026-10-08: retired code lives under archive/ (the TaxHarvest per-client deliverables flow). It is neither an importer that keeps live code alive
+// nor a definition to flag, and the call-site search must not count a hit inside it either.
+test('buildFileCorpus and the call-site search skip archive/ at any depth: an archived importer does not keep live code alive', () => {
+  const repo = wholeFileRepo({
+    'src/live.ts': 'export function unusedHelper() {}\n',
+    'archive/old/importer.ts': "import { unusedHelper } from '../../src/live';\nunusedHelper();\n",
+    'src/Archived/deep/also.ts': "import { unusedHelper } from '../live';\nunusedHelper();\n",
+    'src/archives/real.ts': 'export const real = 1;\n',
+  });
+  const read = buildFileCorpus(repo).map((e) => path.relative(repo, e.file)).sort();
+  assert.deepEqual(read, ['src/archives/real.ts', 'src/live.ts']);
+  const v = isWholeFileDead({ file: path.join(repo, 'src/live.ts'), text: 'export function unusedHelper() {}\n', exportNames: ['unusedHelper'], corpus: buildFileCorpus(repo), repoRoot: repo });
+  assert.equal(v.dead, true, `an archived importer must not count as a reference: ${v.reason}`);
+});
+
+test('countCallSites does not count a reference inside an archive/ directory', () => {
+  const repo = wholeFileRepo({
+    'src/live.js': 'function unusedHelper() {}\nmodule.exports = { unusedHelper };\n',
+    'src/caller.js': "const { unusedHelper } = require('./live');\nunusedHelper();\n",
+    'src/archive/old.js': 'unusedHelper();\n',
+    'Archived/older.js': 'unusedHelper();\n',
+  });
+  const hits = countCallSites('unusedHelper', path.join(repo, 'src/live.js'), [repo], repo);
+  assert.deepEqual([...new Set(hits.map((h) => h.file))], ['src/caller.js'], JSON.stringify(hits));
 });
