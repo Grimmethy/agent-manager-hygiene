@@ -24,6 +24,7 @@ const { applyArchDiscoveryCandidates } = require('agent-manager/src/candidate-do
 const { unusedExportPlanPrompt, unusedExportImplementPrompt, archReviewPlanPrompt, archReviewImplementPrompt } = require('agent-manager/src/prompts.js');
 const { buildFlagInventory } = require('./flag-inventory.js');
 const { countSameFileUses, buildFileCorpus, fileImporters, FILE_FLAG_SYMBOL } = require('./unused-export-scan.js');
+const prefilter = require('./deadcode-prefilter.js');
 
 function deadCodeCandidatesPath(repoRoot) {
   return process.env.AGENT_MANAGER_DEAD_CODE_CANDIDATES_PATH || path.join(repoRoot, 'Docs', 'DEAD_CODE_CANDIDATES.md');
@@ -147,11 +148,19 @@ function nextUnusedExportTask({ getConfig, taskIdExistsInQueue }) {
 
   entries.sort((a, b) => new Date(a.scannedAt) - new Date(b.scannedAt));
 
+  // Pre-filter (lib/deadcode-prefilter.js): symbol entries only; whole-file entries have no callers and always go to the model. Fail open to the old behaviour.
+  const mode = prefilter.prefilterMode();
+  const deadFiles = new Set(entries.filter(isFileEntry).map((e) => String(e.definedIn || '').replace(/\\/g, '/')));
+  const ledger = mode === 'off' ? null : prefilter.readLedger(pipelineDir);
+  let ledgerDirty = false;
+  const flushLedger = () => { if (ledgerDirty) prefilter.writeLedger(pipelineDir, ledger); };
+
   for (const entry of entries) {
     const taskId = taskIdForEntry(entry);
-    if (taskIdExistsInQueue(taskId)) continue;
     if (isFileEntry(entry)) {
+      if (taskIdExistsInQueue(taskId)) continue;
       if (fileEntryIsStale(repoRoot, entry)) continue;
+      flushLedger();
       return {
         id: taskId,
         domain: defaultDomain,
@@ -168,24 +177,40 @@ function nextUnusedExportTask({ getConfig, taskIdExistsInQueue }) {
         },
       };
     }
-    if (usedInsideOwnFile(repoRoot, entry)) continue;
-
-    return {
-      id: taskId,
-      domain: defaultDomain,
-      source: 'deadcode_triage',
-      title: `Triage dead-code candidate: ${entry.symbol} (defined in ${entry.definedIn}) — ${entry.callSites.length} call site(s) found`,
-      promptContext: {
-        symbol: entry.symbol,
-        definedIn: entry.definedIn,
-        callSites: entry.callSites,
-        sourceContext: buildSourceContext(repoRoot, entry, { pipelineDir }),
-        note: 'Judge genuine-dead vs false-positive (barrel/re-export, factory pattern, etc.). Use a majority-vote judgment, not a single verdict.',
-      },
-    };
+    const taken = taskIdExistsInQueue(taskId);
+    if (!taken && usedInsideOwnFile(repoRoot, entry)) continue;
+    let decision;
+    try {
+      decision = prefilter.decide({ entry, taskId, exists: taskIdExistsInQueue, deadFiles, ledger: ledger || { seen: {}, dismissed: {} }, mode });
+    } catch {
+      decision = { action: taken ? 'skip' : 'create', id: taskId, stamp: null, dirty: false };   // fail open: behave as before
+    }
+    if (decision.dirty && ledger) ledgerDirty = true;
+    if (decision.action === 'skip') continue;
+    if (decision.id !== taskId && usedInsideOwnFile(repoRoot, entry)) continue;   // a re-admitted symbol still has to pass the same-file-use guard
+    flushLedger();
+    return buildSymbolTask({ entry, id: decision.id, stamp: decision.stamp, defaultDomain, repoRoot, pipelineDir });
   }
 
+  flushLedger();
   return null;
+}
+
+function buildSymbolTask({ entry, id, stamp, defaultDomain, repoRoot, pipelineDir }) {
+  return {
+    id,
+    domain: defaultDomain,
+    source: 'deadcode_triage',
+    title: `Triage dead-code candidate: ${entry.symbol} (defined in ${entry.definedIn}) — ${entry.callSites.length} call site(s) found`,
+    promptContext: {
+      symbol: entry.symbol,
+      definedIn: entry.definedIn,
+      callSites: entry.callSites,
+      sourceContext: buildSourceContext(repoRoot, entry, { pipelineDir }),
+      note: 'Judge genuine-dead vs false-positive (barrel/re-export, factory pattern, etc.). Use a majority-vote judgment, not a single verdict.',
+      ...(stamp ? { prefilter: stamp } : {}),
+    },
+  };
 }
 
 // A flag entry is either one export (the original shape) or, since brain-dump #1752, a WHOLE FILE: { kind: 'file', symbol: '(file)',
