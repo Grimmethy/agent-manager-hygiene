@@ -277,3 +277,23 @@ test('function_length_review apply skips a candidate whose file + function is al
   assert.equal(second.duplicateOf, 'AC-1');
   assert.equal(fs.readFileSync(candidatesPath, 'utf8'), before);
 });
+
+// HUB0097 verdict constraint: moved here from agent-manager core's prompts.js (which gated it on this
+// source's name). Only this builder appends it, so it cannot leak into sibling review sources.
+test('function_length_review implement prompt carries the mandatory two-outcome verdict constraint', () => {
+  const dir = makeRepo();
+  const { getRegisteredSource } = freshPlugin(dir);
+  const task = { source: 'function_length_review', promptContext: { file: 'src/foo.js', snippet: 'function processThings(items) {}' } };
+  const prompt = getRegisteredSource('function_length_review').buildImplementPrompt(task, 'PLAN: verdict pending');
+  assert.match(prompt, /VERDICT CONSTRAINT \(mandatory for this task\)/);
+  assert.match(prompt, /snippet IS provided/i);
+  assert.match(prompt, /GENUINE or FALSE POSITIVE/);
+});
+
+test('function_length_fix implement prompt does NOT get the review-only verdict constraint', () => {
+  const dir = makeRepo();
+  const { getRegisteredSource } = freshPlugin(dir);
+  const task = { source: 'function_length_fix', promptContext: { file: 'src/foo.js', snippet: 'function processThings(items) {}' } };
+  const prompt = getRegisteredSource('function_length_fix').buildImplementPrompt(task, 'PLAN: do it');
+  assert.doesNotMatch(prompt, /VERDICT CONSTRAINT/);
+});
