@@ -423,3 +423,18 @@ test('review guidance accepts a grounded UNCERTAIN and no longer rejects "cannot
   assert.match(src.reviewGuidance, /malformed or missing a required section/);
   assert.match(src.reviewGuidance, /broader than this one file/);
 });
+
+test('unused_export declares genuineVerdict so core\'s inert-target sweep reads its done/ records (core names no plugin source)', () => {
+  const { getRegisteredSource } = freshPlugin(makeRepo());
+  assert.deepEqual(getRegisteredSource('unused_export').genuineVerdict, { idPrefix: 'deadcode-' });
+  assert.equal(getRegisteredSource('deadcode_fix').genuineVerdict, undefined, 'only the verdict-bearing triage source opts in');
+});
+
+test('every id taskIdForEntry mints starts with the declared genuineVerdict idPrefix', () => {
+  const { getRegisteredSource } = freshPlugin(makeRepo());
+  const { taskIdForEntry } = require('./unused-export.js');
+  const { idPrefix } = getRegisteredSource('unused_export').genuineVerdict;
+  for (const e of [{ symbol: 'foo', definedIn: 'src/a.js' }, { kind: 'file', definedIn: 'src/b.js' }]) {
+    assert.ok(taskIdForEntry(e).startsWith(idPrefix), taskIdForEntry(e));
+  }
+});

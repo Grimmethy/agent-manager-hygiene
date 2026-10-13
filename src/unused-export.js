@@ -319,6 +319,10 @@ function unusedExportInventory({ pipelineDir, repoRoot, taskState }) {
 function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
   registerTaskSource('unused_export', {
     hygieneFamily: hygieneFamily('unused_export'),
+    // Core's inert-target sweep may RETIRE a derived finding about an unreferenced symbol only when a done/ record from
+    // this source carries a vetted Strong `### AC-N` removal candidate (taskIdForEntry ids all start `deadcode-`).
+    // An older core ignores the unknown key.
+    genuineVerdict: { idPrefix: 'deadcode-' },
     priority: taskPriority('unused_export', 90),
     next: () => nextUnusedExportTask({ getConfig, taskIdExistsInQueue }),
     inventory: ({ taskState }) => {
