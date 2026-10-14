@@ -340,6 +340,36 @@ test('silent-catch-block: a state RESET with no message, or a setter unrelated t
   for (const code of flagged) assert.equal(findSilentCatchBlocks(code, 'src/x.tsx').length, 1, code);
 });
 
+// Same-file error helper (2026-10-14, videoforge): `catch (e) { fail(e); }` where `fail` is defined in the same file and shows
+// the error was flagged ten times in one VideoForge run and dismissed ten times as a false positive, one review call each.
+test('silent-catch-block: a catch that hands the error to a same-file helper which surfaces it is not silent', () => {
+  const ok = [
+    "const fail = e => { say(''); alert(e.message || e); };\nasync function go() { try { a(); } catch (e) { fail(e); } }",
+    "function showProblem(err) { document.getElementById('msg').textContent = err.message; }\ntry { a(); } catch (err) { showProblem(err); }",
+    "const report = async (e) => { await post('/log', { error: String(e) }); console.error(e); };\ntry { a(); } catch (e) { report(e); }",
+    "const fail = e => alert(e.message);\ntry { a(); } catch (e) { fail(e); }",                      // expression-bodied arrow
+    "var oops = function (x) { toast(x); };\ntry { a(); } catch (e) { cleanup(); oops(e); }",       // function expression, with other statements
+  ];
+  for (const code of ok) assert.equal(findSilentCatchBlocks(code, 'src/x.js').length, 0, code);
+});
+
+test('silent-catch-block: a same-file helper that does NOT surface the error, is not defined here, or is not handed it is still flagged', () => {
+  const flagged = [
+    "const swallow = e => { cache = null; };\ntry { a(); } catch (e) { swallow(e); }",                // helper hides it too
+    "try { a(); } catch (e) { handle(e); }",                                                          // imported / unknown: cannot verify
+    "const fail = e => { alert(e.message); };\ntry { a(); } catch (e) { fail(); }",                 // helper exists but the error is not passed
+    "const fail = e => { alert(e.message); };\ntry { a(); } catch (e) { fail(other); }",            // a different identifier
+    "const wrap = e => { inner(e); };\nconst inner = e => { cache = null; };\ntry { a(); } catch (e) { wrap(e); }",   // one level only
+    "const fail = e => { fail(e); };\ntry { a(); } catch (e) { fail(e); }",                         // self-recursive, surfaces nothing
+  ];
+  for (const code of flagged) assert.equal(findSilentCatchBlocks(code, 'src/x.js').length, 1, code);
+});
+
+test('silent-catch-block: a same-file helper is a JS/TS rule only -- Python except bodies are unchanged', () => {
+  const py = 'def fail(e):\n    print(e)\ntry:\n    a()\nexcept Exception as e:\n    fail(e)\n';
+  assert.equal(findSilentCatchBlocks(py, 'x.py').length, 1);
+});
+
 test('silent-catch-block: state-setter surfacing is JS/TS only -- a Python except with a set_* call is unchanged', () => {
   const py = 'try:\n    a()\nexcept Exception as e:\n    set_detail(str(e))\n';
   assert.equal(findSilentCatchBlocks(py, 'x.py').length, 1);
