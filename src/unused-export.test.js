@@ -438,3 +438,123 @@ test('every id taskIdForEntry mints starts with the declared genuineVerdict idPr
     assert.ok(taskIdForEntry(e).startsWith(idPrefix), taskIdForEntry(e));
   }
 });
+
+// 2026-10-16: DEAD_CODE_CANDIDATES.md was rooted at the live checkout (getConfig().repoRoot) while the directToMain batch commits in the apply
+// clone, so every apply appended to the live file and then failed `git add` ("outside repository"); the task re-ran 304 times and the doc held
+// 1459 blocks of 7 distinct titles. These tests pin the rooting and the idempotent re-apply (symbol-keyed: core's title-only key is null for four
+// of the real titles below).
+const REAL_DUPLICATED_TITLES = [
+  ['SOURCE_CONTRACT', 'Remove unused SOURCE_CONTRACT export', 'src/contract-spec.js'],
+  ['EXTENDED_NUM_CTX', 'Remove vestigial EXTENDED_NUM_CTX alias constant', 'src/local-client.js'],
+  ['LABEL_RE', 'Remove unused LABEL_RE constant from hub-serial.js', 'src/hub-serial.js'],
+  ['selectDraftStrategy', 'Remove orphaned selectDraftStrategy extraction', 'src/draft-strategy.js'],
+];
+
+function strongBlock(title, file) {
+  return [
+    `### AC-001 · ${title}`, 'Strength: Strong', `Files: ${file}`, '', 'Problem:', 'Exported but has zero real call sites.', '',
+    'Solution:', 'Delete the export.', '', 'Benefits:', 'Less dead surface area.',
+  ].join('\n');
+}
+
+function withApplyEnv(vars, fn) {
+  const keys = ['AGENT_MANAGER_DEAD_CODE_CANDIDATES_PATH', 'AGENT_MANAGER_APPLY_REPO_ROOT'];
+  const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  for (const k of keys) delete process.env[k];
+  Object.assign(process.env, vars);
+  try { return fn(); } finally {
+    for (const k of keys) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+  }
+}
+
+const countBlocks = (file) => (fs.readFileSync(file, 'utf8').match(/^### AC-\d+/gm) || []).length;
+
+test('unused_export apply: with a separate apply clone the doc is written under applyRepoRoot and nothing is written to the live repoRoot', () => {
+  const live = makeRepo();
+  const clone = makeRepo();
+  withApplyEnv({ AGENT_MANAGER_APPLY_REPO_ROOT: clone }, () => {
+    const { getRegisteredSource } = freshPlugin(live);
+    const result = getRegisteredSource('unused_export').apply({
+      implementResponse: strongBlock('Remove dead helper oldHelper', 'src/old.js'),
+      task: { promptContext: { symbol: 'oldHelper' } },
+    });
+    assert.equal(result.candidateCount, 1);
+    assert.equal(result.file, path.join(clone, 'Docs', 'DEAD_CODE_CANDIDATES.md'));
+    assert.equal(countBlocks(path.join(clone, 'Docs', 'DEAD_CODE_CANDIDATES.md')), 1);
+    assert.equal(fs.existsSync(path.join(live, 'Docs', 'DEAD_CODE_CANDIDATES.md')), false, 'the live checkout must stay clean');
+  });
+});
+
+test('unused_export apply: the env override still wins over applyRepoRoot', () => {
+  const live = makeRepo();
+  const clone = makeRepo();
+  const override = path.join(makeRepo(), 'Docs', 'DEAD_CODE_CANDIDATES.md');
+  withApplyEnv({ AGENT_MANAGER_APPLY_REPO_ROOT: clone, AGENT_MANAGER_DEAD_CODE_CANDIDATES_PATH: override }, () => {
+    const { getRegisteredSource } = freshPlugin(live);
+    const result = getRegisteredSource('unused_export').apply({ implementResponse: strongBlock('Remove dead helper oldHelper', 'src/old.js'), task: { promptContext: { symbol: 'oldHelper' } } });
+    assert.equal(result.file, override);
+    assert.equal(fs.existsSync(path.join(clone, 'Docs', 'DEAD_CODE_CANDIDATES.md')), false);
+  });
+});
+
+test('unused_export apply: applying the same approved Strong verdict twice leaves exactly one block and reports the duplicate', () => {
+  const clone = makeRepo();
+  withApplyEnv({ AGENT_MANAGER_APPLY_REPO_ROOT: clone }, () => {
+    const { getRegisteredSource } = freshPlugin(makeRepo());
+    const args = { implementResponse: strongBlock('Remove dead `DATE_LINE` constant and its sole import', 'src/doc-accuracy-check.js'), task: { promptContext: { symbol: 'DATE_LINE' } } };
+    const first = getRegisteredSource('unused_export').apply(args);
+    const second = getRegisteredSource('unused_export').apply(args);
+    assert.equal(first.candidateCount, 1);
+    assert.equal(second.skipped, true);
+    assert.match(second.reason, /already exists/);
+    assert.equal(countBlocks(path.join(clone, 'Docs', 'DEAD_CODE_CANDIDATES.md')), 1);
+  });
+});
+
+for (const [symbol, title, file] of REAL_DUPLICATED_TITLES) {
+  test(`unused_export apply: the real title "${title}" (no core title key) stays at one block across retried applies when the task carries its symbol`, () => {
+    const clone = makeRepo();
+    withApplyEnv({ AGENT_MANAGER_APPLY_REPO_ROOT: clone }, () => {
+      const { candidateKey } = require('agent-manager/src/lib/candidate-dedupe.js');
+      assert.equal(candidateKey({ title, files: file }), null, 'precondition: core cannot key this title on its own');
+      const { getRegisteredSource } = freshPlugin(makeRepo());
+      const args = { implementResponse: strongBlock(title, file), task: { promptContext: { symbol, definedIn: file } } };
+      for (let i = 0; i < 5; i += 1) getRegisteredSource('unused_export').apply(args);
+      assert.equal(countBlocks(path.join(clone, 'Docs', 'DEAD_CODE_CANDIDATES.md')), 1);
+    });
+  });
+}
+
+test('unused_export apply: a different symbol in the same file still appends (dedupe is per symbol, not per file)', () => {
+  const clone = makeRepo();
+  withApplyEnv({ AGENT_MANAGER_APPLY_REPO_ROOT: clone }, () => {
+    const { getRegisteredSource } = freshPlugin(makeRepo());
+    const src = getRegisteredSource('unused_export');
+    src.apply({ implementResponse: strongBlock('Remove unused SOURCE_CONTRACT export', 'src/contract-spec.js'), task: { promptContext: { symbol: 'SOURCE_CONTRACT' } } });
+    const other = src.apply({ implementResponse: strongBlock('Remove unused GATE_TEXT export', 'src/contract-spec.js'), task: { promptContext: { symbol: 'GATE_TEXT' } } });
+    assert.equal(other.candidateCount, 1);
+    assert.equal(countBlocks(path.join(clone, 'Docs', 'DEAD_CODE_CANDIDATES.md')), 2);
+  });
+});
+
+test('unused_export apply: a task with no symbol still appends as before and requireStrength still drops a non-Strong block', () => {
+  const clone = makeRepo();
+  withApplyEnv({ AGENT_MANAGER_APPLY_REPO_ROOT: clone }, () => {
+    const { getRegisteredSource } = freshPlugin(makeRepo());
+    const src = getRegisteredSource('unused_export');
+    const ok = src.apply({ implementResponse: strongBlock('Remove dead helper oldHelper', 'src/old.js') });
+    assert.equal(ok.candidateCount, 1);
+    const weak = src.apply({ implementResponse: strongBlock('Remove dead helper otherHelper', 'src/other.js').replace('Strength: Strong', 'Strength: Not actionable (false positive)'), task: { promptContext: { symbol: 'otherHelper' } } });
+    assert.equal(weak.skipped, true);
+    assert.equal(countBlocks(path.join(clone, 'Docs', 'DEAD_CODE_CANDIDATES.md')), 1);
+  });
+});
+
+test('deadcode_fix reads the same applyRepoRoot-rooted file the unused_export apply hook writes', () => {
+  const live = makeRepo();
+  const clone = makeRepo();
+  withApplyEnv({ AGENT_MANAGER_APPLY_REPO_ROOT: clone }, () => {
+    const { getRegisteredSource } = freshPlugin(live);
+    assert.equal(getRegisteredSource('deadcode_fix').candidatesPath(), path.join(clone, 'Docs', 'DEAD_CODE_CANDIDATES.md'));
+  });
+});
