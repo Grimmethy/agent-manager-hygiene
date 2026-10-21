@@ -24,9 +24,26 @@ const { applyArchDiscoveryCandidates } = require('agent-manager/src/candidate-do
 const { unusedExportPlanPrompt, unusedExportImplementPrompt, archReviewPlanPrompt, archReviewImplementPrompt } = require('agent-manager/src/prompts.js');
 const { buildFlagInventory } = require('./flag-inventory.js');
 const { countSameFileUses, buildFileCorpus, fileImporters, FILE_FLAG_SYMBOL } = require('./unused-export-scan.js');
+const prefilter = require('./deadcode-prefilter.js');
 
-function deadCodeCandidatesPath(repoRoot) {
-  return process.env.AGENT_MANAGER_DEAD_CODE_CANDIDATES_PATH || path.join(repoRoot, 'Docs', 'DEAD_CODE_CANDIDATES.md');
+// Where DEAD_CODE_CANDIDATES.md lives. It must be rooted at getConfig().applyRepoRoot -- the clone the directToMain batch's `git add`/commit
+// runs in -- not repoRoot (the live checkout), exactly like every candidate doc core's config.js defines and like function-length-review.js's
+// functionLengthCandidatesPath. Rooted at repoRoot, every apply appended a block to the LIVE checkout's untracked doc and then failed `git add`
+// ("is outside repository at '<applyRepoRoot>'"); the approved task blocked, was re-approved and ran again. 2026-10-16: 1459 blocks of 7 distinct
+// titles (3 MB), one task through 304 apply cycles, and the live checkout dirty enough to stop the dashboard's live sync. applyRepoRoot defaults
+// to repoRoot, so this is a no-op without a dedicated apply clone.
+function deadCodeCandidatesPath(getConfig) {
+  if (process.env.AGENT_MANAGER_DEAD_CODE_CANDIDATES_PATH) return process.env.AGENT_MANAGER_DEAD_CODE_CANDIDATES_PATH;
+  const cfg = getConfig();
+  return path.join(cfg.applyRepoRoot || cfg.repoRoot, 'Docs', 'DEAD_CODE_CANDIDATES.md');
+}
+
+// The exported symbol a triage task is about, read off the task's own promptContext (written by the scanner, not the model). Passed to
+// applyArchDiscoveryCandidates as `symbol` so the dedupe key does not depend on the model's title: core's title-only key is null for
+// "Remove unused SOURCE_CONTRACT export" and similar, which is how 272 copies of one candidate piled up. null when absent.
+function deadCodeSymbolFromTask(task) {
+  const s = task && task.promptContext && task.promptContext.symbol;
+  return typeof s === 'string' && s.trim() ? s.trim() : null;
 }
 
 const DEAD_CODE_REVIEW_GUIDANCE = 'This is a dead-code triage verdict for a low-usage export in OUR OWN project, NOT itself a code change. The task shows the defining file\'s source (SOURCE EXCERPT) and the call sites found. A valid draft is EXACTLY ONE of: (a) "GENUINE" + a correctly-formatted `### AC-NNN` candidate block (Strength: Strong / Files / Problem / Solution / Benefits) describing exactly what to remove; or (b) "FALSE POSITIVE" / "UNCERTAIN" + one short paragraph (2-4 sentences) explaining why, grounded in the source or call sites shown. A grounded UNCERTAIN -- one that names a concrete observation about the SHOWN source or call sites (for example a dynamic lookup, a re-export or a convention the shown material hints at) and says what would settle it -- is a valid, decisive verdict; do NOT reject it as hedging or refusal. There is deliberately NO diff, no code, and no "steps" here -- do NOT reject the draft for lacking them. REJECT only if: the draft gives no verdict at all (it only says "a human should look"); a GENUINE verdict\'s candidate block is malformed or missing a required section; a GENUINE verdict\'s Solution proposes removing something broader than this one symbol (or, for a WHOLE-FILE task, broader than this one file); or the stated reason is speculation not tied to the shown material, or actually contradicts it (e.g. claims a barrel re-export exists when none of the shown sites or the shown source is one).';
@@ -147,11 +164,19 @@ function nextUnusedExportTask({ getConfig, taskIdExistsInQueue }) {
 
   entries.sort((a, b) => new Date(a.scannedAt) - new Date(b.scannedAt));
 
+  // Pre-filter (lib/deadcode-prefilter.js): symbol entries only; whole-file entries have no callers and always go to the model. Fail open to the old behaviour.
+  const mode = prefilter.prefilterMode();
+  const deadFiles = new Set(entries.filter(isFileEntry).map((e) => String(e.definedIn || '').replace(/\\/g, '/')));
+  const ledger = mode === 'off' ? null : prefilter.readLedger(pipelineDir);
+  let ledgerDirty = false;
+  const flushLedger = () => { if (ledgerDirty) prefilter.writeLedger(pipelineDir, ledger); };
+
   for (const entry of entries) {
     const taskId = taskIdForEntry(entry);
-    if (taskIdExistsInQueue(taskId)) continue;
     if (isFileEntry(entry)) {
+      if (taskIdExistsInQueue(taskId)) continue;
       if (fileEntryIsStale(repoRoot, entry)) continue;
+      flushLedger();
       return {
         id: taskId,
         domain: defaultDomain,
@@ -168,24 +193,40 @@ function nextUnusedExportTask({ getConfig, taskIdExistsInQueue }) {
         },
       };
     }
-    if (usedInsideOwnFile(repoRoot, entry)) continue;
-
-    return {
-      id: taskId,
-      domain: defaultDomain,
-      source: 'deadcode_triage',
-      title: `Triage dead-code candidate: ${entry.symbol} (defined in ${entry.definedIn}) — ${entry.callSites.length} call site(s) found`,
-      promptContext: {
-        symbol: entry.symbol,
-        definedIn: entry.definedIn,
-        callSites: entry.callSites,
-        sourceContext: buildSourceContext(repoRoot, entry, { pipelineDir }),
-        note: 'Judge genuine-dead vs false-positive (barrel/re-export, factory pattern, etc.). Use a majority-vote judgment, not a single verdict.',
-      },
-    };
+    const taken = taskIdExistsInQueue(taskId);
+    if (!taken && usedInsideOwnFile(repoRoot, entry)) continue;
+    let decision;
+    try {
+      decision = prefilter.decide({ entry, taskId, exists: taskIdExistsInQueue, deadFiles, ledger: ledger || { seen: {}, dismissed: {} }, mode });
+    } catch {
+      decision = { action: taken ? 'skip' : 'create', id: taskId, stamp: null, dirty: false };   // fail open: behave as before
+    }
+    if (decision.dirty && ledger) ledgerDirty = true;
+    if (decision.action === 'skip') continue;
+    if (decision.id !== taskId && usedInsideOwnFile(repoRoot, entry)) continue;   // a re-admitted symbol still has to pass the same-file-use guard
+    flushLedger();
+    return buildSymbolTask({ entry, id: decision.id, stamp: decision.stamp, defaultDomain, repoRoot, pipelineDir });
   }
 
+  flushLedger();
   return null;
+}
+
+function buildSymbolTask({ entry, id, stamp, defaultDomain, repoRoot, pipelineDir }) {
+  return {
+    id,
+    domain: defaultDomain,
+    source: 'deadcode_triage',
+    title: `Triage dead-code candidate: ${entry.symbol} (defined in ${entry.definedIn}) — ${entry.callSites.length} call site(s) found`,
+    promptContext: {
+      symbol: entry.symbol,
+      definedIn: entry.definedIn,
+      callSites: entry.callSites,
+      sourceContext: buildSourceContext(repoRoot, entry, { pipelineDir }),
+      note: 'Judge genuine-dead vs false-positive (barrel/re-export, factory pattern, etc.). Use a majority-vote judgment, not a single verdict.',
+      ...(stamp ? { prefilter: stamp } : {}),
+    },
+  };
 }
 
 // A flag entry is either one export (the original shape) or, since brain-dump #1752, a WHOLE FILE: { kind: 'file', symbol: '(file)',
@@ -294,23 +335,30 @@ function unusedExportInventory({ pipelineDir, repoRoot, taskState }) {
 function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
   registerTaskSource('unused_export', {
     hygieneFamily: hygieneFamily('unused_export'),
+    // Core's inert-target sweep may RETIRE a derived finding about an unreferenced symbol only when a done/ record from
+    // this source carries a vetted Strong `### AC-N` removal candidate (taskIdForEntry ids all start `deadcode-`).
+    // An older core ignores the unknown key.
+    genuineVerdict: { idPrefix: 'deadcode-' },
     priority: taskPriority('unused_export', 90),
     next: () => nextUnusedExportTask({ getConfig, taskIdExistsInQueue }),
     inventory: ({ taskState }) => {
       const { repoRoot, pipelineDir } = getConfig();
       return unusedExportInventory({ repoRoot, pipelineDir, taskState });
     },
-    apply: ({ implementResponse }) => {
-      const { repoRoot } = getConfig();
+    apply: ({ implementResponse, task }) => {
       // requireStrength: 'Strong' (brain-dump #1764, core PR #515): the dead-code prompts only ever ask for a Strong block, and only
       // for a GENUINE verdict, so a FALSE POSITIVE / UNCERTAIN verdict must write no block. One written anyway
       // (deadcode-getparser: "Strength: Not actionable (false positive)", filed as AC-110) is dropped here instead of becoming a
       // candidate. An older core ignores the unknown key.
       return applyArchDiscoveryCandidates({
         implementResponse,
-        candidatesPath: deadCodeCandidatesPath(repoRoot),
+        candidatesPath: deadCodeCandidatesPath(getConfig),
         docTitle: '# Dead Code Removal Candidates',
         requireStrength: 'Strong',
+        // Idempotent re-apply (core candidate-docs.js opt-in dedupe), keyed by the scanner's symbol: a retried or requeued apply of the same
+        // approved verdict adds nothing. An older core that predates `symbol` ignores it and falls back to its title key.
+        dedupe: true,
+        symbol: deadCodeSymbolFromTask(task),
       });
     },
     // No emptyApproval (same reasoning as function_length_fix's own candidate-doc source):
@@ -340,10 +388,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
   registerTaskSource('deadcode_fix', {
     hygieneFamily: hygieneFamily('unused_export', { candidateDoc: true }),
     priority: taskPriority('deadcode_fix', 82),
-    next: () => {
-      const { repoRoot } = getConfig();
-      return nextCandidateFulfillmentTask(deadCodeCandidatesPath(repoRoot), 'deadcode_fix');
-    },
+    next: () => nextCandidateFulfillmentTask(deadCodeCandidatesPath(getConfig), 'deadcode_fix'),
     // A vetted "safe to remove" candidate legitimately resolving to "nothing to change
     // after all" is rare -- an empty draft here is far more likely the model giving up or
     // the code having moved since triage. Reject -> retry -> block for a human, same
@@ -353,7 +398,7 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     // recursively re-split (same reasoning/incident class as function_length_fix's
     // noCandidateSplit).
     noCandidateSplit: true,
-    candidatesPath: () => deadCodeCandidatesPath(getConfig().repoRoot),
+    candidatesPath: () => deadCodeCandidatesPath(getConfig),
     candidateDocTitle: '# Dead Code Removal Candidates',
     reasoningTier: 'high',
     // NOT directToMain -- this is a real code deletion (the export and, potentially, its

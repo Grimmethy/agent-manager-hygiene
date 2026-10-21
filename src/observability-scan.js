@@ -147,6 +147,58 @@ function surfacesViaStateSetter(stripped, caught) {
   return false;
 }
 
+// A catch body that hands the caught error to a helper defined in the SAME file, where that helper's own body surfaces it, is a
+// report, not a swallow: `const fail = e => { say(''); alert(e.message); }` ... `catch (e) { fail(e); }`. VideoForge 2026-10-14: ten such
+// blocks were flagged and each dismissed as a false positive after a paid review call. Deliberately narrow:
+//   - the call must be handed the caught identifier itself (fail(e)), not merely exist,
+//   - the helper must be found in this file (an import or a method like this.fail(e) cannot be verified, so it stays flagged),
+//   - its body must pass SURFACES_ERROR_RE or write the error into the DOM -- ONE level only, no chasing helper-of-helper.
+const DOM_SURFACE_RE = /\.(?:textContent|innerText|innerHTML)\s*(?:\+)?=|setCustomValidity\s*\(/;
+const NOT_A_HELPER = new Set(['if', 'for', 'while', 'switch', 'catch', 'function', 'return', 'typeof', 'new', 'await', 'async']);
+
+// Body text of the function named `name` declared in `text` (declaration, `const f = (..) =>`, or `f = function(..)`), or null.
+function localFunctionBody(text, name) {
+  const n = name.replace(/\$/g, '\\$');
+  const declRe = new RegExp(`(?<![\\w$.])function\\s*\\*?\\s*${n}\\s*\\(`);
+  const assignRe = new RegExp(`(?<![\\w$.])(?:const|let|var)\\s+${n}\\s*=\\s*(?:async\\s*)?(?:function\\s*[\\w$]*\\s*\\(|(\\([^)]*\\)|[\\w$]+)\\s*=>)`);
+  let m = declRe.exec(text);
+  if (m) return bodyAfterParams(text, m.index + m[0].length - 1);
+  m = assignRe.exec(text);
+  if (!m) return null;
+  if (m[1] !== undefined) {                                   // arrow: braced body, or an expression running to the end of the line
+    let i = m.index + m[0].length;
+    while (/\s/.test(text[i] || '')) i++;
+    if (text[i] === '{') return extractBraceBody(text, i);
+    const eol = text.indexOf('\n', i);
+    return text.slice(i, eol === -1 ? text.length : eol);
+  }
+  return bodyAfterParams(text, m.index + m[0].length - 1);   // `function (` expression: m ends at its "("
+}
+function bodyAfterParams(text, openParenIdx) {
+  const args = callArgs(text, openParenIdx);
+  if (args === null) return null;
+  let i = openParenIdx + args.length + 2;
+  while (/\s/.test(text[i] || '')) i++;
+  return text[i] === '{' ? extractBraceBody(text, i) : null;
+}
+
+function surfacesViaLocalHelper(stripped, caught, fileText) {
+  if (!caught) return false;
+  const identRe = new RegExp(`(?<![\\w$.])${caught.replace(/\$/g, '\\$')}(?![\\w$])`);
+  const callRe = /(?<![\w$.])([A-Za-z_$][\w$]*)\s*\(/g;
+  let m;
+  while ((m = callRe.exec(stripped))) {
+    if (NOT_A_HELPER.has(m[1])) continue;
+    const args = callArgs(stripped, m.index + m[0].length - 1);
+    if (args === null || !identRe.test(args)) continue;
+    const body = localFunctionBody(fileText, m[1]);
+    if (body === null) continue;
+    const helper = stripComments(body);
+    if (SURFACES_ERROR_RE.test(helper) || DOM_SURFACE_RE.test(helper)) return true;
+  }
+  return false;
+}
+
 // The identifier a `catch (e)` / `catch (err: unknown)` header binds, or null (`catch {`).
 function caughtIdentifier(headerParens) {
   const m = /^\(\s*([A-Za-z_$][\w$]*)/.exec(headerParens || '');
@@ -199,7 +251,8 @@ function findSilentCatchBlocks(text, relPath) {
     // digest-batched triage low-confidence-digest.js already runs for `return
     // someFallbackVar` -- so no new noise-control mechanism is needed; this was just
     // unreachable dead code sitting in front of it. Falls through to that classification.
-    if (stripped.length === 0 || (!SURFACES_ERROR_RE.test(stripped) && !surfacesViaStateSetter(stripped, caughtIdentifier(m[1])))) {
+    if (stripped.length === 0 || (!SURFACES_ERROR_RE.test(stripped) && !surfacesViaStateSetter(stripped, caughtIdentifier(m[1]))
+        && !surfacesViaLocalHelper(stripped, caughtIdentifier(m[1]), text))) {
       const startLine = lineOfIndex(text, m.index);
       const confidence = classifyCatchConfidence({
         stripped, text, headerIndex: m.index, closeIndex: openIndex + 1 + body.length, isPython: false,
