@@ -25,3 +25,29 @@ Factor the common lexical state machine into a single internal helper—e.g., a 
 
 Benefits:
 A single, well-tested lexical scanner removes the risk of the two state machines drifting apart; any fix to string/comment/escape handling is made once and automatically applies to both consumers. The shared scanner is independently testable with a focused test suite, making edge-case coverage easier to reason about and extend. Future functions that need to "understand" code structure (e.g., a new scanner in `deterministic-recheck.js` or a downstream consumer) can reuse the same primitive rather than forking a third copy.
+
+### AC-3 · Duplicated function-length measurement logic across Python and JS paths
+Strength: Strong
+Files: src/function-length-scan.js
+
+Problem:
+`findLongPythonFunctions` measures a function's span by calling `extractIndentedBlock` and comparing `block.lineCount` against the threshold, while `findLongFunctions` uses `extractBraceBody` plus `countLines(body)`. These are two different measurement primitives from `scan-utils.js` that must stay semantically in sync, yet nothing enforces that. Additionally, the JS path guards against double-reporting via a `seenBraceIndex` Set, but the Python path has no equivalent `seenIndex` guard—so if a future regex adjustment causes `PY_DEF_RE` to match the same `def` header twice (e.g., overlapping multi-line signatures), the Python detector would emit duplicate findings while the JS detector would not. Any change to the definition of "function length" (excluding decorators, counting only non-blank lines, etc.) requires a developer to remember to update both functions independently, and the two can silently drift.
+
+Solution:
+Extract a shared `measureFunctionSpan(text, startIndex, extractor)` helper in `scan-utils.js` (or the same module) that encapsulates the "given a start index and an extraction function, return a normalized line count" contract. Both `findLongPythonFunctions` and `findLongFunctions` call this helper, so the measurement definition lives in exactly one place. Add a `seenIndex` Set to `findLongPythonFunctions` mirroring the JS path's `seenBraceIndex` dedup, so both detectors share the same guarantee against duplicate reports.
+
+Benefits:
+A single measurement contract means a semantic change to "function length" is a one-line edit in the shared helper rather than a two-site change with drift risk. The dedup guarantee is now uniform across languages, eliminating a class of duplicate-finding bugs. Future language additions (Rust, Go) plug into the same helper and inherit both the measurement contract and the dedup guard for free.
+
+### AC-4 · Language-to-detector routing is an inline ternary rather than a declarative table
+Strength: Worth exploring
+Files: src/function-length-scan.js
+
+Problem:
+`scanProject` selects the detector with the expression `const finder = file.endsWith('.py') ? findLongPythonFunctions : findLongFunctions;` buried inside the per-file loop. The full language coverage is split across two locations: the `SCAN_EXTENSIONS` array (which lists which extensions are scanned) and this ternary (which maps an extension to a detector). A reader must cross-reference both to understand the complete picture, and adding a third language requires editing the loop body, the extensions array, and the regex patterns in three separate spots with no single declarative statement of "language X uses detector Y."
+
+Solution:
+Replace the inline ternary with a small declarative map, e.g. `const DETECTORS = { '.py': findLongPythonFunctions, '.js': findLongFunctions };` placed adjacent to `SCAN_EXTENSIONS`, and a `getDetector(ext)` lookup that returns the mapped function (or `null` for unhandled extensions). The loop body becomes `const finder = getDetector(ext); if (!finder) continue;`. The map and the extensions array are co-located, making the full language coverage visible in one glance.
+
+Benefits:
+Adding a new language is a single map entry plus its regex, rather than a ternary edit inside the loop. The declarative table serves as self-documenting coverage: a reviewer can see at a glance which languages are supported and which detector handles each. The `getDetector` null-return path gives a clean, testable extension point for future languages without touching the loop logic.
