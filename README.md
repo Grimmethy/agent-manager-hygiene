@@ -84,6 +84,26 @@ internal.
   Backfill an existing pipeline's ledger from `queue/done/` history with
   `node scripts/backfill-inconclusive-suppressions.js --apply`.
 
+## Triage gate (`performance_triage`, `observability_triage`)
+
+Narrow-verdict variants (`variantOf` their parents) for small GPUs, from the task-atomization design note. One closed question per finding,
+answered as strict JSON `{verdict: real|false_positive|uncertain, reason}`; the gate can only remove work. `real` / `uncertain` write nothing, so the
+parent source still reviews the finding on a big lane. The parent defers to a fresh in-flight triage task for 30 min (`AGENT_MANAGER_TRIAGE_DEFER_SECS`)
+and then reviews anyway, so nothing strands.
+
+`AGENT_MANAGER_TRIAGE_GATE`: `shadow` (default; the verdict is recorded on the task as `triageVerdict`, no suppression is written), `enforce` (a
+`false_positive` verdict writes a suppression with cause `triage-gate`), `off` (no triage tasks, no deferral).
+
+Measured 2026-10-21 (full table and a sample of reasons: `docs/TRIAGE_REPLAY_2026-10-21.md`), `scripts/triage-replay.js` on worker-rx580 (qwen3-vl:8b, numCtx 12288, numBatch 512), 40 recorded tasks per parent, about 4 s per task:
+performance_review 0 of 14 recorded positives called false positive, 3 of 26 recorded noops/dismissals filtered; observability_review 0 of 8 positives,
+22 of 32 filtered. The positive counts are below the design note's 30-replay gate, so the gate has NOT been promoted.
+
+Promotion (operator steps, in order; nothing here is done automatically):
+1. Replay again when the project has more recorded positives (`node scripts/triage-replay.js <performance_review|observability_review> --lane worker-rx580`; use `AGENT_MANAGER_LANES_PATH` for a scratch lanes file). Require 0 unsafe over at least 30 positives, then read a sample of the filtered reasons.
+2. Let shadow mode run on the live lane and compare `triageVerdict` with what the parent concludes for the same finding.
+3. Add `performance_triage` and `observability_triage` to the rx580 entry's `taskClasses` in the live `lanes.json` and set that entry's `"reserve": "always"` so big lanes defer to it once capability routing is `enforce`. Then set `AGENT_MANAGER_TRIAGE_GATE=enforce`.
+4. To undo a wrong suppression, delete its row (cause `triage-gate`) from `<pipelineDir>/scanner-suppressions.json`.
+
 ## Tests
 
 ```sh
