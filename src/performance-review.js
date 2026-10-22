@@ -20,6 +20,7 @@ const { isLikelyMinified, windowFromContent } = require('./scan-utils.js');
 const { reconcileFlags } = require('./flag-store.js');
 const { isSuppressed, recordFalsePositiveIfVerdict, recordInconclusiveReview, classifyReviewOutcome } = require('./suppression-store.js');
 const { buildFlagInventory } = require('./flag-inventory.js');
+const { parentIdGuard } = require('./triage-gate.js');
 
 // 2026-09-17 (agent-manager needs-clarification bd-1788740326297, defensive hardening):
 // mirrors observability_review's own STAMP_REVIEW_DISPOSITION pattern -- performance_review
@@ -289,7 +290,8 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     priority: taskPriority('performance_review', 80),
     next: () => {
       const { repoRoot, pipelineDir, defaultDomain, performanceCoveragePath } = getConfig();
-      return nextPerformanceReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue, coveragePath: performanceCoveragePath });
+      // performance_triage (triage-gate.js) gets first look at a finding; defer to it while its task is fresh and in flight.
+      return nextPerformanceReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue: parentIdGuard({ taskIdExistsInQueue, pipelineDir, family: 'performance' }), coveragePath: performanceCoveragePath });
     },
     inventory: ({ taskState }) => {
       const { repoRoot, pipelineDir } = getConfig();

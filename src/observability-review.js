@@ -27,6 +27,7 @@ const fs = require('fs');
 const path = require('path');
 const { scanProject, findSilentCatchBlocks } = require('./observability-scan.js');
 const { isLikelyMinified, windowFromContent } = require('./scan-utils.js');
+const { parentIdGuard } = require('./triage-gate.js');
 const { reconcileFlags } = require('./flag-store.js');
 const {
   isSuppressed, isClusterSuppressed, recordSuppression, recordFalsePositiveIfVerdict, recordInconclusiveReview, classifyReviewOutcome,
@@ -564,7 +565,8 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     priority: taskPriority('observability_review', 80),
     next: () => {
       const { repoRoot, pipelineDir, defaultDomain, observabilityCoveragePath } = getConfig();
-      return nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue, coveragePath: observabilityCoveragePath });
+      // observability_triage (triage-gate.js) gets first look at a finding; defer to it while its task is fresh and in flight.
+      return nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue: parentIdGuard({ taskIdExistsInQueue, pipelineDir, family: 'observability' }), coveragePath: observabilityCoveragePath });
     },
     inventory: ({ taskState }) => {
       const { repoRoot, pipelineDir } = getConfig();

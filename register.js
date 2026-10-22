@@ -22,6 +22,8 @@ const deps = { getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, tas
 require('./src/function-length-review.js').register(deps);
 require('./src/observability-review.js').register(deps);
 require('./src/performance-review.js').register(deps);
+// Narrow-verdict variants of the two review sources above (task-atomization phase 2); must register after them.
+require('./src/triage-sources.js').register(deps);
 require('./src/arch.js').register(deps);
 require('./src/unused-export.js').register(deps);
 require('./src/change-review.js').register(deps);
