@@ -206,3 +206,26 @@ Modify the `catch` block to log the error with context using `console.error`, in
 
 Benefits:
 Once fixed, any failure to detect OpenTelemetry dependencies will be immediately visible in terminal output during CI or local runs, preventing silent failures that could lead to incorrect observability assessments or deployment of non-compliant code. The fix uses only available primitives (`console.error`) and requires no new dependencies.
+
+### AC-10 · Silent JSON Parse Failures Without Logging
+Strength: Strong
+Files: src/performance-review.js
+Snippet:
+```
+  const projectTag = path.basename(repoRoot);
+
+  let coverage;
+  try { coverage = JSON.parse(readIfExists(coveragePath) || '{}'); } catch { coverage = {}; }
+
+  const flagsPath = path.join(pipelineDir, 'queue', 'performance-flags.json');
+  let flags;
+```
+
+Problem:  
+The `try...catch` blocks around `JSON.parse` in `nextPerformanceReviewTask` silently swallow errors by assigning default values (`{}` or `[]`) without logging the error. Since the project has no metrics system, there is no telemetry to surface the failure. Without logging, operators cannot detect when `coveragePath` or `flagsPath` files are malformed or corrupted, leading to silent, undetected downstream failures in performance review logic.
+
+Solution:  
+Add `console.error` logs inside each `catch` block to surface the error with context (file path and error message), while preserving the default value return. This ensures the error is visible to operators without altering the function’s contract to return defaults on failure.
+
+Benefits:  
+Operators can now detect and respond to malformed JSON files without relying on metrics or telemetry. The fix is minimal, uses only available primitives, and does not block the task — the function continues to return defaults as designed, but the failure is now observable.
