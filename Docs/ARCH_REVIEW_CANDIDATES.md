@@ -51,3 +51,32 @@ Replace the inline ternary with a small declarative map, e.g. `const DETECTORS =
 
 Benefits:
 Adding a new language is a single map entry plus its regex, rather than a ternary edit inside the loop. The declarative table serves as self-documenting coverage: a reviewer can see at a glance which languages are supported and which detector handles each. The `getDetector` null-return path gives a clean, testable extension point for future languages without touching the loop logic.
+
+### AC-8 · AC-2a – Add shared scanLexicalStates generator and refactor extractBraceBody to consume it
+Strength: Strong
+Split-Depth: 1
+Files: src/scan-utils.js, src/scan-utils.test.js
+
+Problem:
+extractBraceBody (and, separately, stripNonCode) each carry an inline copy of the same string/comment/escape state machine: inString (tracking which of ' " ` opened it), inLineComment, inBlockComment, and escapeNext. The transitions are character-for-character identical in both functions, so a fix to one (e.g. adding a new escape rule) must be manually replicated in the other. extractBraceBody's only real job is brace-depth tracking; the lexical bookkeeping is incidental and duplicated.
+
+Solution:
+1) Insert a new named-export generator function scanLexicalStates(text) in src/scan-utils.js, placed above extractBraceBody. It iterates the source once and yields { index, state } for every character, where state is one of 'code' | 'string' | 'lineComment' | 'blockComment'. It owns the inString / inLineComment / inBlockComment / escapeNext transitions (ported verbatim from extractBraceBody's existing logic, including the i++ skip for the second char of // and /*). 2) Rewrite extractBraceBody to consume the generator: iterate its output, and only when state === 'code' track brace depth and capture the body slice. Remove all four local state variables and the per-char comment/string/escape branches. Preserve the exact signature (text, openIndex), return value (substring or null), and the bodyStart / depth logic. 3) Add scanLexicalStates to the module.exports list. 4) In src/scan-utils.test.js (create if absent; use node:test per repo convention), add a describe block for scanLexicalStates with table-driven cases: plain code, double-quoted string containing // and /*, single-quoted string with escaped quote, backtick template literal, line comment containing a quote, block comment containing // and a quote, escape at end-of-line, unterminated string, unterminated block comment. Assert the full state array per input.
+
+Benefits:
+Single source of truth for lexical-state transitions in the file. extractBraceBody shrinks to a ~10-line brace-depth loop. The scanner is independently unit-testable without exercising the brace logic. Sets up stripNonCode (next candidate) to consume the same generator, eliminating the second copy.
+
+### AC-9 · AC-2b – Refactor stripNonCode to consume the shared scanLexicalStates generator
+Strength: Strong
+Split-Depth: 1
+Files: src/scan-utils.js
+Depends-On: AC-8
+
+Problem:
+stripNonCode maintains its own inString / inLineComment / inBlockComment / escapeNext state machine (identical transitions to extractBraceBody) alongside its regex-literal-detection state (prevCodeChar, word, wordOpen). The lexical half is pure duplication of what scanLexicalStates (added in AC-2a) already provides; keeping two copies means any future fix to string/comment/escape handling must be applied in two places and can silently diverge.
+
+Solution:
+Rewrite stripNonCode's main loop to iterate over scanLexicalStates(text) instead of maintaining its own inString / inLineComment / inBlockComment / escapeNext locals. For each yielded { index, state }: if state is 'string', 'lineComment', or 'blockComment', blank out[index] (preserving newlines, matching existing behaviour); if state is 'code', run the existing regex-literal heuristic (regexAllowedAfter using prevCodeChar and word) and update prevCodeChar / word / wordOpen as before. Remove the four duplicated state variables. Keep prevCodeChar, word, wordOpen, REGEX_PREV_KEYWORDS, IDENT_CHAR_RE, and regexAllowedAfter entirely local and unchanged in behaviour. Preserve the function signature (text), the output contract (same-length string with interiors blanked, newlines preserved), and the module.exports entry.
+
+Benefits:
+Eliminates the second copy of the lexical state machine. stripNonCode's loop becomes a straightforward map over the scanner's output plus its regex-detection logic. Future lexical fixes (e.g. new escape rules, regex-literal edge cases) are made once in scanLexicalStates and automatically benefit both consumers. The regex-detection heuristic remains isolated and testable in stripNonCode's own tests.
