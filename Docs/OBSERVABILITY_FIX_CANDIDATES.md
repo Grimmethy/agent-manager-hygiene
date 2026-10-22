@@ -229,3 +229,33 @@ Add `console.error` logs inside each `catch` block to surface the error with con
 
 Benefits:  
 Operators can now detect and respond to malformed JSON files without relying on metrics or telemetry. The fix is minimal, uses only available primitives, and does not block the task — the function continues to return defaults as designed, but the failure is now observable.
+
+### AC-11 · Swallowed Error Without Logging in Directory Read
+Strength: Strong
+Files: src/arch.js
+Snippet:
+```
+  let deepDiveCoverage;
+  try {
+    deepDiveCoverage = JSON.parse(readIfExists(deepDiveCoveragePath) || '{"projects":{}}');
+  } catch {
+    deepDiveCoverage = { projects: {} };
+  }
+  const relevantSlugs = new Set(
+```
+
+Problem:
+The `try` block reading `deepDiveAnalysisDir` silently catches any error (including permission denied, directory missing, or filesystem corruption) and returns `null` without logging. The caller cannot know why `null` was returned — the error is entirely lost. This breaks observability because infrastructure failures or misconfigurations go unreported, especially since the subsequent logic depends on `entries` being non-null. The second `try` block also silently catches and ignores errors, but the first is the primary failure point.
+
+Solution:
+Log the error with context using `console.error` before returning `null`. The fix modifies the first `catch` block to:
+
+```js
+} catch (err) {
+  console.error(`Failed to read deep-dive analysis dir: ${deepDiveAnalysisDir}`, err);
+  return null;
+}
+```
+
+Benefits:
+This ensures that any failure to read the directory is recorded in logs, making it visible to operators or monitoring systems. While the function still returns `null` (as per contract), the root cause is now traceable — preventing silent failures from masking real infrastructure or configuration issues. The fix uses only `console.error`, which matches the project’s logging capability.
