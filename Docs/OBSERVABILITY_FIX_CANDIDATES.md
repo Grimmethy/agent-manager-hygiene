@@ -374,3 +374,26 @@ Replace the silent `catch` block with one that logs the error using `console.err
 
 Benefits:
 Once fixed, operators can detect and respond to malformed or corrupted coverage files, preventing silent data degradation. The fix is minimal, leverages only available logging primitives, and does not require metrics or third-party systems — satisfying the project’s constraints while eliminating the silent failure risk.
+
+### AC-17 · Silent Error Swallowing in Coverage Parsing
+Strength: Strong
+Files: src/arch.js
+Snippet:
+```
+  let coverage;
+  try {
+    coverage = JSON.parse(fs.existsSync(importCoveragePath) ? fs.readFileSync(importCoveragePath, 'utf8') : '{"items":{}}');
+  } catch {
+    coverage = { items: {} };
+  }
+  if (!coverage.items) coverage.items = {};
+```
+
+Problem:  
+The `try...catch` block around lines 476–478 catches any error during JSON parsing of `importCoveragePath` but does not log or rethrow it — silently replacing it with a default `{ items: {} }`. Since the project has no metrics system, this error cannot be surfaced via telemetry. The only available primitives are `console.error` (Node) and `logging.error` (Python), which are not used here. This means a failure to read or parse the coverage file — possibly due to a missing file, malformed JSON, or permission issues — goes unnoticed by the caller, leading to silent data loss or incorrect state (coverage not updated) with no debugging signal.
+
+Solution:  
+Replace the empty `catch` block with one that logs the error using `console.error` and rethrows it with a descriptive message, preserving the original behavior (if `result.skipped` is true, the coverage is not updated) but surfacing the error to the caller. This allows the caller to act on the failure (e.g., retry, log, or fail the task) without introducing metrics or telemetry.
+
+Benefits:  
+Once fixed, any failure to parse the import coverage file will be visible to the caller via console.error, enabling debugging and preventing silent data loss or incorrect state. The fix uses only available primitives — no metrics, no third-party logging — and preserves the original logic for skipped candidates.
