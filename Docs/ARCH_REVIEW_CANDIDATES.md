@@ -80,3 +80,18 @@ Rewrite stripNonCode's main loop to iterate over scanLexicalStates(text) instead
 
 Benefits:
 Eliminates the second copy of the lexical state machine. stripNonCode's loop becomes a straightforward map over the scanner's output plus its regex-detection logic. Future lexical fixes (e.g. new escape rules, regex-literal edge cases) are made once in scanLexicalStates and automatically benefit both consumers. The regex-detection heuristic remains isolated and testable in stripNonCode's own tests.
+
+### AC-10 · Inconsistent I/O injection in the `scanOk: false` branch of `reconcileFlags`
+Strength: Strong
+Files: src/flag-store.js, src/flag-store.test.js
+
+Problem:
+`reconcileFlags` already accepts an injected predicate (`isSuppressed`) to keep one I/O-dependent decision testable and side-effect-free, yet the `scanOk: false` fallback hardcodes `fs.existsSync(path.join(repoRoot, f.file))` directly. This creates two concrete costs. First, the failure path is untestable without real filesystem access: the tests that exercise it must call `fs.mkdtempSync` and `fs.writeFileSync` to create temp directories and files, while every other test in the suite uses a `'/nope'` sentinel and needs no I/O at all. Second, the `repoRoot` parameter becomes conditionally required—it is dead weight on the common `scanOk: true` path but mandatory on the failure path. A caller who forgets to supply it gets a `TypeError` thrown by `path.join`, causing the reconciliation process to crash entirely rather than gracefully handling the transient scan error.
+
+Solution:
+Replace the hardcoded `fs.existsSync` call with a second injected predicate (e.g. `fileExists`), following the same pattern already established by `isSuppressed`: accept an optional callback, default to a no-op (or a pure in-memory check) when absent, and let the caller supply the real `fs.existsSync` wrapper in production. This makes `repoRoot` unnecessary for the reconciliation function itself—the filesystem concern is pushed entirely to the caller, who already knows the repo root and can close over it in the injected callback.
+
+Benefits:
+The failure path becomes testable with the same `'/nope'`-sentinel pattern used everywhere else in the suite, eliminating the need for `mkdtempSync`/`writeFileSync` scaffolding in those tests. The `repoRoot` parameter is removed from the function signature, eliminating the conditional-relevance footgun where a forgotten argument causes a hard crash. The module's existing design principle—pure-data reconciliation with narrow, explicit escape hatches for I/O—is applied uniformly, and the test surface shrinks to a single, consistent injection contract.
+
+NOTE: Flag #2 was not applied because the critique's claim that the draft's "silent data loss" mechanism was technically inaccurate was correct, but the critique's assertion that the proposed solution was a "marginal stylistic change" that failed to solve the "conditional parameter" issue was incorrect. The proposed solution *does* solve the conditional parameter issue by removing `repoRoot` from the function signature entirely, allowing the caller to handle the I/O context via closure, which is a valid architectural improvement consistent with the existing `isSuppressed` pattern. The draft's original error was in describing the *failure mode* of the *old* code (silent false vs. crash), which has been corrected in this version.
