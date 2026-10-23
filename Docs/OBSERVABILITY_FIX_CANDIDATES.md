@@ -328,3 +328,26 @@ Log the caught exception with context (`sourceFile`, `label`, `names`) using `co
 
 Benefits:
 Operators can now detect and investigate failures during static analysis, such as missing Python3 or unreadable files, without relying on external monitoring. The fix preserves correctness while improving observability — critical in a project with no metrics system.
+
+### AC-15 · Fix Silent JSON Parse Errors by Logging and Rethrowing
+Strength: Strong
+Files: src/function-length-review.js
+Snippet:
+```
+  const flagsPath = path.join(pipelineDir, 'queue', 'function-length-flags.json');
+
+  let coverage;
+  try { coverage = JSON.parse(readIfExists(coveragePath) || '{}'); } catch { coverage = {}; }
+  let flags;
+  try { flags = JSON.parse(readIfExists(flagsPath) || '[]'); } catch { flags = []; }
+
+```
+
+Problem:  
+The `try/catch` blocks around `JSON.parse` assignments silently swallow errors by assigning empty defaults (`{}` or `[]`) without logging or rethrowing. This means if `readIfExists` returns malformed JSON (due to filesystem corruption, encoding issues, or race conditions), the error is invisible to operators and monitoring systems. Downstream logic — such as scanning, flagging, or task scheduling — may proceed with invalid or missing state, leading to incorrect function-length reviews or corrupted queue state. Since the project has no metrics or logging framework beyond stdlib, the only viable fix is to log the error with context (file path and message) using `console.error` and rethrow to surface it to the caller.
+
+Solution:  
+Replace the silent `catch` blocks with explicit error logging using `console.error` that includes the file path and error message, then rethrow the error to propagate it to the caller. This ensures the error is traceable and actionable, without introducing any new dependencies or telemetry.
+
+Benefits:  
+Once fixed, errors during JSON parsing will be logged with sufficient context to diagnose root causes (e.g., corrupted files, race conditions) and surface to callers for appropriate handling — such as failing the task or alerting operators — preventing silent data corruption or incorrect reviews. The fix uses only available primitives (`console.error`, `throw`) and matches the project’s capabilities.
