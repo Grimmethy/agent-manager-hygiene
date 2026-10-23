@@ -259,3 +259,26 @@ Log the error with context using `console.error` before returning `null`. The fi
 
 Benefits:
 This ensures that any failure to read the directory is recorded in logs, making it visible to operators or monitoring systems. While the function still returns `null` (as per contract), the root cause is now traceable — preventing silent failures from masking real infrastructure or configuration issues. The fix uses only `console.error`, which matches the project’s logging capability.
+
+### AC-12 · Silent Error Swallowed in Flag Inventory Load
+Strength: Strong
+Files: src/observability-review.js
+Snippet:
+```
+function observabilityInventory({ repoRoot, pipelineDir, taskState }) {
+  const projectTag = path.basename(repoRoot);
+  let flags;
+  try { flags = JSON.parse(readIfExists(path.join(pipelineDir, 'queue', 'observability-flags.json')) || '[]'); } catch { flags = []; }
+  return buildFlagInventory({
+    flags, projectTag, repoRoot, taskState,
+    idFor: (f) => `observability-${slugifyForId(projectTag)}-${slugifyForId(f.rule)}-${slugifyForId(f.file || 'repo')}-${f.line || 0}`,
+```
+
+Problem:
+The `catch` block at `src/observability-review.js` silently swallows any error thrown by `JSON.parse` when parsing `observability-flags.json`, without logging or rethrowing. This is a genuine observability hygiene issue because the project has no metrics system and no logging framework beyond `console.error`, yet the failure is entirely invisible to humans. The caller `buildFlagInventory` will proceed with an empty `flags` array, which may lead to misleading dashboard state — e.g., showing “no flags” when flags actually failed to load due to malformed or missing JSON.
+
+Solution:
+Replace the bare `catch { flags = []; }` with a `catch (error)` block that logs the error via `console.error` with context (file, rule, line) so it’s visible to humans, while still returning an empty array — which is the fallback behavior — but now with observability.
+
+Benefits:
+Once fixed, any failure to parse `observability-flags.json` will be visible in console logs, enabling humans to detect and debug the issue without relying on telemetry or metrics — which the project does not have. The dashboard will still show “no flags” in the case of failure, but the root cause will be traceable to a human operator, preventing silent data loss or misreported state.
