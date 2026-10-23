@@ -351,3 +351,26 @@ Replace the silent `catch` blocks with explicit error logging using `console.err
 
 Benefits:  
 Once fixed, errors during JSON parsing will be logged with sufficient context to diagnose root causes (e.g., corrupted files, race conditions) and surface to callers for appropriate handling — such as failing the task or alerting operators — preventing silent data corruption or incorrect reviews. The fix uses only available primitives (`console.error`, `throw`) and matches the project’s capabilities.
+
+### AC-16 · Silent JSON Parse Failures in Coverage Initialization
+Strength: Strong
+Files: src/arch.js
+Snippet:
+```
+  let coverage;
+  try {
+    coverage = JSON.parse(readIfExists(importCoveragePath) || '{"items":{}}');
+  } catch {
+    coverage = { items: {} };
+  }
+  if (!coverage.items) coverage.items = {};
+```
+
+Problem:
+The `catch` block around line 381 (and identical at 375) silently swallows any error from `JSON.parse`, including malformed JSON or I/O failures, without logging or rethrowing. This means if `readIfExists(importCoveragePath)` returns a non-JSON string or corrupted data, the system defaults to `{ items: {} }` without surfacing the failure — leading to potential data loss or incorrect coverage state that operators cannot detect or debug.
+
+Solution:
+Replace the silent `catch` block with one that logs the error using `console.error` with context (file path and error message), then falls back to `{ items: {} }`. This preserves the fallback behavior while surfacing the failure to the operator — enabling detection and remediation without requiring telemetry or metrics infrastructure.
+
+Benefits:
+Once fixed, operators can detect and respond to malformed or corrupted coverage files, preventing silent data degradation. The fix is minimal, leverages only available logging primitives, and does not require metrics or third-party systems — satisfying the project’s constraints while eliminating the silent failure risk.
