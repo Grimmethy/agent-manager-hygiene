@@ -282,3 +282,26 @@ Replace the bare `catch { flags = []; }` with a `catch (error)` block that logs 
 
 Benefits:
 Once fixed, any failure to parse `observability-flags.json` will be visible in console logs, enabling humans to detect and debug the issue without relying on telemetry or metrics — which the project does not have. The dashboard will still show “no flags” in the case of failure, but the root cause will be traceable to a human operator, preventing silent data loss or misreported state.
+
+### AC-13 · Fix Silent Error in performanceInventory for Observability
+Strength: Strong
+Files: src/performance-review.js
+Snippet:
+```
+function performanceInventory({ repoRoot, pipelineDir, taskState }) {
+  const projectTag = path.basename(repoRoot);
+  let flags;
+  try { flags = JSON.parse(readIfExists(path.join(pipelineDir, 'queue', 'performance-flags.json')) || '[]'); } catch { flags = []; }
+  return buildFlagInventory({
+    flags, projectTag, repoRoot, taskState,
+    idFor: (f) => `performance-${slugifyForId(projectTag)}-${slugifyForId(f.rule)}-${slugifyForId(f.file || 'repo')}-${f.line || 0}`,
+```
+
+Problem:  
+The `performanceInventory` function silently catches and swallows errors when parsing `performance-flags.json`, returning an empty array instead of surfacing the failure. This prevents dashboard UI (Hygiene tab) from rendering any flags — even if the file is malformed — and leaves no trace for human operators or observability systems. Since the project lacks metrics or telemetry, logging the error with context (repo, pipeline, file) is the only viable observability primitive to surface this silent failure.
+
+Solution:  
+Replace the silent `catch` block with a logged error that includes the repo tag and file path, then return the empty array fallback. This preserves the read-only contract (returning a valid `buildFlagInventory` object) while making the failure visible to humans via console.error.
+
+Benefits:  
+Operators can now detect when `performance-flags.json` is corrupted or misconfigured without relying on dashboard UI alone. The failure mode is no longer invisible, enabling proactive debugging and reducing risk of undetected data loss.
