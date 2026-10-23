@@ -305,3 +305,26 @@ Replace the silent `catch` block with a logged error that includes the repo tag 
 
 Benefits:  
 Operators can now detect when `performance-flags.json` is corrupted or misconfigured without relying on dashboard UI alone. The failure mode is no longer invisible, enabling proactive debugging and reducing risk of undetected data loss.
+
+### AC-14 · Silent Error Swallowing in Python Static Check
+Strength: Strong
+Files: src/file-decompose-plan-pass.js
+Snippet:
+```
+    const names = syms.map((s) => s.name);
+    if (names.length === 0) continue;
+    let check;
+    try { check = staticCheckMove(repoRoot, sourceFile, names); } catch { check = null; }
+    if (!check) continue; // can't check (no python3, file unreadable) -- no filter this run
+    for (const s of Object.keys(check.externalRefs || {})) fanOut.add(s);
+  }
+```
+
+Problem:
+The `try...catch` block around `staticCheckMove` silently discards any error — including Python3 unavailability or unreadable files — and returns `null`, which causes `fanOut` to remain empty. The comment explicitly states “no filter this run,” meaning the intent is to return partial results, not fail hard. However, without logging or rethrowing, downstream logic may misinterpret an empty `fanOut` as “no external refs found,” when in fact a real failure occurred. This is an observability hygiene gap: the failure is invisible to operators and cannot be traced or debugged without external tools.
+
+Solution:
+Log the caught exception with context (`sourceFile`, `label`, `names`) using `console.error` to surface the failure for human operators, while preserving the return type of `Set` and avoiding rethrowing — because the caller expects to handle partial results. The fix does not alter behavior but ensures the error is visible without breaking the flow.
+
+Benefits:
+Operators can now detect and investigate failures during static analysis, such as missing Python3 or unreadable files, without relying on external monitoring. The fix preserves correctness while improving observability — critical in a project with no metrics system.
