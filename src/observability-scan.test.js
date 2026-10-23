@@ -156,6 +156,42 @@ test('findSilentCatchBlocks recognises widened error-surfacing tokens', () => {
   assert.equal(findSilentCatchBlocks("try { a() } catch (e) {\n  toast('failed: ' + e.message);\n}\n", 'a.js').length, 0);
 });
 
+// --- .push(caughtId) collector form (2026-10-23) --------------------------------------------
+
+test('findSilentCatchBlocks does NOT flag a catch that pushes the caught error into a collector (rejected-hub-disposition-backfill shape)', () => {
+  // The exact shape from src/rejected-hub-disposition-backfill.js, whose CLI prints the
+  // whole result as JSON -- pushing e.message into result.errors is a report, not a swallow.
+  const text = 'function relabel(src) {\n  try {\n    doWork(src);\n  } catch (e) {\n    result.errors.push(`relabel-in-place(${src}): ${e.message}`);\n  }\n}\n';
+  assert.equal(findSilentCatchBlocks(text, 'a.js').length, 0);
+});
+
+test('findSilentCatchBlocks does NOT flag a catch that pushes the caught identifier itself', () => {
+  const text = 'try {\n  risky();\n} catch (e) {\n  errors.push(e);\n}\n';
+  assert.equal(findSilentCatchBlocks(text, 'a.js').length, 0);
+});
+
+test('findSilentCatchBlocks STILL flags a .push() whose argument does not reference the caught identifier', () => {
+  assert.equal(findSilentCatchBlocks('try {\n  risky();\n} catch (e) {\n  list.push(1);\n}\n', 'a.js').length, 1);
+  assert.equal(findSilentCatchBlocks('try {\n  risky();\n} catch (e) {\n  list.push(unrelated);\n}\n', 'a.js').length, 1);
+  // A push of an unrelated value plus a comment is just the previous case with noise:
+  assert.equal(findSilentCatchBlocks('try {\n  risky();\n} catch (e) {\n  // accumulate for the CLI\n  list.push(1);\n}\n', 'a.js').length, 1);
+});
+
+test('a comment-only catch body is unaffected by the push check (existing documented no-op treatment)', () => {
+  // A comment-only body is a documented, deliberate no-op (see isCommentOnlyBody and the
+  // two "documented no-op" tests above); the new .push() check has no call to find there
+  // and leaves that behaviour exactly as it was.
+  assert.equal(findSilentCatchBlocks('try {\n  risky();\n} catch (e) {\n  // intentional: cache warm is best-effort\n}\n', 'a.js').length, 0);
+});
+
+test('the .push() collector form is JS-only: Python except-block handling is unchanged', () => {
+  // findSilentExceptBlocks never consults the JS push/setter/helper checks -- behavior
+  // for Python bodies is decided by the existing token list alone, exactly as before.
+  assert.equal(findSilentExceptBlocks('try:\n    x()\nexcept Exception as e:\n    pass\n', 'a.py').length, 1);
+  assert.equal(findSilentExceptBlocks('try:\n    x()\nexcept Exception:\n    raise\n', 'a.py').length, 0);
+  assert.equal(findSilentExceptBlocks('try:\n    x()\nexcept Exception as e:\n    logging.exception(e)\n', 'a.py').length, 0);
+});
+
 test('findSilentExceptBlocks flags `except: return None` at LOW confidence, not skipped entirely (2026-09-15)', () => {
   // Same reasoning as the JS-side test above -- this shape is a real, confirmed bug
   // class, not a convention to hard-skip.
