@@ -183,3 +183,79 @@ Bind the caught error in each `catch` clause and emit a single `console.error` l
 
 Benefits:
 A human running the pipeline will see an immediate, greppable stderr line naming the exact file path and the `SyntaxError` message the moment a state file is corrupted, giving them enough to locate, inspect, and recover the file before the next rescan overwrites it. The flags backlog is no longer silently dropped without trace; the log line provides the "why did my flags disappear?" signal that was previously absent. The rest of the function's behavior—falling back to empty defaults, triggering a rescan, returning a well-shaped object—is unchanged, so no caller contract is altered.
+
+### AC-9 · Silent Exception Swallowed in Dependency Detection
+Strength: Strong
+Files: src/observability-scan.js
+Snippet:
+```
+    try {
+      const text = fs.readFileSync(path.join(repoRoot, file), 'utf8');
+      if (re.test(text)) return true;
+    } catch {}
+  }
+  return false;
+}
+```
+
+Problem:
+The `hasOtelDependency` function silently catches all exceptions thrown by `fs.readFileSync` when attempting to read files like `package.json` or `requirements.txt`. Since the project has no metrics or telemetry system, and no logging framework beyond `console.error`, the error is completely invisible to humans — especially in CI/CD or production environments where such failures would be catastrophic. The function returns `false` if any file fails to read, but the cause is never recorded or reported.
+
+Solution:
+Modify the `catch` block to log the error with context using `console.error`, including the filename and error message. This ensures that when a file is missing, permission is denied, or encoding fails, the failure is visible in stderr — enabling debugging and recovery. No rethrow is needed since the function’s contract is boolean and the caller does not expect exceptions.
+
+Benefits:
+Once fixed, any failure to detect OpenTelemetry dependencies will be immediately visible in terminal output during CI or local runs, preventing silent failures that could lead to incorrect observability assessments or deployment of non-compliant code. The fix uses only available primitives (`console.error`) and requires no new dependencies.
+
+### AC-10 · Silent JSON Parse Failures Without Logging
+Strength: Strong
+Files: src/performance-review.js
+Snippet:
+```
+  const projectTag = path.basename(repoRoot);
+
+  let coverage;
+  try { coverage = JSON.parse(readIfExists(coveragePath) || '{}'); } catch { coverage = {}; }
+
+  const flagsPath = path.join(pipelineDir, 'queue', 'performance-flags.json');
+  let flags;
+```
+
+Problem:  
+The `try...catch` blocks around `JSON.parse` in `nextPerformanceReviewTask` silently swallow errors by assigning default values (`{}` or `[]`) without logging the error. Since the project has no metrics system, there is no telemetry to surface the failure. Without logging, operators cannot detect when `coveragePath` or `flagsPath` files are malformed or corrupted, leading to silent, undetected downstream failures in performance review logic.
+
+Solution:  
+Add `console.error` logs inside each `catch` block to surface the error with context (file path and error message), while preserving the default value return. This ensures the error is visible to operators without altering the function’s contract to return defaults on failure.
+
+Benefits:  
+Operators can now detect and respond to malformed JSON files without relying on metrics or telemetry. The fix is minimal, uses only available primitives, and does not block the task — the function continues to return defaults as designed, but the failure is now observable.
+
+### AC-11 · Swallowed Error Without Logging in Directory Read
+Strength: Strong
+Files: src/arch.js
+Snippet:
+```
+  let deepDiveCoverage;
+  try {
+    deepDiveCoverage = JSON.parse(readIfExists(deepDiveCoveragePath) || '{"projects":{}}');
+  } catch {
+    deepDiveCoverage = { projects: {} };
+  }
+  const relevantSlugs = new Set(
+```
+
+Problem:
+The `try` block reading `deepDiveAnalysisDir` silently catches any error (including permission denied, directory missing, or filesystem corruption) and returns `null` without logging. The caller cannot know why `null` was returned — the error is entirely lost. This breaks observability because infrastructure failures or misconfigurations go unreported, especially since the subsequent logic depends on `entries` being non-null. The second `try` block also silently catches and ignores errors, but the first is the primary failure point.
+
+Solution:
+Log the error with context using `console.error` before returning `null`. The fix modifies the first `catch` block to:
+
+```js
+} catch (err) {
+  console.error(`Failed to read deep-dive analysis dir: ${deepDiveAnalysisDir}`, err);
+  return null;
+}
+```
+
+Benefits:
+This ensures that any failure to read the directory is recorded in logs, making it visible to operators or monitoring systems. While the function still returns `null` (as per contract), the root cause is now traceable — preventing silent failures from masking real infrastructure or configuration issues. The fix uses only `console.error`, which matches the project’s logging capability.
