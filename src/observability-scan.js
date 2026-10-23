@@ -199,6 +199,27 @@ function surfacesViaLocalHelper(stripped, caught, fileText) {
   return false;
 }
 
+// A catch body that pushes the caught error (or its message) into an accumulating collector is
+// surfacing it for later reporting, not swallowing it: `catch (e) { result.errors.push(`...${e.message}`); }`
+// -- the caller prints the collector (a CLI that dumps the result as JSON) or asserts on it
+// downstream. The third recognised form, alongside surfacesViaStateSetter and
+// surfacesViaLocalHelper; like those two it removes the finding entirely (2026-10-23: the
+// catch in rejected-hub-disposition-backfill.js did exactly this and was flagged, and a
+// local model then spent a whole task adding a redundant console.error line). Deliberately
+// narrow: the `.push(` call's argument must actually reference the caught identifier as a
+// whole word -- `list.push(1)` / `list.push(unrelated)` stays flagged.
+function surfacesViaErrorPush(stripped, caught) {
+  if (!caught) return false;
+  const identRe = new RegExp(`(?<![\\w$.])${caught.replace(/\$/g, '\\$')}(?![\\w$])`);
+  const pushRe = /\.push\s*\(/g;
+  let m;
+  while ((m = pushRe.exec(stripped))) {
+    const args = callArgs(stripped, m.index + m[0].length - 1);
+    if (args !== null && identRe.test(args)) return true;
+  }
+  return false;
+}
+
 // The identifier a `catch (e)` / `catch (err: unknown)` header binds, or null (`catch {`).
 function caughtIdentifier(headerParens) {
   const m = /^\(\s*([A-Za-z_$][\w$]*)/.exec(headerParens || '');
@@ -252,7 +273,7 @@ function findSilentCatchBlocks(text, relPath) {
     // someFallbackVar` -- so no new noise-control mechanism is needed; this was just
     // unreachable dead code sitting in front of it. Falls through to that classification.
     if (stripped.length === 0 || (!SURFACES_ERROR_RE.test(stripped) && !surfacesViaStateSetter(stripped, caughtIdentifier(m[1]))
-        && !surfacesViaLocalHelper(stripped, caughtIdentifier(m[1]), text))) {
+        && !surfacesViaLocalHelper(stripped, caughtIdentifier(m[1]), text) && !surfacesViaErrorPush(stripped, caughtIdentifier(m[1])))) {
       const startLine = lineOfIndex(text, m.index);
       const confidence = classifyCatchConfidence({
         stripped, text, headerIndex: m.index, closeIndex: openIndex + 1 + body.length, isPython: false,
