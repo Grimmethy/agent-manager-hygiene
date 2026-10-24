@@ -420,3 +420,26 @@ Log the error with context using `console.error` (since no logging framework exi
 
 Benefits:
 Once fixed, errors during file parsing are logged with context (file path and error message), making it easier to debug silent failures. The function continues to return a task object with known failure state (via defaults), ensuring correctness and observability without breaking contracts or introducing new dependencies.
+
+### AC-19 · Silent Error Swallowing in Coverage and Flags Parsing
+Strength: Strong
+Files: src/performance-review.js
+Snippet:
+```
+
+  const flagsPath = path.join(pipelineDir, 'queue', 'performance-flags.json');
+  let flags;
+  try { flags = JSON.parse(readIfExists(flagsPath) || '[]'); } catch { flags = []; }
+
+  const now = Date.now();
+  const lastScannedAt = coverage.lastScannedAt ? Date.parse(coverage.lastScannedAt) : NaN;
+```
+
+Problem:
+The `try...catch` blocks around `JSON.parse(...)` silently assign fallback values (`coverage = {}` or `flags = []`) without logging or rethrowing, which means any parsing failure (e.g., malformed JSON, missing file, or invalid syntax) is completely invisible to the caller. Since this code is part of a performance review task and the project has no metrics system but does have `console.error`, the absence of error logging or propagation violates observability hygiene — downstream pipelines may proceed with invalid state, leading to incorrect assessments or silent failures.
+
+Solution:
+Replace the silent-catch blocks with error logging using `console.error` and rethrowing the error to surface it to the caller. This ensures the failure is observable and actionable — for example, the caller can log, retry, or fail fast. The fix uses only available primitives: `console.error`.
+
+Benefits:
+Once fixed, any parsing failure will be logged with context (file path and error message) and rethrown, ensuring that failures are not silently swallowed. This improves observability, correctness, and traceability of performance review tasks — preventing silent regressions or incorrect assessments in downstream pipelines.
