@@ -397,3 +397,26 @@ Replace the empty `catch` block with one that logs the error using `console.erro
 
 Benefits:  
 Once fixed, any failure to parse the import coverage file will be visible to the caller via console.error, enabling debugging and preventing silent data loss or incorrect state. The fix uses only available primitives — no metrics, no third-party logging — and preserves the original logic for skipped candidates.
+
+### AC-18 · Silent Error Swallowing in Task Initialization
+Strength: Strong
+Files: src/performance-review.js
+Snippet:
+```
+  const projectTag = path.basename(repoRoot);
+
+  let coverage;
+  try { coverage = JSON.parse(readIfExists(coveragePath) || '{}'); } catch { coverage = {}; }
+
+  const flagsPath = path.join(pipelineDir, 'queue', 'performance-flags.json');
+  let flags;
+```
+
+Problem:
+The `nextPerformanceReviewTask` function silently swallows errors during JSON parsing of optional files (`coveragePath` and `flagsPath`) by catching exceptions without logging or surfacing them. This breaks observability — if the files are malformed, missing, or corrupted, the error is not logged or communicated to the caller, meaning downstream logic may operate on invalid or missing state without any trace. Since the function’s contract is to return a task object (not throw), silent failure is a hidden bug that could lead to incorrect task execution or data loss — and the scanner correctly flags this as a “silent-catch-block” because the `catch` blocks do not log or rethrow, and the error is not propagated.
+
+Solution:
+Log the error with context using `console.error` (since no logging framework exists) and fall back to defaults (`coverage = {}`, `flags = []`) — but do not rethrow, because rethrowing would break the function’s contract to return a task object. The fix preserves the function’s behavior while surfacing the error for observability, using only available primitives.
+
+Benefits:
+Once fixed, errors during file parsing are logged with context (file path and error message), making it easier to debug silent failures. The function continues to return a task object with known failure state (via defaults), ensuring correctness and observability without breaking contracts or introducing new dependencies.
