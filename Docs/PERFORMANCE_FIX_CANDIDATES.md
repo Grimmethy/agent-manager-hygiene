@@ -45,3 +45,26 @@ Replace the synchronous `fs.readdirSync` with `fs.promises.readdir` and process 
 
 Benefits:
 The fix eliminates blocking I/O, reducing latency per directory read and improving overall system responsiveness. It’s safe, uses only primitives available in the project (Node.js `fs.promises` and `console.error`), and requires no new dependencies or metrics/logging frameworks.
+
+### AC-3 · Synchronous File I/O Bottleneck
+Strength: Strong
+Files: src/file-decompose-to-hub.js
+Snippet:
+```
+  let names;
+  try { names = fs.readdirSync(requestsDir).filter((n) => n.endsWith('.json')); } catch { return []; }
+  const out = [];
+  for (const name of names) {
+    const full = path.join(requestsDir, name);
+    try {
+      const parsed = JSON.parse(fs.readFileSync(full, 'utf8'));
+```
+
+Problem:
+The code synchronously reads and parses every `.json` file in `requestsDir` one at a time using `fs.readFileSync` inside a loop. This blocks the Node.js event loop for each file, causing severe latency that scales linearly with the number of files — potentially hundreds of milliseconds per file on slow disks. This makes the operation unusable for any real-world workload with more than a few files, as no concurrent operations (including HTTP requests or timers) can proceed.
+
+Solution:
+Replace the synchronous loop with an asynchronous approach: first read the directory with `fs.promises.readdir`, then map each `.json` file to a `fs.promises.readFile` promise, and use `Promise.all` to execute all reads in parallel. After parsing, retain the same `filter` and `map` logic. This removes all blocking I/O, allowing the event loop to remain responsive while processing hundreds of files.
+
+Benefits:
+The operation becomes non-blocking and scales linearly with file count instead of quadratically. Performance improves dramatically for large directories, and the system remains responsive to concurrent operations — including HTTP requests and timers — which is essential for real-world usage.
