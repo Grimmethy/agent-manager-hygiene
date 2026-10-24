@@ -313,6 +313,18 @@ function extractIndentedBlock(text, headerStartIndex) {
   return { body, endIndex: endIndex - 1, lineCount: lastRealLine - headerLineIdx + 1 };
 }
 
+// True when a repo-relative path (forward slashes) lives under a third-party vendor
+// directory: `vendor/` anywhere in the path, including the common `static/vendor/`
+// convention. Vendor/bundled dependencies are not the project's own reviewable source,
+// the same principle as SKIP_DIRS' `vendor` entry -- but a scanner that receives an
+// explicit candidate path (not just the listSourceFiles walk) needs this check itself.
+// `static/vendor/` necessarily contains `vendor/`, so the first check subsumes it; both
+// are listed to make the intent explicit.
+function skipVendorPath(path) {
+  const p = String(path || '');
+  return p.includes('vendor/') || p.includes('static/vendor/');
+}
+
 module.exports = {
   listSourceFiles,
   isLikelyMinified,
@@ -326,4 +338,5 @@ module.exports = {
   MINIFIED_LINE_LENGTH_THRESHOLD,
   SKIP_DIRS,
   isArchivedDirName,
+  skipVendorPath,
 };
