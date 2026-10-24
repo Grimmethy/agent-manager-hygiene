@@ -443,3 +443,26 @@ Replace the silent-catch blocks with error logging using `console.error` and ret
 
 Benefits:
 Once fixed, any parsing failure will be logged with context (file path and error message) and rethrown, ensuring that failures are not silently swallowed. This improves observability, correctness, and traceability of performance review tasks — preventing silent regressions or incorrect assessments in downstream pipelines.
+
+### AC-20 · Silent Error Swallowing in Flag Inventory Initialization
+Strength: Strong
+Files: src/function-length-review.js
+Snippet:
+```
+function functionLengthInventory({ repoRoot, pipelineDir, taskState }) {
+  const projectTag = path.basename(repoRoot);
+  let flags;
+  try { flags = JSON.parse(readIfExists(path.join(pipelineDir, 'queue', 'function-length-flags.json')) || '[]'); } catch { flags = []; }
+  return buildFlagInventory({
+    flags, projectTag, repoRoot, taskState,
+    idFor: (f) => `function-length-${slugifyForId(projectTag)}-${slugifyForId(f.file || 'repo')}-${f.line || 0}`,
+```
+
+Problem:
+The function `functionLengthInventory` attempts to parse a JSON flags file but silently catches and discards any error during `JSON.parse`, including file access failures or malformed JSON. The fallback `flags = []` hides the failure, and since there’s no logging or rethrowing, the caller receives an empty inventory without knowing the cause — potentially leading to incorrect dashboard state or silent data loss when the file is corrupted or inaccessible.
+
+Solution:
+Replace the silent `catch` block with one that logs the error to stderr using `console.error` with context about the file path and error message, then rethrows the original error to surface it to the caller. This preserves the stack trace and allows the caller to handle the failure appropriately — without introducing any metrics or telemetry.
+
+Benefits:
+The fix restores observability: failures in flag file parsing are now logged and propagated, enabling operators to detect and respond to file corruption, permission issues, or misconfiguration — preventing silent data loss or misleading dashboard metrics.
