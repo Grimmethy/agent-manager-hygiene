@@ -91,3 +91,26 @@ Replace `fs.readFileSync` with `fs.promises.readFile`, and wrap the loop in `Pro
 
 Benefits:  
 Once fixed, the system will no longer block during file reads, reducing startup time and improving throughput for repeated scans. The fix is deterministic and matches the scanner’s concern: synchronous I/O → async I/O with parallelization → no blocking per iteration. Since the project runs on Node.js 18+, `fs.promises` is available without any new dependencies.
+
+### AC-5 · Parallelize File Reads to Avoid Blocking I/O
+Strength: Strong
+Files: src/observability-scan.js
+Snippet:
+```
+  }
+
+  if (hasOtelDependency(clonePath)) {
+    for (const file of files) {
+      let text;
+      try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
+      const relPath = path.relative(clonePath, file).replace(/\\/g, '/');
+```
+
+Problem:  
+The current implementation uses `fs.readFileSync` in a loop over `files`, which is synchronous and blocks the Node.js event loop on every iteration. With hundreds or thousands of files, this creates a cascading I/O bottleneck — each read waits for the prior one to complete, resulting in slow, sequential execution. This is especially problematic under high concurrency or large directories, where the entire scan becomes I/O-bound and unresponsive.
+
+Solution:  
+Replace the synchronous loop with `Promise.all` over an array of `fs.promises.readFile` calls, wrapped in `async/await`. Each file is read concurrently, and results are collected and filtered. This eliminates the blocking I/O per iteration and allows the event loop to remain responsive during the scan.
+
+Benefits:  
+The scan becomes dramatically faster for large directories due to concurrent I/O. The event loop is no longer blocked, reducing perceived latency and improving throughput. The fix uses only existing primitives (`fs.promises`, `Promise.all`, `async/await`) — no new dependencies or APIs are required.
