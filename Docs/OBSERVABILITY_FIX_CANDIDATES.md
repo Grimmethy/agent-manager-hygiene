@@ -466,3 +466,26 @@ Replace the silent `catch` block with one that logs the error to stderr using `c
 
 Benefits:
 The fix restores observability: failures in flag file parsing are now logged and propagated, enabling operators to detect and respond to file corruption, permission issues, or misconfiguration — preventing silent data loss or misleading dashboard metrics.
+
+### AC-21 · Fix Empty Catch Block in Dependency Check
+Strength: Strong
+Files: src/observability-scan.js
+Snippet:
+```
+    try {
+      const text = fs.readFileSync(path.join(repoRoot, file), 'utf8');
+      if (re.test(text)) return true;
+    } catch {}
+  }
+  return false;
+}
+```
+
+Problem:
+The `hasOtelDependency` function silently swallows all errors during file reads (e.g., file not found, permission denied, syntax errors) by using an empty `catch` block. This means misconfigurations — such as missing or malformed dependency files — go undetected, and the function returns `false` erroneously, making it impossible for callers to diagnose why OpenTelemetry is not detected.
+
+Solution:
+Replace the empty `catch` block with one that logs the error using `console.error` with the file path and error message, then rethrows the original error. This ensures the error is visible to the caller and provides context for debugging.
+
+Benefits:
+Callers will now be able to detect and respond to file system errors during dependency checks. The fix preserves the original error for stack traces and adds logging context, making misconfigurations actionable — without requiring metrics or telemetry systems that don’t exist.
