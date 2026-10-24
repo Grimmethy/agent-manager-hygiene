@@ -489,3 +489,26 @@ Replace the empty `catch` block with one that logs the error using `console.erro
 
 Benefits:
 Callers will now be able to detect and respond to file system errors during dependency checks. The fix preserves the original error for stack traces and adds logging context, making misconfigurations actionable — without requiring metrics or telemetry systems that don’t exist.
+
+### AC-22 · Silent Error Swallowing in File Reading
+Strength: Strong
+Files: src/unused-export-scan.js
+Snippet:
+```
+      if (file.endsWith('.d.ts')) continue; // ambient declarations, not definitions
+      let fileText = null; // read lazily, once per file
+      const readText = () => {
+        if (fileText === null) { try { fileText = fs.readFileSync(file, 'utf8'); } catch { fileText = ''; } }
+        return fileText;
+      };
+      const names = extractExports(file);
+```
+
+Problem:
+The `readText` function silently assigns an empty string to `fileText` when `fs.readFileSync` throws an error — and it does not log the error or rethrow it. This means I/O failures (file missing, corrupted, permission denied) are invisible to the caller, causing `names` and `sites` arrays to be empty or malformed. Since the code iterates over files and builds a list of candidates based on exports, silent failures lead to incomplete or incorrect export analysis — especially for `.ts` files that may be critical to the export scanning logic. The error is not surfaced, making debugging impossible and increasing the risk of undetected bugs in the export analysis pipeline.
+
+Solution:
+Modify the `readText` function to log the error with context (file path and error message) using `console.error`, and rethrow the error to surface it to the caller. This preserves lazy loading while ensuring the error is observable. The fix uses only stdlib `console.error` and `throw`, which are available in the project.
+
+Benefits:
+Once fixed, any I/O failure during file reading will be logged to stderr and rethrown, ensuring the caller can detect and respond to the failure. This improves observability, enables debugging, and prevents silent data loss or incorrect export analysis — especially for files that are critical to the export scanning logic. The fix is minimal, safe, and matches the project’s logging capabilities.
