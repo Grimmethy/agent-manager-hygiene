@@ -321,3 +321,26 @@ Replace the sync read with a batched async approach using `fs.promises.readFile`
 
 Benefits:
 This change eliminates the event loop blocking, allowing concurrent execution of other tasks. It reduces latency by orders of magnitude under heavy load — for example, processing 1000 files in parallel instead of sequentially. The fix uses only `fs.promises` and `Promise.all`, both already available in the project’s dependencies, so no new libraries or APIs are introduced.
+
+### AC-15 · Fix Synchronous Directory Walk with Async I/O
+Strength: Strong
+Files: src/unused-export-scan.js
+Snippet:
+```
+  function walk(dir) {
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (hits.length >= MAX_CALL_SITES) return;
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+```
+
+Problem:  
+The `fs.readdirSync` call inside the loop blocks the event loop on every iteration, causing high latency and reduced throughput — especially during recursive traversal of large directory trees. Each synchronous read waits for I/O completion before proceeding, preventing concurrent operations and starving the event loop. This is a known performance bottleneck in Node.js when synchronous I/O is used in tight loops without async parallelization.
+
+Solution:  
+Replace the synchronous `fs.readdirSync` with `fs.promises.readdir` and use `Promise.all` to parallelize directory entry processing. For each entry, use `fs.promises.stat` to check file type, then recurse into directories asynchronously. This avoids blocking the event loop and allows concurrent I/O operations. The fix uses only `fs.promises` (Node.js built-in) and `Promise.all` — no new dependencies or APIs.
+
+Benefits:  
+The fix reduces latency and improves throughput by eliminating synchronous blocking. Directory traversal becomes non-blocking and scalable, especially for large trees. The event loop remains responsive, and the code remains compatible with existing logging (via `console.warn`) and error handling.
