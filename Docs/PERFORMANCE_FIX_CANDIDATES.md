@@ -183,3 +183,26 @@ Replace the `JSON.parse(JSON.stringify(...))` call with `structuredClone(...)` �
 
 Benefits:  
 Eliminates the O(n) serialization cost per object, reducing CPU usage and GC pressure in performance-sensitive code. The fix is immediate, safe, and leverages a modern native API already available in the project’s environment.
+
+### AC-9 · Fix Sync I/O in File Content Reader
+Strength: Strong
+Files: src/change-review.js
+Snippet:
+```
+
+function smallFileContents(repoRoot, nameStatus) {
+  const out = [];
+  for (const f of nameStatus) {
+    if (out.length >= SMALL_FILE_MAX_COUNT) break;
+    if (f.status === 'D') continue;
+    if (DOC_RE.test(f.path) || GENERATED_RE.test(f.path)) continue;
+```
+
+Problem:
+The current implementation executes synchronous file reads (`fs.readFileSync`) once per file in `nameStatus`, which may contain hundreds or thousands of entries. This blocks the Node.js event loop per iteration, causing degraded responsiveness, potential timeouts under load, and no parallelism — a classic “sync-io-in-loop” anti-pattern that degrades performance and user experience.
+
+Solution:
+Replace the synchronous I/O with `fs.promises.readFile` and process files in parallel using `Promise.allSettled` with a concurrency limit of 5 to avoid overwhelming the system. Enqueue all file paths, process them in batches, and collect results while gracefully handling errors via `console.warn`.
+
+Benefits:
+The fix eliminates blocking I/O, allows concurrent file reads without degrading event loop responsiveness, and improves performance under load — especially for large repos — while using only primitives already available in the project (Node.js `fs.promises`).
