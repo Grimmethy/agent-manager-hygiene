@@ -275,3 +275,26 @@ Convert the synchronous loop to async/await using `fs.promises.readFile` and `Pr
 
 Benefits:
 The fix removes event loop blocking, transforming O(n) sequential I/O into O(1) parallel I/O — massively improving responsiveness and reducing startup time. The code remains functionally identical (same inputs, same outputs) but runs orders of magnitude faster under load. No new dependencies, no logging or metrics changes — just a refactoring using primitives already available.
+
+### AC-13 · Fix Synchronous Directory Traversal to Avoid Event Loop Blocking
+Strength: Strong
+Files: src/unused-export-scan.js
+Snippet:
+```
+  (function walk(dir) {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name.startsWith('.') || FILE_CORPUS_SKIP_DIRS.has(entry.name) || isArchivedDirName(entry.name)) continue;
+```
+
+Problem:  
+The synchronous `fs.readdirSync` call inside the loop blocks the Node.js event loop on every iteration, causing unbounded latency and poor responsiveness during directory scans — especially in large or deeply nested corpora. This is a real performance hazard that degrades user experience and system scalability, even without metrics or logging to measure it.
+
+Solution:  
+Replace `fs.readdirSync` with `fs.promises.readdir`, and refactor the traversal to use an async/await pattern with controlled concurrency (max 10 at a time) using a simple `inFlight` counter and `setTimeout` yielding. Process directories iteratively via a queue to avoid recursion depth issues and keep the event loop responsive without introducing new dependencies.
+
+Benefits:  
+The fix eliminates blocking I/O, allows the event loop to handle other operations concurrently, and scales gracefully with directory size — all while using only primitives already present in the project (Node.js `fs.promises`, `path`, `setTimeout`). No logging or metrics instrumentation is needed, and no new libraries are introduced.
