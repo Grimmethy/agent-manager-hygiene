@@ -512,3 +512,26 @@ Modify the `readText` function to log the error with context (file path and erro
 
 Benefits:
 Once fixed, any I/O failure during file reading will be logged to stderr and rethrown, ensuring the caller can detect and respond to the failure. This improves observability, enables debugging, and prevents silent data loss or incorrect export analysis — especially for files that are critical to the export scanning logic. The fix is minimal, safe, and matches the project’s logging capabilities.
+
+### AC-23 · Silent Error Swallowing in unusedExportInventory
+Strength: Strong
+Files: src/unused-export.js
+Snippet:
+```
+// Read-only inventory for the dashboard's Hygiene tab (see flag-inventory.js). Same id formula as nextUnusedExportTask.
+function unusedExportInventory({ pipelineDir, repoRoot, taskState }) {
+  let entries;
+  try { entries = JSON.parse(readIfExists(path.join(pipelineDir, 'queue', 'dead-code-flags.json')) || '[]'); } catch { entries = []; }
+  const flags = (Array.isArray(entries) ? entries : []).map((e) => ({
+    rule: 'unused-export', file: e.definedIn, line: 0, scannedAt: e.scannedAt,
+    detail: isFileEntry(e) ? `whole file -- ${(e.exports || []).length} export(s), no importer` : `${e.symbol} -- ${(e.callSites || []).length} call site(s)`,
+```
+
+Problem:
+The `try/catch` block in `unusedExportInventory` silently catches any error during `JSON.parse` or `readIfExists`, without logging or rethrowing. This means failures like file permission issues, corrupted JSON, or invalid paths are invisible to operators — and the function returns an empty array, potentially misleading dashboard hygiene data. Since the project has no metrics system, emitting a metric is impossible — but logging the error to stderr using `console.error` is sufficient and aligns with the project’s existing logging pattern.
+
+Solution:
+Replace the empty `catch` block with a `catch` that logs the error using `console.error` with context (file path and error message), then assigns an empty array. This preserves the function’s contract to return a list while making failures observable.
+
+Benefits:
+Operators can now detect and debug failures in reading the dead-code-flags.json file — preventing silent data corruption in the hygiene dashboard — without requiring metrics infrastructure or rethrowing exceptions that would break the caller’s flow.
