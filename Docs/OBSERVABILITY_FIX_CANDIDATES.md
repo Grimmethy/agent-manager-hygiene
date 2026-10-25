@@ -558,3 +558,26 @@ Log the caught error using `console.error` with context including `taskId`, `ent
 
 Benefits:  
 Once fixed, any error in `prefilter.decide(...)` will be visible in logs, enabling developers to detect and fix misconfigurations or bugs without relying on silent fallbacks. This improves the system’s robustness and maintainability by surfacing failures that would otherwise remain invisible.
+
+### AC-25 · Silent Error Swallowing in File Scanning Loop
+Strength: Strong
+Files: src/unused-export-scan.js
+Snippet:
+```
+                hits.push({ file: path.relative(repoRoot, fullPath).replace(/\\/g, '/'), line: lineNum });
+              }
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+```
+
+Problem:
+The `catch {}` block inside the `try` that reads each file silently discards any error thrown during `fs.readFileSync` — including permission errors, file corruption, or encoding mismatches — which could mask real file-system issues during the scan. Since this is a hygiene scanner (not a critical system), silently swallowing errors is dangerous because it hides potential problems in the codebase (e.g., a file that should exist but doesn’t, or a file that’s corrupted and thus falsely reported as “unused” or “missing”). The outer `catch {}` is not sufficient to cover this — it’s at the top level of the directory walk, but the inner `catch {}` is inside a loop over files, and if one file fails, the scanner continues, but the error is not logged or reported — which violates the principle of “fail fast” for hygiene tools that must report partial results, not just crash.
+
+Solution:
+Replace the empty `catch {}` block with a logging statement that prints the error with context to identify which file failed, and continue scanning — do not rethrow. This preserves the tool’s design to report partial results while surfacing observable failures to the user. Since the project has no metrics system, logging to `console.error` is the only available primitive.
+
+Benefits:
+Once fixed, the scanner will log any file-read failures with full context (file path and error message), allowing users to identify and address file-system issues without crashing or silently ignoring them. This improves observability and reliability of the hygiene scan, ensuring that partial results are reported and not lost in silence.
