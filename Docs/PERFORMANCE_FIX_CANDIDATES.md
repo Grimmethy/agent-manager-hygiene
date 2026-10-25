@@ -114,3 +114,26 @@ Replace the synchronous loop with `Promise.all` over an array of `fs.promises.re
 
 Benefits:  
 The scan becomes dramatically faster for large directories due to concurrent I/O. The event loop is no longer blocked, reducing perceived latency and improving throughput. The fix uses only existing primitives (`fs.promises`, `Promise.all`, `async/await`) — no new dependencies or APIs are required.
+
+### AC-6 · Parallelize Directory Scans to Avoid Blocking I/O
+Strength: Strong
+Files: src/proactive-file-decompose-sweep.js
+Snippet:
+```
+  const counts = { tier1: 0, tier2: 0 };
+  const dirs = ['pending', 'adhoc', 'drafting', 'review', 'approved', 'coordinating', 'done']
+    .map((d) => path.join(pipelineDir, 'queue', d));
+  for (const dir of dirs) {
+    let names;
+    try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')); } catch { continue; }
+    for (const name of names) {
+```
+
+Problem:  
+The current code uses `fs.readdirSync` in a loop over 7 directories, causing each directory scan to block the Node.js event loop sequentially. With hundreds or thousands of files per directory, this creates high latency and reduced throughput for the agent-manager-hygiene process. Since there’s no metrics or logging system to monitor or throttle this, performance degradation is invisible — especially if run frequently (e.g., on cron). The blocking nature of `fs.readdirSync` means the entire process waits for each directory read to complete before proceeding.
+
+Solution:  
+Replace `fs.readdirSync` with `fs.promises.readdir` and use `Promise.all` to run all 7 directory reads concurrently. Map the results into a flat list of files, then process them in a single loop. This eliminates the blocking I/O per directory and leverages the event loop’s concurrency for faster overall execution. Since the project runs on Node.js 18+ (widely adopted as of 2026), `fs.promises` is safe to use without adding new dependencies.
+
+Benefits:  
+The fix reduces latency and improves throughput by eliminating serial blocking I/O. The event loop remains responsive during directory scans, and since no new logging or metrics are added, the change is minimal and safe. The performance gain is immediate and measurable — especially for large directories — without requiring any new infrastructure or instrumentation.
