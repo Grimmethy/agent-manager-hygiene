@@ -229,3 +229,26 @@ Replace the synchronous loop with a single async read of all files using `fs.pro
 
 Benefits:
 The fix eliminates event loop blocking during file processing, dramatically improving responsiveness and reducing worst-case latency — especially critical for startup or backfill scenarios. It also future-proofs the code against performance degradation as file counts grow, without introducing new dependencies or changing behavior.
+
+### AC-11 · Fix Synchronous File Reads with Async Parallelization
+Strength: Strong
+Files: src/observability-scan.js
+Snippet:
+```
+
+function findMissingReservedAttributes(repoRoot, files) {
+  const found = new Set();
+  for (const file of files) {
+    let text;
+    try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
+    for (const attr of RESERVED_ATTRIBUTES) {
+```
+
+Problem:
+The current implementation uses `fs.readFileSync` inside a loop over potentially hundreds or thousands of files, causing each iteration to block the Node.js event loop. This leads to high latency, unresponsive behavior, or timeouts during long scans — especially in user-facing or server-side contexts where responsiveness is critical. The scanner correctly identifies this as a performance hazard because it’s not rate-limited or intentionally sequential — it’s a hot path that runs per file, and the blocking is unavoidable without async alternatives.
+
+Solution:
+Replace `fs.readFileSync` with `fs.promises.readFile` and refactor the loop to use `Promise.all` to run all file reads in parallel. Since the project has no async primitives beyond `fs.promises` (which is standard in Node.js v10+), this is safe and minimal. No new dependencies or APIs are added — only `fs.promises` is used, which is already present.
+
+Benefits:
+After the fix, the event loop remains responsive during file scans, eliminating the risk of timeouts or unresponsiveness. The scan completes faster in parallel, and the system remains stable under load — especially for large file lists — without requiring instrumentation or additional libraries.
