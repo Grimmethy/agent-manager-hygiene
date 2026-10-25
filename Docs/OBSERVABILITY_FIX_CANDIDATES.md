@@ -535,3 +535,26 @@ Replace the empty `catch` block with a `catch` that logs the error using `consol
 
 Benefits:
 Operators can now detect and debug failures in reading the dead-code-flags.json file — preventing silent data corruption in the hygiene dashboard — without requiring metrics infrastructure or rethrowing exceptions that would break the caller’s flow.
+
+### AC-24 · Silent Prefilter Error Swallowing
+Strength: Strong
+Files: src/unused-export.js
+Snippet:
+```
+    let decision;
+    try {
+      decision = prefilter.decide({ entry, taskId, exists: taskIdExistsInQueue, deadFiles, ledger: ledger || { seen: {}, dismissed: {} }, mode });
+    } catch {
+      decision = { action: taken ? 'skip' : 'create', id: taskId, stamp: null, dirty: false };   // fail open: behave as before
+    }
+    if (decision.dirty && ledger) ledgerDirty = true;
+```
+
+Problem:  
+The `try...catch` block around `prefilter.decide(...)` silently catches any error and assigns a fallback decision without logging or rethrowing. This masks real bugs or misconfigurations in the prefilter logic — for example, if `prefilter.decide` is called with invalid state or a missing dependency — and the error is never surfaced to operators or developers. Since the project has no metrics or telemetry system, the only way to observe such failures is through logging, which is currently absent.
+
+Solution:  
+Log the caught error using `console.error` with context including `taskId`, `entry`, and `mode` so that it can be debugged, while preserving the fallback behavior. The fix adds a contextual log before assigning the fallback decision, ensuring observability without fabricating metrics or rethrowing.
+
+Benefits:  
+Once fixed, any error in `prefilter.decide(...)` will be visible in logs, enabling developers to detect and fix misconfigurations or bugs without relying on silent fallbacks. This improves the system’s robustness and maintainability by surfacing failures that would otherwise remain invisible.
