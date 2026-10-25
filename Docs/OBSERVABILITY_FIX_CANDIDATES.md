@@ -581,3 +581,26 @@ Replace the empty `catch {}` block with a logging statement that prints the erro
 
 Benefits:
 Once fixed, the scanner will log any file-read failures with full context (file path and error message), allowing users to identify and address file-system issues without crashing or silently ignoring them. This improves observability and reliability of the hygiene scan, ensuring that partial results are reported and not lost in silence.
+
+### AC-26 · Silent Error Swallowing in File Scanner
+Strength: Strong
+Files: src/unused-export-scan.js
+Snippet:
+```
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  for (const root of searchRoots) {
+```
+
+Problem:
+The `catch {}` block around the file-reading logic (lines 288–294) silently discards any error thrown during `fs.readFileSync` or line parsing — such as permission issues, file corruption, or path resolution failures. Since there’s no logging or rethrow, the caller (e.g., the `walk` function or main loop) has no way to detect that a file was unreadable. This breaks observability: the scanner continues as if the file was processed, potentially leaving gaps in the scan or masking real file-system failures — especially since the surrounding code uses early-exit patterns (`return`) but no error propagation.
+
+Solution:
+Replace the empty `catch {}` with a block that logs the error with context (file path and error message) and rethrows it to surface to the caller. This preserves the early-exit pattern and ensures errors are not silently swallowed. The fix is scoped to the flagged block only — the outer `catch {}` remains untouched unless flagged separately.
+
+Benefits:
+Once fixed, the scanner will surface file-system failures via console.error, enabling humans to detect and debug unreadable files. This prevents silent gaps in the scan and ensures the traversal’s correctness is observable — even without metrics or telemetry — because the error is now logged and rethrown for the caller to handle.
