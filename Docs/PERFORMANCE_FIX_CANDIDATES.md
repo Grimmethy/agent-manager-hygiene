@@ -160,3 +160,26 @@ Replace the synchronous loop with `Promise.all` over `fs.promises.readFile`, wra
 
 Benefits:
 The event loop is no longer blocked per file read, allowing concurrent I/O and restoring responsiveness. The fix is architecturally sound and matches the scanner’s concern without introducing new dependencies or side effects. Memory usage may increase with large file sets, but this is a trade-off for eliminating the original blocking behavior — and the original code also suffered from the same memory pressure during reads.
+
+### AC-8 · Replace JSON.parse(JSON.stringify) with structuredClone for performance
+Strength: Strong
+Files: src/performance-scan.js
+Snippet:
+```
+  return findings;
+}
+
+// JSON.parse(JSON.stringify(x)) / json.loads(json.dumps(x)) is a common "deep clone"
+// idiom that pays for a full serialize+reparse of the whole structure -- wasteful on a
+// large/hot object compared to a real structural clone (structuredClone in JS,
+// copy.deepcopy in Python, or a targeted shallow copy).
+```
+
+Problem:  
+The current code uses `JSON.parse(JSON.stringify(...))` to deep clone objects, which incurs full serialization and deserialization overhead (O(n) per object) — especially costly in performance-critical paths or repeated operations. This is a well-known antipattern that blocks GC and increases CPU load in tight loops, even if the objects are small or shallow. The project runs on Node.js 17+, which supports `structuredClone`, a native, zero-overhead (in terms of serialization) alternative that preserves structure and is semantically equivalent for plain objects.
+
+Solution:  
+Replace the `JSON.parse(JSON.stringify(...))` call with `structuredClone(...)` — a direct, zero-cost semantic replacement. No additional dependencies or logic changes are required. The fix is atomic and scoped to this single call site.
+
+Benefits:  
+Eliminates the O(n) serialization cost per object, reducing CPU usage and GC pressure in performance-sensitive code. The fix is immediate, safe, and leverages a modern native API already available in the project’s environment.
