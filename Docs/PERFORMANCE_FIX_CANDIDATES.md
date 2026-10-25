@@ -137,3 +137,26 @@ Replace `fs.readdirSync` with `fs.promises.readdir` and use `Promise.all` to run
 
 Benefits:  
 The fix reduces latency and improves throughput by eliminating serial blocking I/O. The event loop remains responsive during directory scans, and since no new logging or metrics are added, the change is minimal and safe. The performance gain is immediate and measurable — especially for large directories — without requiring any new infrastructure or instrumentation.
+
+### AC-7 · Synchronous File Reads Block Event Loop
+Strength: Strong
+Files: src/function-length-scan.js
+Snippet:
+```
+  const findings = [];
+  const threshold = maxFunctionLines();
+
+  for (const file of allFiles) {
+    let text;
+    try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
+    if (isLikelyMinified(text)) continue;
+```
+
+Problem:
+Each iteration of the loop performs a synchronous `fs.readFileSync`, which blocks the Node.js event loop for the duration of each file read. With many files (even dozens), this creates cascading delays, starving concurrent I/O including HTTP, timers, or user events — especially critical if this runs in a hot path like startup or frequent scans. The loop is pure data-fetching with no concurrency control, making the blocking behavior a direct performance hazard.
+
+Solution:
+Replace the synchronous loop with `Promise.all` over `fs.promises.readFile`, wrapped in an async function. Each file read becomes an async operation, and `Promise.all` runs them concurrently. Skip failed reads silently, preserving the original behavior. This eliminates blocking I/O per iteration while using only Node.js primitives available since v18.
+
+Benefits:
+The event loop is no longer blocked per file read, allowing concurrent I/O and restoring responsiveness. The fix is architecturally sound and matches the scanner’s concern without introducing new dependencies or side effects. Memory usage may increase with large file sets, but this is a trade-off for eliminating the original blocking behavior — and the original code also suffered from the same memory pressure during reads.
