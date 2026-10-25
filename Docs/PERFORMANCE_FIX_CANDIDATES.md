@@ -206,3 +206,26 @@ Replace the synchronous I/O with `fs.promises.readFile` and process files in par
 
 Benefits:
 The fix eliminates blocking I/O, allows concurrent file reads without degrading event loop responsiveness, and improves performance under load — especially for large repos — while using only primitives already available in the project (Node.js `fs.promises`).
+
+### AC-10 · Fix Synchronous File I/O Loop with Async Parallelization
+Strength: Strong
+Files: src/decompose-move-determinism-backfill.js
+Snippet:
+```
+  const planSlug = hubDecomposedFrom.slice(HUB_PREFIX.length);
+  let names;
+  try { names = fs.readdirSync(requestsDir); } catch { return null; }
+  for (const f of names) {
+    if (!f.endsWith('.json')) continue;
+    let request;
+    try { request = JSON.parse(fs.readFileSync(path.join(requestsDir, f), 'utf8')); } catch { continue; }
+```
+
+Problem:
+The current code synchronously reads and parses each file one at a time using `fs.readdirSync` and `fs.readFileSync`, which blocks the event loop per file. In a worst-case scenario with 100+ files, this can cause hundreds of milliseconds of latency per iteration, leading to poor responsiveness and potential timeouts — especially if this loop runs during startup or frequent backfill operations. The synchronous nature prevents concurrent I/O and scales poorly with file count.
+
+Solution:
+Replace the synchronous loop with a single async read of all files using `fs.promises.readdir`, then process each `.json` file concurrently with `fs.promises.readFile` and `JSON.parse` inside `Promise.all`. This avoids blocking the event loop per file and reduces worst-case latency from O(n) synchronous I/O to O(1) async I/O + O(n) parallelism, while preserving the original logic’s semantics.
+
+Benefits:
+The fix eliminates event loop blocking during file processing, dramatically improving responsiveness and reducing worst-case latency — especially critical for startup or backfill scenarios. It also future-proofs the code against performance degradation as file counts grow, without introducing new dependencies or changing behavior.
