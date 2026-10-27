@@ -1,0 +1,9 @@
+{
+  "name": "unused-duplicate-fixture",
+  "dependencies": {
+    "foo": "1.0.0"
+  },
+  "devDependencies": {
+    "foo": "2.0.0"
+  }
+}

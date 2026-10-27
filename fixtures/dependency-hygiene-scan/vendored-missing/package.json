@@ -1,0 +1,6 @@
+{
+  "name": "vendored-missing-fixture",
+  "dependencies": {
+    "lodash": "^4.17.21"
+  }
+}
