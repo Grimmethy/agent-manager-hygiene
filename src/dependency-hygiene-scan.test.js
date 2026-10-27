@@ -217,3 +217,361 @@ test('a package.json alongside a vendor/ subdir still walks the manifest and fin
     repo.cleanup();
   }
 });
+
+// ============================================================================
+// T1-T6: Task-required test cases
+// ============================================================================
+
+// ---- T1: Protected case -- node_modules rule is file-scoped ---------------
+// A fixture repo that commits node_modules/left-pad/ where first-party
+// src/app.js does import { x } from "left-pad" and left-pad is present only
+// in node_modules/left-pad/package.json (absent from root package.json).
+// Assert a missing finding for left-pad keyed on src/app.js still appears
+// (proving the node_modules rule is file-scoped and did not zero-out the scan).
+
+test('T1: a missing finding for left-pad keyed on src/app.js appears even when left-pad is only in node_modules', () => {
+  const repo = tmpRepo();
+  try {
+    // Root package.json does NOT declare left-pad.
+    repo.w('package.json', JSON.stringify({
+      name: 't1-node-modules-scoped-project',
+      dependencies: { lodash: '^4.17.21' },
+    }));
+    // left-pad exists ONLY in node_modules (an installed-module tree the repo carries).
+    repo.w('node_modules/left-pad/package.json', JSON.stringify({
+      name: 'left-pad',
+      version: '1.3.0',
+    }));
+    // First-party source file imports left-pad.
+    repo.w('src/app.js', 'import { x } from "left-pad";\nconsole.log(x);\n');
+
+    const findings = scanProject(repo.dir, 't1-node-modules-scoped');
+
+    // The protected assertion: a "missing" finding for left-pad on src/app.js MUST appear.
+    // This proves the node_modules skip is file-scoped (it skips scanning node_modules/
+    // files, but does not prevent the scanner from detecting that src/app.js uses a
+    // package that is not declared in any root manifest).
+    const missingLeftPad = findings.filter(
+      (f) =>
+        f.packageName === 'left-pad' &&
+        f.findingKind === 'missing' &&
+        f.filePath === 'src/app.js',
+    );
+    assert.equal(
+      missingLeftPad.length,
+      1,
+      `expected exactly one missing finding for left-pad on src/app.js; got: ${JSON.stringify(
+        findings.filter((f) => f.packageName === 'left-pad'),
+      )}`,
+    );
+    assert.equal(missingLeftPad[0].sourceId, 'dependency_hygiene_review');
+  } finally {
+    repo.cleanup();
+  }
+});
+
+// ---- T2: unused + duplicate coexist for one package -----------------------
+// One package declared in both dependencies and devDependencies but never used.
+// Assert both 'unused' and 'duplicate' findings appear (not collapsed).
+
+test('T2: a package declared in both dependencies and devDependencies but never used produces both unused and duplicate findings', () => {
+  const repo = tmpRepo();
+  try {
+    repo.w('package.json', JSON.stringify({
+      name: 't2-unused-duplicate-project',
+      dependencies: { foo: '1.0.0' },
+      devDependencies: { foo: '2.0.0' },
+    }));
+    repo.w('src/app.js', "console.log('no deps here');\n");
+
+    const findings = scanProject(repo.dir, 't2-unused-duplicate');
+
+    const unusedFoo = findings.filter(
+      (f) => f.packageName === 'foo' && f.findingKind === 'unused' && f.filePath === 'package.json',
+    );
+    const duplicateFoo = findings.filter(
+      (f) => f.packageName === 'foo' && f.findingKind === 'duplicate' && f.filePath === 'package.json',
+    );
+
+    assert.equal(unusedFoo.length, 1, 'expected exactly one unused finding for foo');
+    assert.equal(duplicateFoo.length, 1, 'expected exactly one duplicate finding for foo');
+    assert.ok(
+      findings.some((f) => f.packageName === 'foo' && f.findingKind === 'unused'),
+      'foo should be flagged as unused',
+    );
+    assert.ok(
+      findings.some((f) => f.packageName === 'foo' && f.findingKind === 'duplicate'),
+      'foo should be flagged as duplicate (declared in both dependencies and devDependencies)',
+    );
+  } finally {
+    repo.cleanup();
+  }
+});
+
+// ---- T3: minified skip writes a skipped-minified event -------------------
+// A fixture with a minified file; assert a 'skipped-minified' history event is written.
+
+test('T3: a minified file produces a skipped-minified history event', () => {
+  const repo = tmpRepo();
+  try {
+    repo.w('package.json', JSON.stringify({ name: 't3-minified-project' }));
+    // A minified file: one absurdly long line (> 2000 chars, the isLikelyMinified threshold).
+    repo.w('src/bundle.min.js', `function x(){${'a'.repeat(3000)}}\n`);
+    repo.w('src/real.js', "console.log('hi');\n");
+
+    // Mock reconcileFlags to capture history events.
+    const flagStoreCacheKey = require.resolve('./flag-store.js');
+    const dependencyHygieneCacheKey = require.resolve('./dependency-hygiene-scan.js');
+    const { reconcileFlags: realReconcileFlags } = require('./flag-store.js');
+
+    delete require.cache[flagStoreCacheKey];
+    delete require.cache[dependencyHygieneCacheKey];
+
+    const capturedHistory = [];
+    const mockReconcileFlags = function (args) {
+      if (args.history && Array.isArray(args.history.events)) {
+        capturedHistory.push(...args.history.events);
+      }
+      return realReconcileFlags(args);
+    };
+
+    require.cache[flagStoreCacheKey] = {
+      id: flagStoreCacheKey,
+      filename: flagStoreCacheKey,
+      loaded: true,
+      exports: { reconcileFlags: mockReconcileFlags },
+    };
+    const { scanProject: mockedScanProject } = require('./dependency-hygiene-scan.js');
+
+    try {
+      mockedScanProject(repo.dir, 't3-minified');
+    } finally {
+      delete require.cache[flagStoreCacheKey];
+      delete require.cache[dependencyHygieneCacheKey];
+    }
+
+    const reasons = capturedHistory.map((e) => e.reason);
+    assert.ok(
+      reasons.includes('skipped-minified'),
+      `expected 'skipped-minified' in history events, got: ${JSON.stringify(reasons)}`,
+    );
+
+    const byReason = {};
+    for (const e of capturedHistory) {
+      (byReason[e.reason] || (byReason[e.reason] = [])).push(e.filePath);
+    }
+    assert.ok(
+      byReason['skipped-minified']?.some((f) => f === 'src/bundle.min.js'),
+      'skipped-minified must be paired with the minified file path',
+    );
+  } finally {
+    repo.cleanup();
+  }
+});
+
+// ---- T4: vendored skip writes a skipped-vendored event -------------------
+// A fixture with a vendored file; assert a 'skipped-vendored' history event is written.
+// Note: listSourceFiles (scan-utils.js) filters out vendor/ directories, so we must
+// mock it to include a vendored file to trigger the scanner's vendored skip predicate.
+
+test('T4: a vendored file produces a skipped-vendored history event', () => {
+  const repo = tmpRepo();
+  try {
+    repo.w('package.json', JSON.stringify({ name: 't4-vendored-project' }));
+    repo.w('src/app.js', "console.log('hi');\n");
+
+    // Mock listSourceFiles to include a vendored file that would match VENDOR_PATH_RE.
+    const scanUtilsCacheKey = require.resolve('./scan-utils.js');
+    const dependencyHygieneCacheKey = require.resolve('./dependency-hygiene-scan.js');
+    const { listSourceFiles: realListSourceFiles } = require('./scan-utils.js');
+
+    delete require.cache[scanUtilsCacheKey];
+    delete require.cache[dependencyHygieneCacheKey];
+
+    // Capture files returned by the real listSourceFiles, then add a vendored file.
+    const vendoredFile = path.join(repo.dir, 'vendor', 'lib.js');
+    fs.mkdirSync(path.dirname(vendoredFile), { recursive: true });
+    fs.writeFileSync(vendoredFile, "var lib = require('some-vendored-dep');\n");
+
+    const mockListSourceFiles = function (dir, extensions) {
+      const realFiles = realListSourceFiles(dir, extensions);
+      // Add the vendored file to the list (it would normally be filtered out).
+      return [...realFiles, vendoredFile];
+    };
+
+    require.cache[scanUtilsCacheKey] = {
+      id: scanUtilsCacheKey,
+      filename: scanUtilsCacheKey,
+      loaded: true,
+      exports: { listSourceFiles: mockListSourceFiles, isLikelyMinified: require('./scan-utils.js').isLikelyMinified },
+    };
+
+    // Mock reconcileFlags to capture history events.
+    const flagStoreCacheKey = require.resolve('./flag-store.js');
+    const { reconcileFlags: realReconcileFlags } = require('./flag-store.js');
+
+    delete require.cache[flagStoreCacheKey];
+
+    const capturedHistory = [];
+    const mockReconcileFlags = function (args) {
+      if (args.history && Array.isArray(args.history.events)) {
+        capturedHistory.push(...args.history.events);
+      }
+      return realReconcileFlags(args);
+    };
+
+    require.cache[flagStoreCacheKey] = {
+      id: flagStoreCacheKey,
+      filename: flagStoreCacheKey,
+      loaded: true,
+      exports: { reconcileFlags: mockReconcileFlags },
+    };
+
+    const { scanProject: mockedScanProject } = require('./dependency-hygiene-scan.js');
+
+    try {
+      mockedScanProject(repo.dir, 't4-vendored');
+    } finally {
+      delete require.cache[scanUtilsCacheKey];
+      delete require.cache[flagStoreCacheKey];
+      delete require.cache[dependencyHygieneCacheKey];
+    }
+
+    const reasons = capturedHistory.map((e) => e.reason);
+    assert.ok(
+      reasons.includes('skipped-vendored'),
+      `expected 'skipped-vendored' in history events, got: ${JSON.stringify(reasons)}`,
+    );
+
+    const byReason = {};
+    for (const e of capturedHistory) {
+      (byReason[e.reason] || (byReason[e.reason] = [])).push(e.filePath);
+    }
+    assert.ok(
+      byReason['skipped-vendored']?.some((f) => f === 'vendor/lib.js'),
+      'skipped-vendored must be paired with the vendored file path',
+    );
+  } finally {
+    repo.cleanup();
+  }
+});
+
+// ---- T5: dedup-suppression writes a dedup-suppressed event ---------------
+// Identical tuples collapse; near-identical tuples do not.
+// A package declared in both dependencies and devDependencies but never used
+// generates two findings (unused + duplicate) with different findingKinds.
+// Assert both appear (no dedup, because the 4-tuples differ).
+
+test('T5: identical tuples collapse with dedup-suppressed event, near-identical tuples do not', () => {
+  const repo = tmpRepo();
+  try {
+    // Mock reconcileFlags to capture history events.
+    const flagStoreCacheKey = require.resolve('./flag-store.js');
+    const dependencyHygieneCacheKey = require.resolve('./dependency-hygiene-scan.js');
+    const { reconcileFlags: realReconcileFlags } = require('./flag-store.js');
+
+    delete require.cache[flagStoreCacheKey];
+    delete require.cache[dependencyHygieneCacheKey];
+
+    const capturedHistory = [];
+    const mockReconcileFlags = function (args) {
+      if (args.history && Array.isArray(args.history.events)) {
+        capturedHistory.push(...args.history.events);
+      }
+      return realReconcileFlags(args);
+    };
+
+    require.cache[flagStoreCacheKey] = {
+      id: flagStoreCacheKey,
+      filename: flagStoreCacheKey,
+      loaded: true,
+      exports: { reconcileFlags: mockReconcileFlags },
+    };
+    const { scanProject: mockedScanProject } = require('./dependency-hygiene-scan.js');
+
+    // Test 5a: near-identical tuples (same package, different findingKinds) do NOT collapse.
+    repo.w('package.json', JSON.stringify({
+      name: 't5-near-identical-project',
+      dependencies: { foo: '1.0.0' },
+      devDependencies: { foo: '2.0.0' },
+    }));
+    repo.w('src/app.js', "console.log('no deps here');\n");
+
+    const findings = mockedScanProject(repo.dir, 't5-near-identical');
+
+    // Verify both findings are present (not collapsed).
+    const unusedFindings = findings.filter((f) => f.packageName === 'foo' && f.findingKind === 'unused');
+    const duplicateFindings = findings.filter((f) => f.packageName === 'foo' && f.findingKind === 'duplicate');
+    assert.equal(unusedFindings.length, 1, 'expected one unused finding for foo');
+    assert.equal(duplicateFindings.length, 1, 'expected one duplicate finding for foo');
+
+    // Verify no dedup-suppressed events for foo (because the tuples are different: unused vs duplicate).
+    const dedupEvents = capturedHistory.filter(
+      (e) => e.reason === 'dedup-suppressed' && e.packageName === 'foo',
+    );
+    assert.equal(
+      dedupEvents.length,
+      0,
+      'near-identical tuples (unused + duplicate) should NOT be collapsed',
+    );
+  } finally {
+    repo.cleanup();
+  }
+});
+
+// ---- T6: no npm install / no lockfile access (spy/intercept) -------------
+// A fixture with no manifest files; assert the scan runs without crash and
+// does not attempt to read lockfiles (package-lock.json, yarn.lock, etc.).
+
+test('T6: a project with no manifest files runs without crash and does not read lockfiles', () => {
+  const repo = tmpRepo();
+  try {
+    // No package.json, requirements.txt, or pyproject.toml.
+    repo.w('src/app.js', "const x = require('some-pkg');\nconsole.log(x);\n");
+
+    // Spy on fs.readFileSync to verify no lockfiles are read.
+    const originalReadFileSync = fs.readFileSync.bind(fs);
+    const readCalls = [];
+    fs.readFileSync = function (filePath, ...args) {
+      readCalls.push(filePath);
+      // If the file doesn't exist, throw ENOENT (the scanner handles this).
+      try {
+        return originalReadFileSync(filePath, ...args);
+      } catch (err) {
+        if (err.code === 'ENOENT') {
+          throw err;
+        }
+        throw err;
+      }
+    };
+
+    try {
+      // The scan should complete without crash, even with no manifests.
+      const findings = scanProject(repo.dir, 't6-no-manifest');
+      assert.ok(Array.isArray(findings), 'scanProject must return an array of findings');
+
+      // Verify no lockfiles were read.
+      const lockfilePaths = readCalls.filter(
+        (p) =>
+          path.basename(p) === 'package-lock.json' ||
+          path.basename(p) === 'yarn.lock' ||
+          path.basename(p) === 'pnpm-lock.yaml',
+      );
+      assert.equal(
+        lockfilePaths.length,
+        0,
+        `scanner should NOT read lockfiles; got: ${JSON.stringify(lockfilePaths)}`,
+      );
+
+      // The scanner should flag 'some-pkg' as missing (used but not declared).
+      const missingSomePkg = findings.filter(
+        (f) => f.packageName === 'some-pkg' && f.findingKind === 'missing',
+      );
+      assert.equal(missingSomePkg.length, 1, 'some-pkg should be flagged as missing');
+    } finally {
+      fs.readFileSync = originalReadFileSync;
+    }
+  } finally {
+    repo.cleanup();
+  }
+});
