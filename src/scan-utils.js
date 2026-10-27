@@ -313,6 +313,90 @@ function extractIndentedBlock(text, headerStartIndex) {
   return { body, endIndex: endIndex - 1, lineCount: lastRealLine - headerLineIdx + 1 };
 }
 
+// A path (repo-relative, forward slashes) that lives under a vendor/ or static/vendor/
+// directory is third-party / vendored code -- never a project's own reviewable source.
+// Same heuristic as the archived-dir rule but for external code: the naming consistency
+// scanner (and any future hygiene rule that cares about project-owned identifiers) should
+// skip vendored paths entirely, since those follow someone else's style guide.
+function isVendoredPath(relPath) {
+  const p = String(relPath || '');
+  return /(^|\/)vendor\//.test(p) || /(^|\/)static\/vendor\//.test(p);
+}
+
+// Extracts function declarations, variable declarations, class declarations, method
+// definitions, and arrow function assignments from source text. Returns an array of
+// {name, line, column, kind} objects, deduplicated by (name, kind) pair. Used by naming
+// consistency scanners to identify all identifiers in a file for cross-reference checks.
+//
+// Regex-based (not a parser) -- same tradeoff as every other rule in this toolkit:
+// false positives/negatives are expected and filtered at review time.
+function extractIdentifiers(text) {
+  const results = [];
+  const seen = new Set();
+
+  // Patterns for different identifier kinds
+  const patterns = [
+    // Function declarations: function name(...)
+    { re: /\bfunction\s+([A-Za-z_$][\w$]*)\s*\(/g, kind: 'function' },
+    // Arrow function assignments: const/let/var name = ... =>
+    { re: /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?\([^)]*\)\s*=>/g, kind: 'arrow' },
+    // Class declarations: class Name
+    { re: /\bclass\s+([A-Za-z_$][\w$]*)\s*(?:{|extends)/g, kind: 'class' },
+    // Method definitions: name(...) { (inside class body)
+    { re: /\b([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{/g, kind: 'method' },
+    // Variable declarations: const/let/var name =
+    { re: /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/g, kind: 'variable' },
+  ];
+
+  for (const { re, kind } of patterns) {
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(text))) {
+      const name = m[1];
+      const key = `${name}:${kind}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const line = lineOfIndex(text, m.index);
+      const column = m.index - text.lastIndexOf('\n', m.index - 1) - 1;
+      results.push({ name, line, column, kind });
+    }
+  }
+
+  return results;
+}
+
+// Detects mixed naming conventions (camelCase vs snake_case) in identifiers.
+// Returns true if consistent, false if mixed. Classes are excluded (typically PascalCase).
+// Used by naming consistency scanner to flag files with inconsistent style.
+function isNamingConsistent(text) {
+  const identifiers = extractIdentifiers(text);
+  const camelCase = [];
+  const snakeCase = [];
+
+  for (const { name, kind } of identifiers) {
+    // Skip classes (PascalCase is expected)
+    if (kind === 'class') continue;
+    // Skip single-character names
+    if (name.length <= 1) continue;
+    // Skip names with underscores at start/end (private/protected convention)
+    if (name.startsWith('_') || name.endsWith('_')) continue;
+
+    if (/[a-z][A-Z]/.test(name)) {
+      camelCase.push(name);
+    } else if (/_/.test(name)) {
+      snakeCase.push(name);
+    }
+  }
+
+  // If both camelCase and snake_case are present, it's inconsistent
+  if (camelCase.length > 0 && snakeCase.length > 0) {
+    return false;
+  }
+
+  return true;
+}
+
 module.exports = {
   listSourceFiles,
   isLikelyMinified,
@@ -326,4 +410,7 @@ module.exports = {
   MINIFIED_LINE_LENGTH_THRESHOLD,
   SKIP_DIRS,
   isArchivedDirName,
+  isVendoredPath,
+  extractIdentifiers,
+  isNamingConsistent,
 };
