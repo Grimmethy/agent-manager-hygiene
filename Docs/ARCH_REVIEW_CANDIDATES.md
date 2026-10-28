@@ -136,3 +136,29 @@ Benefits:
 Reviewers (human or agent) are no longer misled by a capability block that looks valid but is actually empty or stale. Config failures become visible and actionable instead of silently producing wrong output. The sentinel gives downstream code a clear decision point: proceed with a known-good marker, or abort rather than act on untrustworthy data.
 
 NOTE: The independent review's CRITIQUE section concluded "NO ISSUES FOUND" after verifying all three claims against the source file and dismissing the pre-check "missing-file" signals as not real problems; no flags were applied.
+
+### AC-16 · Inconsistent extraction between arch_discovery and arch_import task sources
+Strength: Strong
+Files: src/arch.js
+
+Problem:
+`nextArchDiscoveryTask` is properly decomposed into extracted helpers (`loadGraph`, `selectBudgetedCommunityFiles`, `communityContentHash`, `buildArchDiscoveryTaskForCommunity`, `sortedCommunitiesByCoverage`, `legacyTaskId`, `readDirtySignals`, `clearDirtySignal`, `isCommunityCovered`), each with its own comment explaining its purpose and extraction history. `nextArchImportTask` keeps all JSON I/O (`JSON.parse` of `deepDiveCoveragePath` and `importCoveragePath`), file scanning (readdirSync, block splitting), and candidate-building logic inline within the function body. This means the JSON parsing and coverage-checking logic can't be tested or verified independently, the function is larger and more complex than necessary, and there's no way to reuse the coverage-update logic without duplicating it elsewhere. This inconsistency creates a maintenance hazard: the arch_import path is harder to understand, test, and modify than the arch_discovery path, despite being equally important.
+
+Solution:
+Extract the inline logic from `nextArchImportTask` into dedicated helpers: `parseCoverageFile` (parses JSON from a coverage file path), `readImportCandidates` (reads and filters import candidates from the import directory), and `buildImportCandidate` (constructs a candidate object from parsed data). Add comments explaining each helper's purpose and relationship to `nextArchImportTask`. Mirror the extraction pattern used in `nextArchDiscoveryTask`.
+
+Benefits:
+The arch_import path becomes as maintainable and testable as the arch_discovery path. Each helper can be unit-tested in isolation, the main function becomes a clear orchestration of smaller steps, and future changes to coverage parsing or candidate building are localized to their respective helpers.
+
+### AC-17 · Dirty signal file documentation claims single-writer semantics that the code violates
+Strength: Strong
+Files: src/arch.js
+
+Problem:
+The comment block for `readDirtySignals` states: "Read-only here -- arch.js never writes this file, only change_review does, so there's exactly one writer and no read-modify-write race between the two plugins' independent per-tick invocations." But `clearDirtySignal` in the same file writes to `communityDirtySignalsPath`: `function clearDirtySignal(communityDirtySignalsPath, communityId) { const signals = readDirtySignals(communityDirtySignalsPath); const key = String(communityId); if (!(key in signals)) return; delete signals[key]; writeJsonAtomicSync(communityDirtySignalsPath, signals); }`. This creates two writers to the same file: `change_review` (documented as the only writer) adds dirty flags, and `arch.js` via `clearDirtySignal` removes dirty flags. Both perform read-modify-write on the same JSON file. Even with atomic writes, there's a race: if `change_review` writes while `arch.js` is reading, `arch.js`'s read gets stale data and could clear a flag that was just set by a newer commit. The documentation's claim of "no read-modify-write race" is false, which misleads future readers about the file's concurrency properties and could cause someone to add code assuming single-writer semantics, creating bugs.
+
+Solution:
+Update the comment block for `readDirtySignals` to accurately reflect the dual-writer reality: "This file is read by arch.js and written by both change_review (additive dirty flags) and arch.js via clearDirtySignal (subtractive). Both perform read-modify-write, so there is a potential race condition if they interleave within a tick." Additionally, consider adding a comment to `clearDirtySignal` noting its write semantics and the race window. If the race is acceptable (e.g., both operations are idempotent and the worst case is a stale flag), document this explicitly. If not, explore a coordination mechanism (file locking, a single-writer proxy, or atomic compare-and-swap).
+
+Benefits:
+The documentation now accurately reflects the code's behavior, preventing future readers from making incorrect assumptions about single-writer semantics. This reduces the risk of introducing bugs when modifying either writer. If the race is acceptable, the documentation makes this explicit; if not, it prompts investigation into proper coordination.
