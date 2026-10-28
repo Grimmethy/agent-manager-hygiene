@@ -95,3 +95,44 @@ Benefits:
 The failure path becomes testable with the same `'/nope'`-sentinel pattern used everywhere else in the suite, eliminating the need for `mkdtempSync`/`writeFileSync` scaffolding in those tests. The `repoRoot` parameter is removed from the function signature, eliminating the conditional-relevance footgun where a forgotten argument causes a hard crash. The module's existing design principle—pure-data reconciliation with narrow, explicit escape hatches for I/O—is applied uniformly, and the test surface shrinks to a single, consistent injection contract.
 
 NOTE: Flag #2 was not applied because the critique's claim that the draft's "silent data loss" mechanism was technically inaccurate was correct, but the critique's assertion that the proposed solution was a "marginal stylistic change" that failed to solve the "conditional parameter" issue was incorrect. The proposed solution *does* solve the conditional parameter issue by removing `repoRoot` from the function signature entirely, allowing the caller to handle the I/O context via closure, which is a valid architectural improvement consistent with the existing `isSuppressed` pattern. The draft's original error was in describing the *failure mode* of the *old* code (silent false vs. crash), which has been corrected in this version.
+
+### AC-13 · Extract responsibilities from `nextPerformanceReviewTask` into focused sub-functions
+Strength: Strong
+Files: src/performance-review.js
+
+Problem:
+`nextPerformanceReviewTask` simultaneously reads coverage state and decides whether a rescan is due, invokes the scanner, reconciles the persistent flag backlog against fresh findings, writes coverage and flags JSON to disk, sorts/filters/suppresses flags, and selects the next task to emit. This single-responsibility violation means a failure mid-scan leaves coverage state inconsistent, the function is hard to unit-test because every sub-responsibility needs its own fixtures, and any change to one concern (e.g. the suppression check) requires re-reading the whole function to verify it doesn't affect the others. The scanning + reconciliation logic and the task-selection logic should be separate.
+
+Solution:
+Split `nextPerformanceReviewTask` into a small pipeline of pure or narrowly-scoped helpers: (1) `shouldRescan(lastScannedAt, now)` for the rescan-interval decision, (2) `scanCoverage(scanner, repoRoot)` for the scanner invocation, (3) `reconcileFlags(existingFlags, freshFlags)` for the flag reconciliation step, (4) `persistCoverageAndFlags(coverage, flags)` for the disk write, (5) `applySuppressionAndSort(flags, suppressed)` for filtering/suppression/sorting, and (6) `selectNextTask(flags, coverage)` for the final task selection. The top-level function becomes a thin orchestrator that threads state through these helpers in order, with each helper independently testable and each failure mode isolated to its own stage.
+
+Benefits:
+Each sub-function can be unit-tested in isolation with minimal fixtures, a failure at any stage no longer corrupts downstream state, and future changes to one concern (e.g. swapping the suppression strategy) no longer require re-reading unrelated logic. The orchestrator becomes a clear contract that documents the pipeline order, making the review loop easier to reason about and extend.
+
+### AC-14 · Consolidate structural duplication between `performance-review.js` and `observability-review.js`
+Strength: Strong
+Files: src/performance-review.js, src/observability-review.js
+
+Problem:
+The two files are an "exact structural mirror" of each other — same `lastScannedAt` / rescan-interval / dedupe / prune shape, swapped only to a different scanner and coverage files. Every concern is duplicated verbatim between them: the `RESCAN_INTERVAL_MS` constant, the `slugifyForId` helper, the `findingIsSuppressed` helper, the `capabilityProfileBlock` helper, the `assemblePrompt` helper, the `SNIPPET_BEFORE`/`SNIPPET_AFTER` constants, the `reconcileFlags` call shape, the `applyArchDiscoveryCandidates` integration, the `recordFalsePositiveIfVerdict` / `recordInconclusiveReview` / `classifyReviewOutcome` triad, the `groundingFields` / `advisoryProse` / `reviewGuidance` registration shape, and the `directToMain: true` flag. Adding a new hygiene plugin means copy-pasting ~70% of an existing one and swapping a handful of identifiers — every bug fix, behavior change, or API shift in one file must be manually replicated in the other, and drift between them is inevitable.
+
+Solution:
+Extract the shared scaffolding into a single reusable module (e.g. `src/review-lib.js`) parameterized by the scanner, coverage-file paths, and any domain-specific prompt fragments. The shared pieces — `RESCAN_INTERVAL_MS`, `slugifyForId`, `findingIsSuppressed`, `capabilityProfileBlock`, `assemblePrompt`, `SNIPPET_BEFORE`/`SNIPPET_AFTER`, `reconcileFlags`, `applyArchDiscoveryCandidates`, the `recordFalsePositiveIfVerdict` / `recordInconclusiveReview` / `classifyReviewOutcome` triad, the `groundingFields` / `advisoryProse` / `reviewGuidance` registration shape, and the `directToMain: true` flag — all move into the library. Each review file then becomes a thin adapter that supplies its scanner and file paths to the shared pipeline. A small regression test suite against the library covers the shared behavior once, for both reviewers.
+
+Benefits:
+A bug fix or behavior change in the shared logic is applied in one place and immediately correct for both reviewers. Adding a new hygiene plugin no longer requires copy-paste; it becomes a matter of wiring a new adapter. Drift between the two files becomes structurally impossible, and the test surface shrinks because the shared behavior is exercised once rather than duplicated.
+
+### AC-15 · Surface `capabilityProfileBlock` failures instead of silently swallowing them
+Strength: Strong
+Files: src/performance-review.js
+
+Problem:
+`capabilityProfileBlock` calls `require('agent-manager/src/config.js').getConfig()` and catches all exceptions, falling back to `projectCapabilityProfile(null, ...)`. If the config file is missing, malformed, or the repo root is wrong, the prompt sent to the LLM will include a capability block that may be empty, from a different project context, or silently incomplete — with no log line, no warning, and no way for the reviewer (human or agent) to know the data is untrustworthy. The header comment acknowledges the project "can't support" certain primitives, making this capability block the gatekeeper for whether a proposed fix is feasible — and that gate is silently bypassed on any config failure.
+
+Solution:
+Replace the blanket `catch` with a structured error path: log a clear warning (e.g. `warn('capability-profile unavailable: %s', err.message)`) and return an explicit sentinel such as `{ status: 'unavailable', reason: err.message }` rather than silently falling back to `projectCapabilityProfile(null, ...)`. Downstream code in `assemblePrompt` should check for the sentinel and either omit the capability block with a documented note, or refuse to emit the prompt and surface the failure up the call stack so the reviewer knows the data is untrustworthy. Add a unit test that exercises the failure path to ensure the sentinel propagates correctly.
+
+Benefits:
+Reviewers (human or agent) are no longer misled by a capability block that looks valid but is actually empty or stale. Config failures become visible and actionable instead of silently producing wrong output. The sentinel gives downstream code a clear decision point: proceed with a known-good marker, or abort rather than act on untrustworthy data.
+
+NOTE: The independent review's CRITIQUE section concluded "NO ISSUES FOUND" after verifying all three claims against the source file and dismissing the pre-check "missing-file" signals as not real problems; no flags were applied.
