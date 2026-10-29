@@ -473,7 +473,8 @@ function applyArchImportCandidate({ implementResponse, candidatesPath, importCov
   let coverage;
   try {
     coverage = JSON.parse(fs.existsSync(importCoveragePath) ? fs.readFileSync(importCoveragePath, 'utf8') : '{"items":{}}');
-  } catch {
+  } catch (err) {
+    console.error('applyArchImportCandidate: failed to parse import coverage file at', importCoveragePath, 'for item', itemId, 'from', sourceProject, '--', err && err.message ? err.message : err, '; falling back to empty coverage');
     coverage = { items: {} };
   }
   if (!coverage.items) coverage.items = {};
