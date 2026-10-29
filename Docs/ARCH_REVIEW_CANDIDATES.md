@@ -96,6 +96,34 @@ The failure path becomes testable with the same `'/nope'`-sentinel pattern used 
 
 NOTE: Flag #2 was not applied because the critique's claim that the draft's "silent data loss" mechanism was technically inaccurate was correct, but the critique's assertion that the proposed solution was a "marginal stylistic change" that failed to solve the "conditional parameter" issue was incorrect. The proposed solution *does* solve the conditional parameter issue by removing `repoRoot` from the function signature entirely, allowing the caller to handle the I/O context via closure, which is a valid architectural improvement consistent with the existing `isSuppressed` pattern. The draft's original error was in describing the *failure mode* of the *old* code (silent false vs. crash), which has been corrected in this version.
 
+### AC-11 · AC-10a: Inject fileExists predicate into reconcileFlags
+Strength: Strong
+Split-Depth: 1
+Files: src/flag-store.js
+
+Problem:
+reconcileFlags hardcodes fs.existsSync(path.join(repoRoot, f.file)) in the scanOk:false branch, coupling the function to filesystem I/O and making the failure path hard to test without scaffolding.
+
+Solution:
+Add an optional fileExists callback parameter (default () => false), remove the repoRoot parameter, and replace the hardcoded call with fileExists(f.file).
+
+Benefits:
+Eliminates hidden I/O, enables trivial mocking in tests, and lets callers supply their own file-exists semantics.
+
+### AC-12 · AC-10b: Update flag-store tests to use fileExists injection
+Strength: Strong
+Split-Depth: 1
+Files: src/flag-store.test.js
+Depends-On: AC-11
+
+Problem:
+Tests for the scanOk:false path use fs.mkdtempSync/writeFileSync to create temp files, which is unnecessary now that fileExists is injectable. All calls still pass repoRoot.
+
+Solution:
+Replace the temp-file tests with ones that pass a fileExists mock (e.g., returns false for pruned files). Remove repoRoot from all calls.
+
+Benefits:
+Tests no longer touch the filesystem, run faster, and directly verify the injection contract.
 ### AC-13 · Extract responsibilities from `nextPerformanceReviewTask` into focused sub-functions
 Strength: Strong
 Files: src/performance-review.js
