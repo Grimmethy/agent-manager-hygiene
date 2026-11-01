@@ -344,3 +344,26 @@ Replace the synchronous `fs.readdirSync` with `fs.promises.readdir` and use `Pro
 
 Benefits:  
 The fix reduces latency and improves throughput by eliminating synchronous blocking. Directory traversal becomes non-blocking and scalable, especially for large trees. The event loop remains responsive, and the code remains compatible with existing logging (via `console.warn`) and error handling.
+
+### AC-16 · Batch Sync I/O to Reduce Event Loop Blocking
+Strength: Strong
+Files: src/proactive-file-decompose-sweep.js
+Snippet:
+```
+  const reqDir = path.join(resolvedPipelineDir, 'queue', 'file-decompose-requests');
+  let filedThisRun = 0;
+
+  for (const targetFile of oversized) {
+    if (filedThisRun >= MAX_FILES_PER_RUN) break;
+    summary.checked += 1;
+
+```
+
+Problem:  
+The synchronous I/O operation inside the loop over `oversized` blocks the Node.js event loop on every iteration. With many files, this causes degraded responsiveness, potential timeouts under load, and unbounded memory growth due to repeated blocking operations — even if the project lacks async primitives or metrics to throttle or measure.
+
+Solution:  
+Restructure the loop to process files in batches of 10 using a `for` loop to group `oversized` into chunks. For each batch, run the sync I/O once per batch — not per file — to reduce the number of blocking operations from N to ceil(N / 10). This avoids re-entering the sync I/O per file while preserving the existing logic flow.
+
+Benefits:  
+The event loop is blocked fewer times, reducing the risk of timeout or hang under load. Memory growth is mitigated by limiting the number of sync calls. The fix uses only synchronous primitives and existing code structure — no async, no new dependencies, no logging/metrics — and is fully compatible with the project’s current capabilities.
