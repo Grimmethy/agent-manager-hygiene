@@ -367,3 +367,26 @@ Restructure the loop to process files in batches of 10 using a `for` loop to gro
 
 Benefits:  
 The event loop is blocked fewer times, reducing the risk of timeout or hang under load. Memory growth is mitigated by limiting the number of sync calls. The fix uses only synchronous primitives and existing code structure — no async, no new dependencies, no logging/metrics — and is fully compatible with the project’s current capabilities.
+
+### AC-17 · Fix Blocking File Reads in Scan Loop
+Strength: Strong
+Files: src/unused-export-scan.js
+Snippet:
+```
+  let fileLevel = 0;
+  let corpus = null; // every text file under repoRoot, read once and only if a file has exports with no external call sites
+  const scannedAt = new Date().toISOString();
+  for (const dir of scanRoots) {
+    for (const file of listSourceFiles(dir, DEFINE_EXTENSIONS)) {
+      if (file.endsWith('.d.ts')) continue; // ambient declarations, not definitions
+      let fileText = null; // read lazily, once per file
+```
+
+Problem:
+The synchronous `fs.readFileSync` call inside the loop blocks the Node.js event loop on every iteration, causing unacceptable latency under high file counts. With hundreds or thousands of files, this results in hundreds or thousands of blocking I/O operations, starving the event loop and degrading responsiveness — especially in long-running or high-concurrency scenarios.
+
+Solution:
+Replace the sync loop with async parallel reads using `fs.promises.readFile` and `Promise.all`. Pre-fetch all file contents concurrently, then process them in a single pass after all reads complete. This eliminates the blocking I/O per iteration and restores event loop responsiveness.
+
+Benefits:
+The fix reduces latency by eliminating synchronous I/O from the loop, allowing the event loop to handle other tasks. It scales linearly with file count (due to parallelism) rather than sequentially, and requires no new dependencies — only `fs.promises` and `Promise`, both available in Node.js core.
