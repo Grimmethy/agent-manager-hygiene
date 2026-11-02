@@ -390,3 +390,26 @@ Replace the sync loop with async parallel reads using `fs.promises.readFile` and
 
 Benefits:
 The fix reduces latency by eliminating synchronous I/O from the loop, allowing the event loop to handle other tasks. It scales linearly with file count (due to parallelism) rather than sequentially, and requires no new dependencies — only `fs.promises` and `Promise`, both available in Node.js core.
+
+### AC-18 · Fix Synchronous File Reads in Loop
+Strength: Strong
+Files: src/observability-scan.js
+Snippet:
+```
+  const scannedAt = new Date().toISOString();
+  const findings = [];
+
+  for (const file of files) {
+    let text;
+    try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
+    const relPath = path.relative(clonePath, file).replace(/\\/g, '/');
+```
+
+Problem:
+The current code uses `fs.readFileSync` inside a loop over `files`, which causes each I/O operation to block the Node.js event loop. In a real-world observability scan, this loop may run over hundreds or thousands of files — leading to severe latency, reduced throughput, and potential timeouts or degraded UX for concurrent operations. The performance cost is directly proportional to the number of files, as each synchronous read halts the event loop until completion.
+
+Solution:
+Replace `fs.readFileSync` with `fs.promises.readFile` and convert the loop to use `Promise.all` to read all files concurrently. This avoids blocking per-file I/O and leverages Node.js’s async I/O primitives. Since the project’s dependency manifest does not restrict Node.js version and `fs.promises` is available in Node.js 18+, this change is safe and implementable without adding new dependencies.
+
+Benefits:
+After the fix, the scan will complete significantly faster, especially for large file sets, because I/O operations run in parallel rather than sequentially. The event loop remains responsive, preventing timeouts or degraded UX in concurrent or long-running scans. No metrics or logging system is needed — the fix is purely performance-oriented and uses only existing primitives.
