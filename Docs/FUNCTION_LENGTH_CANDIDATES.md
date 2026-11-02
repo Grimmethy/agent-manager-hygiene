@@ -1300,3 +1300,147 @@ Extract the initial `registerTaskSource` logic into `registerTaskSourceWithConfi
 
 Benefits:
 Decomposing this function reduces cognitive load for developers, enables unit testing of individual responsibilities (e.g., testing deduplication logic without running full registration), and makes future modifications safer — changes to one concern won’t require navigating a 110-line monolith. This also improves code review by isolating changes to specific logical units.
+
+### AC-188 · Decompose Long Lexical Scanner
+Strength: Strong
+Files: src/decompose-node-module.js
+Symbol: locallyBoundNames
+Snippet:
+```
+// dependency lived in a default param, got treated as a local, slipped the check, and the
+// merged split threw ReferenceError at call time).
+function locallyBoundNames(code) {
+  const clean = stripStringsAndComments(code);
+  const names = new Set();
+  let m;
+
+  // const/let/var -- simple `= ` (name before the first `=`) and destructuring patterns
+  // (one level of nesting handled explicitly, since regex can't balance braces).
+  const declRe = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?==|;|\bin\b|\bof\b|$)/g;
+  while ((m = declRe.exec(clean))) names.add(m[1]);
+  const declPatRe = /\b(?:const|let|var)\s*(\{(?:[^{}]|\{[^{}]*\})*\}|\[(?:[^[\]]|\[[^[\]]*\])*\])\s*=/g;
+  while ((m = declPatRe.exec(clean))) for (const n of bindingNamesFromPattern(m[1])) names.add(n);
+
+  // function name(<params>) and (<params>) =>
+  const paramGroups = [];
+  const fnRe = /\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)?\s*\(([\s\S]*?)\)\s*\{/g;
+  while ((m = fnRe.exec(clean))) { if (m[1]) names.add(m[1]); paramGroups.push(m[2]); }
+  const arrowRe = /\(([\s\S]*?)\)\s*=>/g;
+  while ((m = arrowRe.exec(clean))) paramGroups.push(m[1]);
+  for (const g of paramGroups) for (const part of splitTopLevel(g)) for (const n of bindingNamesFromPattern(part)) names.add(n);
+
+  // single-identifier arrow: `x => ...`
+  const singleArrowRe = /(?:^|[^\w$)."'`])\s*([A-Za-z_$][\w$]*)\s*=>/g;
+  while ((m = singleArrowRe.exec(clean))) names.add(m[1]);
+
+  // for (const X of ...) / for (X = ...) / catch (e)
+  const forRe = /\bfor\s*\(\s*(?:const|let|var)?\s*([{[][\s\S]*?[}\]]|[A-Za-z_$][\w$]*)/g;
+  while ((m = forRe.exec(clean))) for (const n of bindingNamesFromPattern(m[1])) names.add(n);
+  const catchRe = /\bcatch\s*\(\s*([A-Za-z_$][\w$]*)/g;
+  while ((m = catchRe.exec(clean))) names.add(m[1]);
+
+  return names;
+}
+
+// Identifiers *read* in a slice of code -- word tokens not preceded by a single `.`
+// (member access) and not an object-literal key. A `...` prefix is spread/rest, NOT
+// member access, so `...listArchivedMonthDirs(x)` DOES read `listArchivedMonthDirs`
+// (2026-09-09: a require-bound name reached only via spread was dropped from the carried
+// requires -> ReferenceError at call time, past both the parse and no-arg runtime guard).
+// Over-reports (locals, params) -- callers filter those out.
+function referencedIdentifiers(code) {
+  const clean = stripStringsAndComments(code);
+  const out = new Set();
+  const re = /(\.\.\.|\.)?\b([A-Za-z_$][\w$]*)\b(\s*:(?![:=]))?/g;
+  let m;
+  while ((m = re.exec(clean))) {
+    if (m[1] === '.') continue; // member access -- not a free read
+    if (m[3]) continue;         // object-literal key
+    out.add(m[2]);
+  }
+  return out;
+}
+
+// One top-level statement starting at line index `i` (column 0). Accumulates continuation
+// lines until the statement terminates with `;` at end-of-line (capped), so a multi-line
+// `const {\n a,\n b\n} = require('x');` is one unit. Returns { text, endExclusive }.
+function readTopLevelStatement(lines, i) {
+  let j = i;
+  let buf = lines[i];
+  while (!/;\s*$/.test(buf.trimEnd()) && j < lines.length - 1 && j - i < 40) {
+    // A new column-0 statement keyword on the next line means the current one had no
+    // trailing `;` -- stop here rather than swallowing it.
+    if (/^(?:const|let|var|function|class|async\s|module\.exports|if\b|for\b|while\b|return\b)/.test(lines[j + 1] || '')) break;
+    j += 1;
+    buf += `\n${lines[j]}`;
+  }
+  return { text: buf, endExclusive: j + 1 };
+}
+
+// The module prelude: the CONTIGUOUS run of `'use strict'`, comments, and top-level
+// `require(...)` / `import` statements at the very top of the file -- STOPPING at the first
+// real code (a `function`, a `class`, a non-require `const/let/var`, or executable code).
+// A `require()` that appears LATER in the file (a lazy/local-ish import after real code) is
+// deliberately NOT part of the prelude -- putting the back-require after it would splice it
+// into the middle of the module (the 2026-09-09 staleness-audit.js / apply-group-a.js
+// corruption). Returns { prelude, body }.
+function splitRequirePrelude(src) {
+  const lines = src.split('\n');
+  let i = 0;
+  let preludeEnd = 0; // exclusive
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^\s*$/.test(line)) { i++; continue; }
+    if (/^\s*['"]use strict['"];?\s*$/.test(line)) { preludeEnd = i + 1; i++; continue; }
+    if (/^\s*\/\//.test(line)) { i++; continue; }
+    if (/^\s*\/\*/.test(line)) {
+      while (i < lines.length && !/\*\//.test(lines[i])) i++;
+      i += 1;
+      continue;
+    }
+    if (/^import\b/.test(line)) { preludeEnd = i + 1; i++; continue; }
+    if (/^(?:const|let|var|require)\b/.test(line)) {
+      const stmt = readTopLevelStatement(lines, i);
+      if (/\brequire\s*\(/.test(stmt.text)) { preludeEnd = stmt.endExclusive; i = stmt.endExclusive; continue; }
+      break; // a non-require declaration == real code
+    }
+    break; // function / class / executable == real code
+  }
+  return { prelude: lines.slice(0, preludeEnd).join('\n'), body: lines.slice(preludeEnd).join('\n') };
+}
+
+// EVERY top-level `require(...)` / `import` statement in the whole file, not just the
+// prelude ones -- a module-scope `const { x } = require('./y')` that sits AFTER real code
+// still binds `x` module-wide, so the self-containment check and the new module both need
+// to know about it.
+function allTopLevelRequireStatements(src) {
+  const lines = src.split('\n');
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^import\b/.test(line)) { out.push(line); i++; continue; }
+    if (/^(?:const|let|var|require)\b/.test(line)) {
+      // Don't require `require(` on the FIRST line -- a multi-line destructured require
+      // (`const {\n  a,\n  b,\n} = require('./x')`) has the call several lines down. Read
+      // the whole logical statement, then test that for `require(`.
+      const stmt = readTopLevelStatement(lines, i);
+      if (/\brequire\s*\(/.test(stripStringsAndComments(stmt.text))) {
+        out.push(stmt.text); i = stmt.endExclusive; continue;
+      }
+    }
+    i++;
+  }
+```
+
+Problem:
+The function `locallyBoundNames` is 122 lines long and performs five distinct lexical analysis tasks: parsing variable declarations, extracting parameter names from functions and arrows, handling single-identifier arrows, and processing `for`/`catch` bindings. Each task has its own regex, loop logic, and side-effect (adding to a Set), making the function a composite of responsibilities. This violates the Single Responsibility Principle and makes testing, debugging, and extension difficult — especially since each pattern could change independently.
+
+Solution:
+Extract each lexical analysis concern into its own function: `addBindingNamesFromDeclarations`, `addBindingNamesFromParameters`, `addBindingNamesFromSingleArrows`, and `addBindingNamesFromForAndCatch`. Each function handles one pattern type, uses its own regex, and operates on the shared `names` Set. The top-level function simply orchestrates these calls, keeping the interface unchanged but improving internal structure.
+
+Benefits:
+Decomposing the function enables unit tests per responsibility, localized changes (e.g. adding new binding patterns), and clearer code reviews. It also makes the function easier to understand at a glance — the “what” is now separated from the “how” — without altering any behavior.
+
+VERDICT CONSTRAINT:
+Genuine
