@@ -1037,3 +1037,137 @@ Decomposing this function improves testability, as each unit can be unit-tested 
 
 VERDICT CONSTRAINT:
 Genuine
+
+### AC-7 · Decompose Monolithic Task Registration
+Strength: Strong
+Files: src/arch.js
+Symbol: register
+Snippet:
+```
+}
+
+function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
+  // arch_review -- consumer of nextCandidateFulfillmentTask against arch_discovery's doc.
+  // reasoningTier 'high': arch_review's low-tier implement pass has produced 0-char output
+  // on its final retry live. candidatesPath is a lazy getter (getConfig() isn't callable
+  // at module-load time) -- where a {"mode":"split"} implement response writes its
+  // sub-candidates back.
+  // No emptyApproval (2026-08-28): a fulfillment source consumes an already-Strong-rated
+  // candidate -- an empty draft there means "I couldn't produce this fix" (model gave up,
+  // couldn't locate the code, or the code moved), not "there was nothing to do". With
+  // emptyApproval those silently auto-closed with no branch and no human (see retired
+  // AC-25, whose target had moved to this plugin). Without it, an empty draft is rejected
+  // -> retried -> eventually blocked for a human. emptyApproval stays on the arch_discovery
+  // / arch_import GENERATORS below, where "found zero real issues" is a valid common outcome.
+  registerTaskSource('arch_review', {
+    hygieneFamily: hygieneFamily('arch', { candidateDoc: true }),
+    priority: taskPriority('arch_review', 70),
+    next: () => nextCandidateFulfillmentTask(getConfig().archReviewCandidatesPath, 'arch_review'),
+    candidateFulfillment: true,
+    candidatesPath: () => getConfig().archReviewCandidatesPath,
+    candidateDocTitle: '# Architecture Review Candidates',
+    reasoningTier: 'high',
+  });
+  updateTaskSource('arch_review', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
+
+  // arch_import_review -- the OTHER consumer of nextCandidateFulfillmentTask, against
+  // arch_import's own candidates doc. Priority 71: every stage's own consumer outranks its
+  // own generator. Shares arch_review's plan/implement prompt pair.
+  //
+  // 2026-09-04 (AC-8 incident): stamp promptContext.premiseEvidence at task-build time,
+  // deterministically, against content the candidate already fetched -- cheap, synchronous,
+  // no fresh grep. `groundingFields` threads it to the reviewer (review-time backstop for a
+  // plain diff); `premiseCheck` is the harder gate, consulted by agent-manager core's
+  // finalizeCandidateFulfillment right before a {"mode":"split"} response is honored, so a
+  // false premise never fans out into child candidates the way AC-8 did.
+  registerTaskSource('arch_import_review', {
+    hygieneFamily: hygieneFamily('arch', { candidateDoc: true }),
+    priority: taskPriority('arch_import_review', 71),
+    next: () => {
+      const task = nextCandidateFulfillmentTask(getConfig().archImportCandidatesPath, 'arch_import_review');
+      if (task) task.promptContext.premiseEvidence = computePremiseEvidence(task);
+      return task;
+    },
+    candidateFulfillment: true, // no emptyApproval -- see arch_review above
+    candidatesPath: () => getConfig().archImportCandidatesPath,
+    candidateDocTitle: '# Architecture Import Candidates',
+    reasoningTier: 'high',
+    groundingFields: ['premiseEvidence'],
+    reviewGuidance: ARCH_IMPORT_REVIEW_PREMISE_GUIDANCE,
+    premiseCheck: runPremiseCheck,
+  });
+  updateTaskSource('arch_import_review', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
+
+  // arch_discovery -- generator. Custom apply: its implement pass outputs raw markdown
+  // candidate write-ups, not Group B JSON, so without this apply-task.js's writeArtifact()
+  // falls through to the generic JSON parser and every approved task fails apply.
+  registerTaskSource('arch_discovery', {
+    groundedPromptFiles: true,
+    hygieneFamily: hygieneFamily('arch'),
+    priority: taskPriority('arch_discovery', 80),
+    next: () => nextArchDiscoveryTask({ getConfig, taskIdExistsInQueue }),
+    apply: ({ implementResponse }) => {
+      const { archReviewCandidatesPath } = getConfig();
+      return applyArchDiscoveryCandidates({ implementResponse, candidatesPath: archReviewCandidatesPath });
+    },
+    emptyApproval: true,
+    // 2026-09-17 (agent-manager's empty-approval-decision.js, needs-clarification
+    // bd-1788787323412): explicit opt-in marking that this source's real implement
+    // response is the shared "### AC-NNN" candidate-doc format (applyArchDiscoveryCandidates
+    // just above parses exactly this), so a non-empty response that still parses to zero
+    // candidates can be treated the same as an effectively-empty one -- deterministic
+    // approve/block, no wasted majority vote on a draft whose apply outcome is already
+    // knowable. Deliberately a SEPARATE flag from emptyApproval, not inferred from it --
+    // deep_dive/project_search are also emptyApproval but do NOT use this format.
+    candidateDocFormat: true,
+    directToMain: true, // low-risk additive candidate-doc append -- commit straight to main, no throwaway branch
+    reviewGuidance: ARCH_DISCOVERY_REVIEW_GUIDANCE,
+    reportClass: 'benefit', // a surfaced, human-reviewed architecture candidate is a real outcome (system-report.js)
+    // concept-candidate-grounding-gate-3e9bec: deterministic Check 0 on the write-up's
+    // Files: line -- a path that resolves nowhere in this repo is a fabrication a blind
+    // redraft only re-invents. arch_discovery had no post-implement check before this.
+    postImplementCheck: runArchDiscoveryGroundingCheck,
+  });
+  updateTaskSource('arch_discovery', { buildPlanPrompt: archDiscoveryPlanPrompt, buildImplementPrompt: archDiscoveryImplementPrompt });
+
+  // arch_import -- generator. Same raw-markdown apply, plus the import-coverage.json stamp.
+  registerTaskSource('arch_import', {
+    preValidateCitedPaths: true,
+    hygieneFamily: hygieneFamily('arch'),
+    priority: taskPriority('arch_import', 81),
+    next: () => nextArchImportTask({ getConfig, taskIdExistsInQueue }),
+    apply: ({ implementResponse, task }) => {
+      const { archImportCandidatesPath, importCoveragePath } = getConfig();
+      return applyArchImportCandidate({ implementResponse, candidatesPath: archImportCandidatesPath, importCoveragePath, task });
+    },
+    emptyApproval: true,
+    candidateDocFormat: true, // see arch_discovery's own comment on this flag
+    directToMain: true, // see arch_discovery
+    reviewGuidance: ARCH_IMPORT_REVIEW_GUIDANCE,
+    reportClass: 'benefit', // see arch_discovery
+    // ADR-0022 Stage A4: arch_import's plan pass only proposes QUERY: terms; agent-manager's
+    // local-draft.js greps its own repo for them between plan and implement and hands the
+    // hits to the implement pass as grounding. On a genuine zero-hit search, skip the
+    // implement call entirely (the model fabricates file paths instead of following the
+    // "output nothing" instruction) -- an empty draft here auto-approves via emptyApproval.
+    harnessSearch: 'archImport',
+    skipImplementWhenNoHarnessHits: true,
+    // 2026-09-05: 3 of 7 blocked arch_import tasks shared the exact shape
+    // arch-import-premise-check.js already catches for its sibling arch_import_review --
+    // a fabricated premise/file/line-number contradicting the real harness-fetched content
+    // -- but that gate only runs at arch_import_review's split point, never here at
+    // arch_import's own initial write-up. See arch-import-grounding-check.js's own header.
+    postImplementCheck: runArchImportGroundingCheck,
+  });
+  updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });
+}
+```
+
+Problem:  
+The `register` function is a composite of four semantically distinct task source registrations — `arch_review`, `arch_import_review`, `arch_discovery`, and `arch_import` — each with unique configurations, logic, and side effects. This violates the Single Responsibility Principle, making the function hard to test, debug, extend, or read. The scanner’s 115-line threshold is a valid signal: the function is doing too much, mixing setup, configuration, and domain logic.
+
+Solution:  
+Extract each task source registration into its own named function: `registerArchReview`, `registerArchImportReview`, `registerArchDiscovery`, and `registerArchImport`. Each function encapsulates its own configuration and behavior, preserving all logic while isolating responsibilities. This allows independent testing, modification, and extension.
+
+Benefits:  
+Decomposing the function reduces cognitive load, improves testability by enabling unit tests for each task source, and makes future changes safer and more predictable. Even if total lines increase slightly, maintainability and scalability improve dramatically — a necessary trade-off for long-term code health.
