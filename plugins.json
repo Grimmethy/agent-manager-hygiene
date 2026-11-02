@@ -1,0 +1,26 @@
+[
+  {
+    "name": "observability_review",
+    "registerPath": "./src/observability-review.js"
+  },
+  {
+    "name": "performance_review",
+    "registerPath": "./src/performance-review.js"
+  },
+  {
+    "name": "function_length_review",
+    "registerPath": "./src/function-length-review.js"
+  },
+  {
+    "name": "arch_review",
+    "registerPath": "./src/arch.js"
+  },
+  {
+    "name": "unused_export",
+    "registerPath": "./src/unused-export.js"
+  },
+  {
+    "name": "change_review",
+    "registerPath": "./src/change-review.js"
+  }
+]
