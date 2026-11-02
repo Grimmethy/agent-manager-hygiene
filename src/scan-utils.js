@@ -60,6 +60,26 @@ function listSourceFiles(dir, extensions) {
 // source, however dense, essentially never does. Checked once per file, not per rule, so
 // every rule in every scanner using this benefits without each needing its own guard.
 const MINIFIED_LINE_LENGTH_THRESHOLD = 2000;
+
+// Hygiene parameter defaults and env var handling
+// HYGIENE_PARAM_COUNT_MAX: maximum number of parameters before flagging (default 6)
+// HYGIENE_PARAM_COUNT_CALL_SITES: whether to check call sites for param count patterns (default true)
+function getHygieneConfig() {
+  const rawMax = process.env.HYGIENE_PARAM_COUNT_MAX;
+  const parsedMax = rawMax === undefined ? 6 : Number(rawMax);
+  const paramCountMax = Number.isFinite(parsedMax) && parsedMax > 0 ? Math.floor(parsedMax) : 6;
+
+  const rawCallSites = process.env.HYGIENE_PARAM_COUNT_CALL_SITES;
+  const paramCountCallSites = rawCallSites === undefined
+    ? true
+    : !['false', '0', ''].includes(String(rawCallSites).toLowerCase());
+
+  return {
+    paramCountMax,
+    paramCountCallSites,
+  };
+}
+
 function isLikelyMinified(text) {
   let lineStart = 0;
   for (let i = 0; i <= text.length; i++) {
@@ -323,6 +343,7 @@ module.exports = {
   stripNonCode,
   isTestFile,
   windowFromContent,
+  getHygieneConfig,
   MINIFIED_LINE_LENGTH_THRESHOLD,
   SKIP_DIRS,
   isArchivedDirName,
