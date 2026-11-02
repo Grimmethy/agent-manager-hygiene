@@ -696,3 +696,140 @@ Decomposing the function improves readability by isolating concerns, enables uni
 
 VERDICT CONSTRAINT:
 Genuine
+
+### AC-5 · Decompose God Function into Orchestrator + Atomic Subtasks
+Strength: Strong
+Files: src/arch.js
+Symbol: nextArchImportTask
+Snippet:
+```
+const ARCH_IMPORT_RETRY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+function nextArchImportTask({ getConfig, taskIdExistsInQueue }) {
+  const { repoRoot, deepDiveAnalysisDir, deepDiveCoveragePath, importCoveragePath, defaultDomain } = getConfig();
+  // Same convention nextDeepDiveTask()/nextProjectSearchTask() already use.
+  const projectTag = path.basename(repoRoot);
+
+  let entries;
+  try {
+    entries = fs.readdirSync(deepDiveAnalysisDir, { withFileTypes: true });
+  } catch {
+    return null; // no analysis dir yet -- nothing to promote
+  }
+
+  // Scoping fix (2026-07-27): an analysis doc only contributes candidates when
+  // deep-dive-coverage.json says that external project was onboarded FOR this consumer
+  // project. A doc with no recorded relevantToProject predates this fix and is excluded.
+  let deepDiveCoverage;
+  try {
+    deepDiveCoverage = JSON.parse(readIfExists(deepDiveCoveragePath) || '{"projects":{}}');
+  } catch {
+    deepDiveCoverage = { projects: {} };
+  }
+  const relevantSlugs = new Set(
+    Object.entries(deepDiveCoverage.projects || {})
+      .filter(([, proj]) => proj.relevantToProject === projectTag)
+      .map(([slug]) => slug),
+  );
+
+  let coverage;
+  try {
+    coverage = JSON.parse(readIfExists(importCoveragePath) || '{"items":{}}');
+  } catch {
+    coverage = { items: {} };
+  }
+  if (!coverage.items) coverage.items = {};
+
+  let coverageChanged = false;
+  const candidates = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
+    const projectSlug = entry.name.replace(/\.md$/, '');
+    if (!relevantSlugs.has(projectSlug)) continue;
+    const text = readIfExists(path.join(deepDiveAnalysisDir, entry.name));
+    if (!text) continue;
+
+    // Split on H2 ("## ") item headings -- drop index 0, the "# <project> -- Deep Dive" H1.
+    const blocks = text.split(/(?=^## )/m).slice(1);
+    for (const block of blocks) {
+      const idMatch = block.match(/^\*\*ID:\*\*\s*(\S+)/m);
+      if (!idMatch) continue;
+      const itemId = idMatch[1];
+
+      if (!(itemId in coverage.items)) {
+        coverage.items[itemId] = { promotedAt: null, candidateId: null, projectSlug };
+        coverageChanged = true;
+      }
+      const itemCoverage = coverage.items[itemId];
+      if (itemCoverage.promotedAt) continue; // a REAL candidate was produced -- genuinely done
+      if (itemCoverage.lastAttemptedAt && Date.now() - Date.parse(itemCoverage.lastAttemptedAt) < ARCH_IMPORT_RETRY_COOLDOWN_MS) continue;
+
+      const ratingMatch = block.match(/^\*\*Rating:\*\*\s*(\S+)/m);
+      const rating = ratingMatch ? ratingMatch[1] : '';
+      if (rating !== 'Use' && rating !== 'Adapt') continue;
+
+      const titleMatch = block.match(/^##\s*(.+)$/m);
+      const filesMatch = block.match(/^\*\*Files:\*\*\s*(.+)$/m);
+      const rationaleAnchor = filesMatch ? filesMatch[0] : idMatch[0];
+      const rationale = block.slice(block.indexOf(rationaleAnchor) + rationaleAnchor.length).trim();
+
+      candidates.push({
+        itemId,
+        projectSlug,
+        title: titleMatch ? titleMatch[1].trim() : itemId,
+        rating,
+        files: filesMatch ? filesMatch[1].trim() : '',
+        rationale,
+      });
+    }
+  }
+
+  if (coverageChanged) {
+    fs.mkdirSync(path.dirname(importCoveragePath), { recursive: true });
+    fs.writeFileSync(importCoveragePath, JSON.stringify(coverage, null, 2));
+  }
+
+  // Sort by itemId string only for a stable, reproducible pick across repeated calls, not
+  // a claim of real chronological ordering across projects.
+  candidates.sort((a, b) => a.itemId.localeCompare(b.itemId));
+
+  for (const c of candidates) {
+    const taskId = 'arch-import-' + c.itemId;
+    if (taskIdExistsInQueue(taskId)) continue;
+
+    return {
+      id: taskId,
+      domain: defaultDomain,
+      source: 'arch_import',
+      title: `Arch import: ${c.title} (from ${c.projectSlug})`,
+      promptContext: {
+        itemId: c.itemId,
+        sourceProject: c.projectSlug,
+        itemTitle: c.title,
+        rating: c.rating,
+        itemFiles: c.files,
+        itemRationale: c.rationale,
+      },
+    };
+  }
+
+  return null;
+}
+```
+
+Problem:
+This function bundles five distinct responsibilities — config parsing, project relevance filtering, Markdown metadata extraction, coverage state management, candidate sorting, and task metadata generation — into a single monolithic flow. Each responsibility mutates state or depends on external data in ways that make unit testing impossible without mocking the entire function. The interleaving of error-handling branches (e.g., `coverageChanged`, `deepDiveCoverage`) and state mutations (`candidates`, `deepDiveCoverage`) creates cognitive overhead and increases the risk of subtle bugs when modifying one part without understanding the others.
+
+Solution:
+Extract five atomic functions:  
+1. `getProjectRelevanceMap(config)` — returns relevant project slugs based on `deepDiveCoverage`.  
+2. `parseAnalysisEntries(deepDiveDir, relevantSlugs)` — parses and filters analysis entries by relevance and metadata.  
+3. `filterCandidatesByRatingAndCooldown(candidates, coverage, cooldownMs)` — filters candidates by rating and cooldown.  
+4. `generateTaskMetadata(candidates, config)` — generates final task metadata or null.  
+5. `orchestrateNextArchImportTask(config, deepDiveDir, cooldownMs)` — coordinates the above, managing state and error paths.
+
+Benefits:
+Decomposing this function makes each unit testable in isolation, reduces cognitive load for future maintainers, and allows incremental refactoring without risking cascading failures. The orchestrator can be mocked or stubbed easily, while each subtask can be reviewed and tested independently, improving both code quality and team velocity.
+
+VERDICT CONSTRAINT:
+Genuine
