@@ -1671,3 +1671,193 @@ VERDICT CONSTRAINT:
 - Refusals, hedging, or a third outcome (including "Uncertain", "I cannot determine", or any other qualifier) are NOT acceptable. Pick the one verdict that best fits the evidence in the snippet and commit to it.
 
 Genuine
+
+### AC-190 · Decompose Observability Task Registration
+Strength: Strong
+Files: src/observability-review.js
+Symbol: register
+Snippet:
+```
+}
+
+function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
+  registerTaskSource('observability_review', {
+    hygieneFamily: hygieneFamily('observability'),
+    priority: taskPriority('observability_review', 80),
+    next: () => {
+      const { repoRoot, pipelineDir, defaultDomain, observabilityCoveragePath } = getConfig();
+      return nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue, coveragePath: observabilityCoveragePath });
+    },
+    inventory: ({ taskState }) => {
+      const { repoRoot, pipelineDir } = getConfig();
+      return observabilityInventory({ repoRoot, pipelineDir, taskState });
+    },
+    apply: ({ implementResponse, task }) => {
+      const { observabilityFixCandidatesPath, pipelineDir } = getConfig();
+      // task.promptContext.snippet is the real, review-time-fresh code text this
+      // finding is about (see nextObservabilityReviewTask below) -- passed through
+      // deterministically so it survives into the candidate doc as data, not just
+      // however faithfully the model's own prose happened to paraphrase it.
+      const res = applyArchDiscoveryCandidates({
+        implementResponse,
+        candidatesPath: observabilityFixCandidatesPath,
+        docTitle: '# Observability Fix Candidates',
+        snippet: task && task.promptContext && task.promptContext.snippet,
+        // Opt-in dedupe (agent-manager candidate-docs.js): a re-drafted/requeued finding whose file + function is already
+        // in the doc (master, an unmerged agent/* branch, or this tree) is skipped instead of appended again (2026-09-26, AC-187 vs AC-51).
+        dedupe: true,
+      });
+      // A "false positive" verdict wrote no candidate -- remember the flagged construct
+      // so the scanner never re-emits it (suppression-store.js).
+      recordFalsePositiveIfVerdict({ applyResult: res, implementResponse, task, pipelineDir });
+      // A verdict that produced no candidate and is not an explicit false positive:
+      // track it, and after a few such tries stop the scanner re-emitting this construct.
+      recordInconclusiveReview({ applyResult: res, implementResponse, task, pipelineDir });
+      // Structured outcome for task-disposition.js (core): splits `dismissed` (a correct
+      // false-positive triage) out of the `noop` grab-bag. Mutating `task` here is
+      // persisted by apply-task.js after apply() returns.
+      if (STAMP_REVIEW_DISPOSITION && task) {
+        task.reviewDisposition = classifyReviewOutcome({ applyResult: res, implementResponse });
+      }
+      return res;
+    },
+    // 2026-08-31: the reviewer must see the SAME code window the drafter was given.
+    // nextObservabilityReviewTask puts the flagged code into promptContext.snippet and the
+    // implement prompt tells the model to "ground your verdict in the snippet you were
+    // given" -- but get-grounding-source.js only threads a fixed set of promptContext
+    // fields into review-task.js's grounding block, and `snippet` wasn't one of them. So
+    // the reviewer saw only PLAN + IMPLEMENT + "file exists", was told to treat every
+    // claim as UNVERIFIED, and rejected correct verdicts ("there is no try/except in this
+    // 5-line handler") as "an unverified assertion based on a snippet not provided in the
+    // prompt" -> 2 retries -> blocked. Declaring it here makes get-grounding-source.js's
+    // generic source.groundingFields consumer include it. 2026-09-02: also thread
+    // `enclosingCode` -- the wider block+context window nextObservabilityReviewTask now
+    // builds -- so the reviewer judges the verdict against the same real code the drafter saw.
+    groundingFields: ['snippet', 'enclosingCode'],
+    advisoryProse: true,
+    // The verdict is binary (GENUINE / FALSE POSITIVE) and the drafter had the flagged
+    // block + enclosing function as real source -- so an "I can't verify / a human should
+    // look" answer IS rejectable, but a decisive, code-grounded false-positive verdict
+    // that happens to read cautiously is NOT hedging. Spell that out so the generic
+    // hedging rule (review-task.js) doesn't reject correct dismissals.
+    reviewGuidance: 'This is an observability_review triage verdict, not a code change. A valid draft is EXACTLY ONE of: (a) "GENUINE" + a correctly-formatted `### AC-NNN` candidate block (Strength/Files/Problem/Solution/Benefits), or (b) "FALSE POSITIVE" + one short paragraph citing the specific lines in the grounding source. The drafter was given the flagged block AND its surrounding code read straight from the file. REJECT the draft if it answers "uncertain", "cannot verify", "a human should open the file", or otherwise refuses to reach a verdict from the code it was shown. But do NOT reject a decisive verdict merely for sounding careful: "not a silent swallow because the except binds `e` and the function\'s documented contract returns None on failure" is a real, complete verdict grounded in the code -- approve it. Reject a FALSE POSITIVE verdict only when its stated reason actually contradicts the grounding source (e.g. it claims the body logs the error but the shown lines are a bare `pass`), and reject a GENUINE verdict whose candidate is malformed or proposes a primitive the project does not have.',
+    reviewCompletenessQuestion: 'Does the draft reach a decisive GENUINE-or-FALSE-POSITIVE verdict (not "uncertain"/"needs a human"), and is that verdict consistent with the flagged block + surrounding code in the grounding source?',
+    directToMain: true, // the apply is a low-risk candidate-doc append, not real code -- straight to main
+    // ADR-0022 Stage A3: how a completed review counts toward system-report.js's
+    // junk/filtering/benefit accounting. A review that correctly dismissed a false
+    // positive is real triage work ('filtering'); one that confirmed a genuine issue
+    // is a 'benefit'. Read off the registry there instead of a hardcoded source check.
+    reportClass: (task) => {
+      const text = (task.implementResponse || '').toLowerCase();
+      if (text.includes('false positive') || text.includes('false-positive')) return 'filtering';
+      if (text.includes('genuine')) return 'benefit';
+      return 'unclear';
+    },
+  });
+  updateTaskSource('observability_review', { buildPlanPrompt: observabilityReviewPlanPrompt, buildImplementPrompt: observabilityReviewImplementPrompt });
+
+  registerTaskSource('observability_review_digest', {
+    hygieneFamily: hygieneFamily('observability'),
+    priority: taskPriority('observability_review_digest', 78),
+    next: () => {
+      const { repoRoot, pipelineDir, defaultDomain, observabilityCoveragePath } = getConfig();
+      return nextObservabilityReviewDigestTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue, coveragePath: observabilityCoveragePath });
+    },
+    apply: ({ implementResponse, task }) => {
+      const { observabilityFixCandidatesPath, pipelineDir } = getConfig();
+      const items = (task && task.promptContext && task.promptContext.items) || [];
+      const verdicts = parseDigestVerdicts(implementResponse, items.length);
+      let filed = 0;
+      let dismissed = 0;
+      for (const item of items) {
+        const v = verdicts.get(item.n);
+        if (!v) continue; // unparsed -- leave it; the finding recurs next cycle
+        if (v.verdict === 'genuine') {
+          const one = [
+            `### AC-000 · silent-catch-block at ${item.file}:${item.line}`,
+            'Strength: Moderate',
+            `Files: ${item.file}`,
+            '', 'Problem:',
+            `A caught error is discarded with no operator visibility. ${item.detail} ${v.reason}`.trim(),
+            '', 'Solution:',
+            'Log the caught error (message + context) before the existing fallback/return; do not change control flow.',
+            '', 'Benefits:',
+            'An operator can tell a silent recovery from a real failure in the logs.',
+          ].join('\n');
+          const r = applyArchDiscoveryCandidates({
+            implementResponse: one, candidatesPath: observabilityFixCandidatesPath,
+            docTitle: '# Observability Fix Candidates', snippet: item.snippet,
+          });
+          if (r && !r.skipped) filed += 1;
+        } else {
+          const r = recordSuppression(pipelineDir, {
+            rule: item.rule, file: item.file, snippet: item.snippet,
+            taskId: task && task.id, cause: 'false-positive',
+          });
+          if (r && r.recorded) dismissed += 1;
+        }
+      }
+      const aggregate = filed > 0 ? 'genuine' : (dismissed > 0 ? 'dismissed' : 'inconclusive');
+      if (STAMP_REVIEW_DISPOSITION && task) task.reviewDisposition = aggregate;
+      if (filed > 0) {
+        return { skipped: false, reason: `observability digest: filed ${filed} candidate(s), dismissed ${dismissed}` };
+      }
+      return { skipped: true, reason: `observability digest: ${dismissed} finding(s) dismissed as FALSE POSITIVE, ${items.length - dismissed} unresolved` };
+    },
+    groundingFields: ['items'],
+    advisoryProse: true,
+    reviewGuidance: 'This is a BATCH observability triage. A valid draft is a list of exactly N lines, one per numbered block, each "<n>. GENUINE|FALSE POSITIVE — <short reason>". Approve if every block has a decisive verdict with a reason that is consistent with the block shown in the grounding `items`. Reject only if lines are missing, verdicts are absent/"uncertain", or a reason plainly contradicts its block.',
+    reviewCompletenessQuestion: 'Does the draft give a decisive GENUINE/FALSE-POSITIVE verdict for every numbered block, each consistent with that block\'s code in the grounding?',
+    directToMain: true,
+    reportClass: (task) => {
+      const text = (task.implementResponse || '').toLowerCase();
+      if (text.includes('genuine')) return 'benefit';
+      if (text.includes('false positive') || text.includes('false-positive')) return 'filtering';
+      return 'unclear';
+    },
+  });
+  updateTaskSource('observability_review_digest', { buildPlanPrompt: observabilityReviewDigestPlanPrompt, buildImplementPrompt: observabilityReviewDigestImplementPrompt });
+
+  registerTaskSource('observability_fix', {
+    hygieneFamily: hygieneFamily('observability', { candidateDoc: true }),
+    priority: taskPriority('observability_fix', 72),
+    next: () => {
+      const { observabilityFixCandidatesPath } = getConfig();
+      return nextCandidateFulfillmentTask(observabilityFixCandidatesPath, 'observability_fix');
+    },
+    // No emptyApproval (2026-08-28): an empty fulfillment draft means "couldn't produce
+    // this fix", not "nothing to do" -- with it, those silently auto-closed with no branch
+    // and no human. Without it, an empty draft is rejected -> retried -> blocked for a
+    // human. See agent-manager's retired AC-25.
+    candidateFulfillment: true,
+    // 2026-09-18 (brain-dump bd-1789602379616): every observability_fix candidate is, by
+    // construction, sourced from one of observability_review's own deterministic scanner
+    // rules -- so when a draft answers with the documented "FALSE POSITIVE" refusal (the
+    // finding no longer applies), re-running THAT rule set against the cited file's
+    // current content answers "is this refusal correct" deterministically, no model call.
+    // See agent-manager/src/premise-recheck-decision.js's own header for the full
+    // mechanism and why this needed an explicit opt-in field rather than being derived
+    // from the "_fix" source's own name (pipeline_forensics_fix/change_review_fix don't
+    // follow a "_fix" -> "_review" naming pattern). The rules themselves are already
+    // registered below via deterministic-recheck.js's own register() call.
+    premiseRecheckSource: 'observability_review',
+    candidatesPath: () => getConfig().observabilityFixCandidatesPath,
+    candidateDocTitle: '# Observability Fix Candidates',
+  });
+  updateTaskSource('observability_fix', { buildPlanPrompt: observabilityFixPlanPrompt, buildImplementPrompt: observabilityFixImplementPrompt });
+}
+```
+
+Problem:  
+The `register` function orchestrates three semantically distinct task sources — `observability_review`, `observability_review_digest`, and `observability_fix` — each with unique logic for `next`, `inventory`, `apply`, `groundingFields`, `reviewGuidance`, and `reportClass`. These are not variations of a single pattern but independent triage workflows with different failure modes and reporting behaviors. The function’s length reflects structural complexity, not just line count: it contains three major logical blocks that resist refactoring without introducing coupling or losing clarity. The scanner’s 100-line threshold is appropriate here because the function’s architecture is composite, not linear.
+
+Solution:  
+Extract each task source into its own dedicated registration function:  
+- `registerObservabilityReview({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority })`  
+- `registerObservabilityReviewDigest({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority })`  
+- `registerObservabilityFix({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority })`  
+
+Introduce a shared helper `registerTaskSourceWithConfig({ type, config, ... })` to handle common setup, but allow type-specific overrides for `groundingFields`, `reviewGuidance`, and `reportClass`. This preserves testability and reduces duplication while keeping each task’s logic isolated.
+
+Benefits:  
+Each extracted function becomes independently testable and maintainable, reducing the cognitive load on developers. Changes to one task’s logic won’t risk breaking others. Reviewers can focus on one triage workflow at a time, improving code review quality. The shared config pattern enables consistent configuration while allowing per-type customization, making the system more scalable and less brittle.
