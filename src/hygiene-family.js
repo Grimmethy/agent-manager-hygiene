@@ -8,6 +8,15 @@
 //   candidateDoc  this source owns a Docs/*_CANDIDATES.md the tab inventories (its candidate ids are `<source-with-dashes>-ac-N`)
 // A family's scanner-flag counts come from whichever member has an `inventory({ taskState })` hook.
 
+// Env-driven thresholds for the param-count hygiene check.
+// HYGIENE_PARAM_COUNT_MAX: max param count before a function is flagged (default 6).
+// HYGIENE_PARAM_COUNT_CALL_SITES: when true, the check also inspects call sites (default true).
+const HYGIENE_PARAM_COUNT_MAX = process.env.HYGIENE_PARAM_COUNT_MAX
+  ? Number(process.env.HYGIENE_PARAM_COUNT_MAX) : 6;
+
+const HYGIENE_PARAM_COUNT_CALL_SITES = process.env.HYGIENE_PARAM_COUNT_CALL_SITES
+  ? process.env.HYGIENE_PARAM_COUNT_CALL_SITES !== 'false' : true;
+
 const FAMILIES = {
   observability: { key: 'observability', label: 'Observability', order: 10, idPrefixes: ['observability-'] },
   performance: { key: 'performance', label: 'Performance', order: 20, idPrefixes: ['performance-'] },
@@ -23,4 +32,4 @@ function hygieneFamily(key, { candidateDoc = false } = {}) {
   return candidateDoc ? { ...f, candidateDoc: true } : { ...f };
 }
 
-module.exports = { hygieneFamily, FAMILIES };
+module.exports = { hygieneFamily, FAMILIES, HYGIENE_PARAM_COUNT_MAX, HYGIENE_PARAM_COUNT_CALL_SITES };
