@@ -1171,3 +1171,132 @@ Extract each task source registration into its own named function: `registerArch
 
 Benefits:  
 Decomposing the function reduces cognitive load, improves testability by enabling unit tests for each task source, and makes future changes safer and more predictable. Even if total lines increase slightly, maintainability and scalability improve dramatically — a necessary trade-off for long-term code health.
+
+### AC-26 · Decompose Monolithic Function Length Review Logic
+Strength: Strong
+Files: src/function-length-review.js
+Symbol: register
+Snippet:
+```
+}
+
+function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
+  registerTaskSource('function_length_review', {
+    requireCodeShapeInCandidate: true,
+    hygieneFamily: hygieneFamily('function_length'),
+    priority: taskPriority('function_length_review', 80),
+    next: () => {
+      const { repoRoot, pipelineDir, defaultDomain } = getConfig();
+      return nextFunctionLengthReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue });
+    },
+    inventory: ({ taskState }) => {
+      const { repoRoot, pipelineDir } = getConfig();
+      return functionLengthInventory({ repoRoot, pipelineDir, taskState });
+    },
+    apply: ({ implementResponse, task }) => {
+      const { pipelineDir } = getConfig();
+      const candidatesPath = functionLengthCandidatesPath(getConfig);
+      // See apply-group-a.js's applyArchDiscoveryCandidates for why this real,
+      // review-time-fresh snippet is threaded through deterministically.
+      const res = applyArchDiscoveryCandidates({
+        implementResponse,
+        candidatesPath,
+        docTitle: '# Function Length Decomposition Candidates',
+        // Opt-in dedupe (agent-manager candidate-docs.js): a re-drafted/requeued finding whose file + function is already
+        // in the doc (master, an unmerged agent/* branch, or this tree) is skipped instead of appended again (2026-09-26, AC-187 vs AC-51).
+        dedupe: true,
+        snippet: task && task.promptContext && task.promptContext.snippet,
+        // The scanner's own function name keys the dedupe ahead of any title parsing. An older agent-manager core
+        // that predates the `symbol` parameter simply ignores it.
+        symbol: functionSymbolFromDetail(task && task.promptContext && task.promptContext.detail),
+      });
+      // A "false positive" verdict wrote no candidate -- remember the flagged construct
+      // so the scanner never re-emits it (suppression-store.js).
+      recordFalsePositiveIfVerdict({ applyResult: res, implementResponse, task, pipelineDir });
+      // A verdict that produced no candidate and is not an explicit false positive:
+      // track it, and after a few such tries stop the scanner re-emitting this construct.
+      recordInconclusiveReview({ applyResult: res, implementResponse, task, pipelineDir });
+      return res;
+    },
+    // 2026-08-31: thread the flagged function window into review grounding -- see
+    // observability_review's own comment. Without this the reviewer never sees the snippet
+    // the drafter was told to ground its verdict in, and rejects correct calls as
+    // unverified speculation.
+    groundingFields: ['snippet'],
+    // 2026-08-23: review-task.js/local-draft.js now read these two flags directly off
+    // the registry entry instead of a hardcoded array a plugin author would otherwise
+    // have to go edit inside those files -- the actual prerequisite this family's
+    // extraction needed. advisoryProse: a short prose false-positive verdict is the
+    // EXPECTED deliverable here, not a refusal. See review-task.js's own ADVISORY_PROSE_
+    // SOURCES-turned-flag comment for the full history.
+    advisoryProse: true,
+    // 2026-09-02: advisoryProse alone was not enough -- the review vote still fell back to
+    // the GENERIC "does it contain real, complete code" completeness question and rejected
+    // every correct output ("a meta-plan describing an extraction refactor rather than the
+    // actual code changes", "meta-commentary rather than the actual code implementation")
+    // -- 5 real function_length_review tasks blocked+exhausted that way. This source's
+    // deliverable is a PROSE verdict or a candidate BLOCK, never code; spell that out for
+    // the reviewer exactly as observability_review already does.
+    reviewGuidance: 'This is a function-length triage verdict for a function in OUR OWN project, NOT a code change. A valid draft is EXACTLY ONE of: (a) "GENUINE" + a correctly-formatted `### AC-NNN` candidate block (Strength: Strong / Files / Problem / Solution / Benefits) sketching which logical pieces to extract, scoped to exactly this one function; or (b) "FALSE POSITIVE" / "UNCERTAIN" + one short paragraph (2-4 sentences) explaining why, grounded in the function snippet shown. There is deliberately NO diff, no code, and no "steps" here -- do NOT reject the draft for lacking them, and do NOT reject a Solution paragraph for "describing an extraction refactor rather than the actual code" (describing the decomposition IS the deliverable). REJECT only if: the draft refuses to reach a verdict ("a human should look", "cannot determine"); a GENUINE verdict\'s candidate block is malformed or missing a required section; a GENUINE verdict\'s Solution proposes something broader than this one function; or a FALSE POSITIVE verdict\'s stated reason actually contradicts the snippet shown (e.g. claims the function is short when the snippet clearly runs past the threshold).',
+    reviewCompletenessQuestion: 'Does the draft reach a decisive GENUINE-or-FALSE-POSITIVE verdict (not "uncertain"/"needs a human") and, if GENUINE, is it followed by a well-formed `### AC-NNN` candidate block whose Solution is a decomposition scoped to exactly this one function?',
+    // 2026-09-05: catches a Solution paragraph that invents a helper name/signature/call
+    // relationship contradicting the real flagged-function snippet -- see
+    // function-length-grounding-check.js's own header for the incident (8 of 9 blocked
+    // tasks shared this exact shape). Routes into the same blockedStage:'review' path a
+    // real review rejection takes, before a doomed draft burns a full vote round.
+    postImplementCheck: runGroundingCheck,
+    // 2026-08-31: the apply is a low-risk additive candidate-doc append, not real code --
+    // commit straight to main, no throwaway agent/<id> branch to hand-merge. Matches the
+    // sibling candidate-generating review sources (observability_review, performance_review,
+    // arch_discovery); function_length_review was the only one still missing it, which meant
+    // every function_length_fix hand-off needed a human to merge the review branch before
+    // function_length_fix (which reads FUNCTION_LENGTH_CANDIDATES.md from the working copy)
+    // could even see the candidate.
+    directToMain: true,
+  });
+  updateTaskSource('function_length_review', { buildPlanPrompt: functionLengthReviewPlanPrompt, buildImplementPrompt: functionLengthReviewImplementPrompt });
+
+  registerTaskSource('function_length_fix', {
+    hygieneFamily: hygieneFamily('function_length', { candidateDoc: true }),
+    priority: taskPriority('function_length_fix', 72),
+    next: () => {
+      return nextCandidateFulfillmentTask(functionLengthCandidatesPath(getConfig), 'function_length_fix');
+    },
+    // No emptyApproval (2026-08-28): a Strong candidate legitimately resolving to "no real
+    // decomposition after all" is rare, and it was letting the common case -- an empty
+    // draft because the model gave up or the code moved -- silently auto-close with no
+    // branch and no human (agent-manager's retired AC-25). An empty fulfillment draft is
+    // now rejected -> retried -> blocked for a human to look at. A genuine false-positive
+    // still surfaces that way, just visibly.
+    // candidateFulfillment: opts into local-draft.js's find-verification retry for free.
+    candidateFulfillment: true,
+    // A function_length_fix candidate is already the review stage's decomposed, Strong-
+    // rated extraction target -- re-splitting it just files more decomposition candidates
+    // that get re-split forever instead of ever landing a diff. Confirmed live 2026-09-01:
+    // AC-15 -> AC-15a/b, AC-16 -> AC-16a/b, AC-17 -> AC-17a/b, AC-18 -- four branches
+    // pushed, each touching only the candidates doc, zero real code, each parent marked
+    // done/succeeded for producing nothing. The generic splitDepth>=1 recursion cap
+    // (local-draft.js's finalizeCandidateFulfillment) bounds this to one wasted split, but
+    // never fully stops it -- same class of incident that got pipeline_forensics_fix this
+    // exact flag the same day (task-sources.js). This pass must produce a real diff or
+    // output empty (-> blocked for a human).
+    noCandidateSplit: true,
+    // candidatesPath/candidateDocTitle: still used to file THIS fix's own candidate (from
+    // function_length_review) -- unrelated to the disabled re-split path above. Same
+    // env-var-or-default resolution as this source's own `next` above, duplicated rather
+    // than shared per this file's own stated convention for tiny same-file helpers.
+    candidatesPath: () => functionLengthCandidatesPath(getConfig),
+    candidateDocTitle: '# Function Length Decomposition Candidates',
+  });
+  updateTaskSource('function_length_fix', { buildPlanPrompt: functionLengthFixPlanPrompt, buildImplementPrompt: functionLengthFixImplementPrompt });
+}
+```
+
+Problem:
+This function is 110 lines long and orchestrates multiple distinct responsibilities: task registration, inventory retrieval, candidate application logic, grounding, advisory prose handling, review completeness enforcement, post-implement checks, and task source updates. Each of these responsibilities could be isolated into its own function, improving testability, readability, and maintainability.
+
+Solution:
+Extract the initial `registerTaskSource` logic into `registerTaskSourceWithConfig`, isolate the `inventory` handler into `buildFunctionLengthInventory`, encapsulate candidate processing and deduplication into `applyFunctionLengthCandidates`, extract configuration flags into `configureFunctionLengthReview`, and isolate `updateTaskSource` calls into `updateFunctionLengthTaskSources`. Each function would handle one logical concern, with clear inputs and outputs.
+
+Benefits:
+Decomposing this function reduces cognitive load for developers, enables unit testing of individual responsibilities (e.g., testing deduplication logic without running full registration), and makes future modifications safer — changes to one concern won’t require navigating a 110-line monolith. This also improves code review by isolating changes to specific logical units.
