@@ -385,3 +385,128 @@ VERDICT CONSTRAINT (mandatory for this task):
 - Refusals, hedging, or a third outcome (including "Uncertain", "I cannot determine", or any other qualifier) are NOT acceptable. Pick the one verdict that best fits the evidence in the snippet and commit to it.
 
 VERDICT: GENUINE
+
+### AC-3 · Decompose Multi-Phase Runtime Probe Execution
+Strength: Strong
+Files: src/decompose-node-module.js
+Symbol: firstRuntimeError
+Snippet:
+```
+}
+
+function firstRuntimeError(changes, sourceFile, repoRoot) {
+  const os = require('os');
+  const fs = require('fs');
+  const { execFileSync } = require('child_process');
+  const dirCandidates = [path.dirname(sourceFile)];
+  for (const ch of changes) {
+    dirCandidates.push(path.dirname(ch.file));
+    const body = ch.mode === 'create' ? ch.content : ch.replace;
+    if (typeof body === 'string') dirCandidates.push(...relativeRequireTargetDirs(body, path.dirname(ch.file)));
+  }
+  const ancestorRel = commonAncestorDir(dirCandidates);
+  const ancestorAbs = path.join(repoRoot, ancestorRel);
+  let dir;
+  try {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nm-runtime-'));
+    fs.cpSync(ancestorAbs, dir, { recursive: true });
+  } catch (e) {
+    try { if (dir) fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    return null; // can't stage a runnable copy -- fall back to the static + parse guards
+  }
+  try {
+    for (const ch of changes) {
+      const body = ch.mode === 'create' ? ch.content : ch.replace;
+      if (typeof body !== 'string') continue;
+      // Preserve ch.file's real position relative to the copied ancestor -- a basename-
+      // only write flattens a newFile that sits in a subdirectory (e.g.
+      // sdk/lib/candidate-lifecycle.js under sdk/candidate-fulfillment.js), so a
+      // correctly-relative-pathed require() from the reduced source can never resolve it
+      // here even though it would in the real repo.
+      const relPath = path.relative(ancestorRel, ch.file);
+      const dest = path.join(dir, relPath);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, body);
+    }
+    const probe = [
+      'const path=require("path");',
+      `const m=require(${JSON.stringify(path.join(dir, path.relative(ancestorRel, sourceFile)))});`,
+      // 2026-09-14, screaminggoatclubmt: "fix the runtime probe bug too" -- found live
+      // against task-sources.js's own real exports: nextDeepDiveTask/nextProjectSearchTask
+      // (task-source POLLERS, not simple helpers) spawn REAL python3 subprocesses against
+      // REAL external repo clones as a side effect of merely being called with no args --
+      // this isn't a naming-convention edge case, it's this pipeline's own dominant
+      // `next<X>Task()` shape across every task-source module. The risky-name denylist
+      // never anticipated it (none of write/apply/save/... match "next"), so the probe ran
+      // real external I/O during what's supposed to be a side-effect-free dry-run check,
+      // then blew the timeout mid-spawn -- misreported by the generic fallback below as
+      // "module failed to load" instead of what actually happened (a timeout while it was
+      // doing real work it should never have been allowed to start).
+      // 2026-09-14, screaminggoatclubmt: "dig into the new bug too" -- found live against
+      // local-draft.js's own real exports: callImplementModel is an `async function`.
+      // Calling `v()` on it NEVER throws synchronously, even when its own parameter
+      // destructuring (`{ recordModelCall, implPrompt, ... }` with no argument supplied)
+      // would throw -- an async function always returns a Promise, so that failure
+      // becomes a REJECTED promise instead, which the `try{v()}catch` here can never see.
+      // The rejection then surfaces later as an unhandled promise rejection, which
+      // crashes the WHOLE probe process by default in modern Node -- not name-pattern-
+      // specific like the next*/onboard/clone fix above, since ANY async export with a
+      // required parameter hits this, regardless of its name. Extending the denylist
+      // forever is whack-a-mole; a global safety net fixes the whole class at once.
+      'let sawRTE=null;',
+      'process.on("unhandledRejection",(e)=>{ if(e && e.name==="ReferenceError" && !sawRTE) sawRTE=e; });',
+      'process.on("uncaughtException",()=>{});', // same belt-and-suspenders spirit as the risky-name denylist: never let a call we made crash this probe outright
+      'const risky=/^(write|apply|save|generate|run|queue|file|commit|push|delete|sync|remove|move|reset|migrate|send|post|exec|spawn|kill|install|build|next|onboard|clone)/i;',
+      'for(const [k,v] of Object.entries(m||{})){',
+      '  if(typeof v!=="function"||risky.test(k)||v.length>4) continue;',
+      '  try{',
+      '    const r=v();',
+      '    if(r && typeof r.then==="function") r.catch((e)=>{ if(e && e.name==="ReferenceError" && !sawRTE) sawRTE=e; });',
+      '  }catch(e){',
+      '    if(e && e.name==="ReferenceError"){ process.stderr.write("RTE "+k+": "+e.message); process.exit(3); }',
+      '  }',
+      '}',
+      // Give any pending promise rejection a chance to settle before deciding the
+      // verdict -- without this, a same-tick unhandledRejection listener can still fire
+      // AFTER the process would otherwise exit 0, silently losing a genuine async RTE.
+      'setTimeout(()=>{',
+      '  if(sawRTE){ process.stderr.write("RTE (async): "+sawRTE.message); process.exit(3); }',
+      '  process.exit(0);',
+      '},50);',
+    ].join('\n');
+    try {
+      // Timeout dropped 20s -> 8s: belt-and-suspenders alongside the risky-name fix above
+      // -- bounds the worst case for any FUTURE side-effecting export shape this denylist
+      // still doesn't anticipate, so a stray real subprocess fails fast instead of running
+      // wild for 20s.
+      execFileSync('node', ['-e', probe], {
+        cwd: dir, timeout: 8_000, stdio: ['ignore', 'ignore', 'pipe'],
+        env: { ...process.env, AGENT_MANAGER_REPO_ROOT: repoRoot },
+      });
+      return null;
+    } catch (e) {
+      const err = String((e && e.stderr) || (e && e.message) || e);
+      if (e && e.status === 3) return err.replace(/^RTE\s*/, '').split('\n')[0].slice(0, 200);
+      // A SIGTERM (e.signal) with no output is the timeout firing mid-call -- distinct
+      // from "the module could not even be require()d" (the ONLY case this branch used to
+      // describe), and worth saying so plainly rather than the misleading generic message.
+      if (e && e.signal && !err.trim()) {
+        return `${sourceFile}: an exported function ran long enough to hit the ${8_000}ms probe timeout (likely real side effects the risky-name filter didn't anticipate) -- rather than a missing dependency`;
+      }
+      const line = err.split('\n').find((l) => /Error:|ReferenceError|is not defined/.test(l)) || 'module failed to load';
+      return `${sourceFile}: ${line.trim().slice(0, 200)}`;
+    }
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+}
+```
+
+Problem:
+The function `firstRuntimeError` orchestrates six distinct, stateful phases — directory discovery, environment staging, file mirroring, probe construction, execution with timeout, and cleanup — each with its own failure modes and responsibilities. These are not merely “lines” of code but logically separate operations that are interleaved with error handling and state management, making the function hard to test, debug, extend, or reason about.
+
+Solution:
+Extract the six phases into six named functions: `gatherDirCandidates`, `resolveAncestorDir`, `stageRepoCopy`, `writeFilesToStage`, `buildRuntimeProbeScript`, and `runProbeAndWait`. Also extract the nested probe logic into `probeRuntimeExports`, which returns a promise or error with categorized failure modes. Each function should handle only one concern and return early on failure, with cleanup handled by a finally block or explicit `cleanupStage`.
+
+Benefits:
+Decomposing the function improves testability (each phase can be unit-tested in isolation), debuggability (failure modes are localized), extensibility (adding a new probe step doesn’t require touching the whole function), and readability (each function has a single responsibility). The error handling becomes explicit and composable, not interleaved with setup or execution logic.
