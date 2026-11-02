@@ -1444,3 +1444,230 @@ Decomposing the function enables unit tests per responsibility, localized change
 
 VERDICT CONSTRAINT:
 Genuine
+
+### AC-189 · classifyCatchConfidence is a composite of 10+ distinct logic paths
+Strength: Strong
+Files: src/observability-scan.js
+Symbol: classifyCatchConfidence
+Snippet:
+```
+// catch/except header. closeIndex: index of the closing `}` (JS) / last char of the block
+// (Python). Returns 'high' | 'low'. Pure string work, no AST.
+function classifyCatchConfidence({ stripped, text, headerIndex, closeIndex, isPython }) {
+  if (!CONFIDENCE_TIER_ON) return 'high';
+
+  // Genuinely silent -> HIGH.
+  if (stripped.length === 0) return 'high';
+  if (isPython && PY_EMPTY_EXCEPT_RE.test(stripped)) return 'high';
+
+  // Deliberate control flow in the body -> LOW.
+  if (RETURN_RE.test(stripped)) return 'low';
+  if (LOOP_CTRL_RE.test(stripped)) return 'low';
+
+  // Terminal clause of a try/…/finally whose finally is non-empty -> LOW (JS best-effort;
+  // a Python miss just stays HIGH).
+  if (!isPython && typeof closeIndex === 'number') {
+    const after = text.slice(closeIndex + 1, closeIndex + 400);
+    const fin = after.match(/^\s*finally\s*\{/);
+    if (fin) {
+      const finBody = extractBraceBody(text, closeIndex + 1 + fin[0].length - 1);
+      if (finBody !== null && stripComments(finBody).trim().length > 0) return 'low';
+    }
+  }
+
+  // Best-effort signal in the 12 lines above the header (a comment, or a `safe*`/`try_*`
+  // enclosing name). Loose on purpose -- a wrong LOW only reroutes to the digest, never
+  // drops the finding.
+  const upTo = text.slice(0, headerIndex);
+  const preWindow = upTo.split('\n').slice(-13).join('\n');
+  if (BEST_EFFORT_COMMENT_RE.test(preWindow) || BEST_EFFORT_NAME_RE.test(preWindow)) return 'low';
+
+  // Body has content but no control flow at all (bare assignment / lone call) -> genuinely
+  // silent, HIGH.
+  if (!CTRL_FLOW_RE.test(stripped)) return 'high';
+
+  return 'high';
+}
+const LOOP_CONTEXT_WINDOW_LINES = 40;
+const HEALTH_SIGNAL_RE = /heartbeat|health.?check|liveness|readiness/i;
+
+// Strips comments AND string/docstring literals from a body so a body that's "empty
+// except for a comment (or a lone docstring) explaining why it's intentionally empty"
+// doesn't read as suspicious content. Covers both languages: // and /* */ (JS), # (Python/
+// shell-ish), and triple-quoted Python strings.
+function stripComments(body) {
+  return body
+    .replace(/'''[\s\S]*?'''|"""[\s\S]*?"""/g, '')
+    .replace(/\/\/.*$/gm, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/#.*$/gm, '')
+    .trim();
+}
+
+// error-handling.md's Guidance #2/#3/self-diagnostics: a caught error that is neither
+// rethrown nor surfaced (logged, recorded as a metric, etc.) has silently vanished.
+// Skips a body containing any of these tokens -- presence of ANY of them is read as
+// "this error was surfaced somehow," even if imperfectly. Covers JS and Python idioms.
+const SURFACES_ERROR_RE = /throw|console\.|log(ger|ging)?\.|\.error\(|Error\(|raise\b|panic\(|record|notify|alert|metric|traceback|warn|capture_exception|sys\.exc_info|reject\(|Promise\.reject|next\(err|captureException|Sentry|reportError|toast\(|showError\(|\.exception\(|\.critical\(|\.fatal\(|print\(|(?:cb|callback|done)\(\s*err/i;
+
+
+// React/Vue-style client code surfaces a caught error by writing it to component state that the UI renders --
+// `catch (e) { setErrorMsg(e.message); setStatus('error'); }` -- not by logging. SURFACES_ERROR_RE cannot see that, so every such
+// handler was flagged (PF-Client-Portal 2026-09-19: Landing.tsx:209 and two of the six digest findings were exactly this, all
+// dismissed as false positives after a paid review call each). A state setter counts as surfacing when, and only when:
+//   - its name says it holds an error/message (setErr, setErrorMsg, setBulkMsg, setFailure, setToast, ...), or
+//   - it is handed the caught error itself (setX(e.message), setX(String(err))), or
+//   - it is handed an error-status string (setStatus('error'), setPhase("failed")),
+// and it is not just CLEARING state (setErr(null), setErrors({}), setMsg('')) -- clearing an error in a catch is a reset, not a report.
+// Deliberately NOT accepted: setData(null) / setResult(null) / setMe(null) -- state reset on failure with no message; those stay
+// flagged (LOW confidence, digest-batched) because the user is told nothing.
+const SETTER_CALL_RE = /\bset[A-Za-z0-9_$]*\s*\(/g;
+const ERRORISH_SETTER_NAME_RE = /^set\w*?(?:[Ee]rr|[Mm]sg|[Mm]essage|[Ff]ail|[Nn]otice|[Ww]arn|[Tt]oast|[Aa]lert|[Bb]anner)/;
+const ERROR_STATUS_LITERAL_RE = /['"`](?:error|errored|failed|failure|fail)['"`]/i;
+const CLEARING_ARGS_RE = /^\s*(?:null|undefined|''|""|``|false|0|\[\s*\]|\{\s*\})?\s*$/;
+
+// Text between the parens of a call whose "(" is at openIdx, or null when unbalanced.
+function callArgs(text, openIdx) {
+  let depth = 0;
+  for (let i = openIdx; i < text.length; i++) {
+    const c = text[i];
+    if (c === '(') depth++;
+    else if (c === ')' && --depth === 0) return text.slice(openIdx + 1, i);
+  }
+  return null;
+}
+
+// stripped: the comment-stripped catch body. caught: the caught identifier ('e', 'err', ...) or null for `catch {`. JS/TS only.
+function surfacesViaStateSetter(stripped, caught) {
+  const identRe = caught ? new RegExp(`(?<![\\w$.])${caught.replace(/\$/g, '\\$')}(?![\\w$])`) : null;
+  SETTER_CALL_RE.lastIndex = 0;
+  let m;
+  while ((m = SETTER_CALL_RE.exec(stripped))) {
+    const name = m[0].replace(/\s*\($/, '');
+    const args = callArgs(stripped, m.index + m[0].length - 1);
+    if (args === null) continue;
+    if (CLEARING_ARGS_RE.test(args)) continue;
+    if (ERRORISH_SETTER_NAME_RE.test(name)) return true;
+    if (ERROR_STATUS_LITERAL_RE.test(args)) return true;
+    if (identRe && identRe.test(args)) return true;
+  }
+  return false;
+}
+
+// A catch body that hands the caught error to a helper defined in the SAME file, where that helper's own body surfaces it, is a
+// report, not a swallow: `const fail = e => { say(''); alert(e.message); }` ... `catch (e) { fail(e); }`. VideoForge 2026-10-14: ten such
+// blocks were flagged and each dismissed as a false positive after a paid review call. Deliberately narrow:
+//   - the call must be handed the caught identifier itself (fail(e)), not merely exist,
+//   - the helper must be found in this file (an import or a method like this.fail(e) cannot be verified, so it stays flagged),
+//   - its body must pass SURFACES_ERROR_RE or write the error into the DOM -- ONE level only, no chasing helper-of-helper.
+const DOM_SURFACE_RE = /\.(?:textContent|innerText|innerHTML)\s*(?:\+)?=|setCustomValidity\s*\(/;
+const NOT_A_HELPER = new Set(['if', 'for', 'while', 'switch', 'catch', 'function', 'return', 'typeof', 'new', 'await', 'async']);
+
+// Body text of the function named `name` declared in `text` (declaration, `const f = (..) =>`, or `f = function(..)`), or null.
+function localFunctionBody(text, name) {
+  const n = name.replace(/\$/g, '\\$');
+  const declRe = new RegExp(`(?<![\\w$.])function\\s*\\*?\\s*${n}\\s*\\(`);
+  const assignRe = new RegExp(`(?<![\\w$.])(?:const|let|var)\\s+${n}\\s*=\\s*(?:async\\s*)?(?:function\\s*[\\w$]*\\s*\\(|(\\([^)]*\\)|[\\w$]+)\\s*=>)`);
+  let m = declRe.exec(text);
+  if (m) return bodyAfterParams(text, m.index + m[0].length - 1);
+  m = assignRe.exec(text);
+  if (!m) return null;
+  if (m[1] !== undefined) {                                   // arrow: braced body, or an expression running to the end of the line
+    let i = m.index + m[0].length;
+    while (/\s/.test(text[i] || '')) i++;
+    if (text[i] === '{') return extractBraceBody(text, i);
+    const eol = text.indexOf('\n', i);
+    return text.slice(i, eol === -1 ? text.length : eol);
+  }
+  return bodyAfterParams(text, m.index + m[0].length - 1);   // `function (` expression: m ends at its "("
+}
+function bodyAfterParams(text, openParenIdx) {
+  const args = callArgs(text, openParenIdx);
+  if (args === null) return null;
+  let i = openParenIdx + args.length + 2;
+  while (/\s/.test(text[i] || '')) i++;
+  return text[i] === '{' ? extractBraceBody(text, i) : null;
+}
+
+function surfacesViaLocalHelper(stripped, caught, fileText) {
+  if (!caught) return false;
+  const identRe = new RegExp(`(?<![\\w$.])${caught.replace(/\$/g, '\\$')}(?![\\w$])`);
+  const callRe = /(?<![\w$.])([A-Za-z_$][\w$]*)\s*\(/g;
+  let m;
+  while ((m = callRe.exec(stripped))) {
+    if (NOT_A_HELPER.has(m[1])) continue;
+    const args = callArgs(stripped, m.index + m[0].length - 1);
+    if (args === null || !identRe.test(args)) continue;
+    const body = localFunctionBody(fileText, m[1]);
+    if (body === null) continue;
+    const helper = stripComments(body);
+    if (SURFACES_ERROR_RE.test(helper) || DOM_SURFACE_RE.test(helper)) return true;
+  }
+  return false;
+}
+
+// The identifier a `catch (e)` / `catch (err: unknown)` header binds, or null (`catch {`).
+function caughtIdentifier(headerParens) {
+  const m = /^\(\s*([A-Za-z_$][\w$]*)/.exec(headerParens || '');
+  return m ? m[1] : null;
+}
+
+// A Python `except` body that is ONLY `pass` or `...` is the silent-swallow equivalent of
+// an empty JS catch block.
+const PY_EMPTY_EXCEPT_RE = /^(?:pass|\.\.\.)$/;
+
+
+// The RAW body (before stripComments) is non-empty but strips to nothing -> it is
+// exclusively comment(s): a documented, deliberate no-op, not a silent swallow. (JS only;
+// a Python `except:` body cannot be comment-only without a SyntaxError.)
+function isCommentOnlyBody(rawBody, strippedBody) {
+  return rawBody.trim().length > 0 && strippedBody.length === 0;
+}
+
+// A whitespace-collapsed fingerprint of the caught-error handler body -- stable across
+// reindentation and line drift, so observability-review.js can re-locate a persisted flag
+// against a re-scan of the current file even after commits moved its line number. Empty
+// bodies fingerprint as '' (matched by exact-line fallback instead).
+function bodyFingerprint(strippedBody) {
+  return String(strippedBody || '').replace(/\s+/g, ' ').trim();
+}
+
+function findSilentCatchBlocks(text, relPath) {
+  // Test / fixture / mock files deliberately swallow errors to exercise failure paths;
+  // flagging them is noise. Matches performance-scan.js's use of the same helper.
+  if (isTestFile(relPath)) return [];
+  if (relPath.endsWith('.py')) return findSilentExceptBlocks(text, relPath);
+  const findings = [];
+  const catchRe = /\bcatch\s*(\([^)]*\))?\s*\{/g;
+  let m;
+  while ((m = catchRe.exec(text))) {
+    const openIndex = m.index + m[0].length - 1;
+    const body = extractBraceBody(text, openIndex);
+    if (body === null) continue;
+    const stripped = stripComments(body);
+    // A body that is exclusively comment(s) is a documented, deliberate no-op.
+    if (isCommentOnlyBody(body, stripped)) continue;
+    // `catch { return <literal>; }` / bare `return;` etc. used to be skipped entirely
+    // here as "a deliberate on-failure-default convention, not a vanished error" -- but
+    // that convention is exactly the shape of a real, repeatedly-confirmed bug class
+    // (2026-09-15: countRecentCompletions's `catch { return 0; }` masked a genuine
+    // unreadable-directory error as "0 completions," identical to the healthy-quiet-
+    // pipeline case; its sibling countPending had the same shape before AC-57 fixed it).
+// ... [truncated for review: this function continues for 122 more line(s) not shown]
+```
+
+Problem:
+The function `classifyCatchConfidence` is 322 lines long not due to verbosity but because it bundles 10+ unrelated responsibilities — from detecting empty catch blocks, analyzing finally clauses, to identifying DOM surfaces or state setters — without any logical separation. This forces reviewers to mentally track multiple independent logic branches, making the function brittle to change and hard to test. Modifying one logic (e.g., updating `SURFACES_ERROR_RE`) requires navigating 322 lines, increasing regression risk.
+
+Solution:
+Extract each responsibility into its own small, named function: `classifyByEmptyness`, `classifyByFinallyBlock`, `classifyByContextSignals`, `classifyByStateSetters`, etc. Each should take only the necessary inputs and return a confidence tier or `null`. The main function becomes a simple chain of these, with early returns for `null` or `high` values. No new logic is added — only decomposition.
+
+Benefits:
+Decomposition reduces cognitive load during review, enables unit tests for each logic path in isolation, and makes future modifications safer and faster. The function’s length drops from 322 to ~50 lines of glue logic, while preserving all original behavior.
+
+VERDICT CONSTRAINT:
+- The function snippet IS provided above in this prompt; you do not need to request it or assume it is missing.
+- You MUST render exactly one verdict: GENUINE or FALSE POSITIVE.
+- Refusals, hedging, or a third outcome (including "Uncertain", "I cannot determine", or any other qualifier) are NOT acceptable. Pick the one verdict that best fits the evidence in the snippet and commit to it.
+
+Genuine
