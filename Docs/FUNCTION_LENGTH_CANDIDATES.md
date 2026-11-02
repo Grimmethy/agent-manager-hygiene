@@ -833,3 +833,207 @@ Decomposing this function makes each unit testable in isolation, reduces cogniti
 
 VERDICT CONSTRAINT:
 Genuine
+
+### AC-6 · Decompose Main Transformation Logic
+Strength: Strong
+Files: scripts/decompose-blueprint-extract.py
+Symbol: main
+Snippet:
+```
+
+
+def main(argv):
+    if len(argv) < 5:
+        fail(["usage: decompose-blueprint-extract.py <source.py> <bp_var> <bp_slug> <sym>..."])
+        return 2
+    path, bp_var, bp_slug, symbols = argv[1], argv[2], argv[3], argv[4:]
+    try:
+        src = open(path, "r", encoding="utf-8").read()
+        tree = ast.parse(src, filename=path)
+    except (OSError, SyntaxError, ValueError) as exc:
+        fail([f"{type(exc).__name__}: {exc}"])
+        return 2
+    lines = src.split("\n")
+
+    module_funcs, module_names = {}, set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            module_funcs.setdefault(node.name, node)
+            module_names.add(node.name)
+        elif isinstance(node, ast.ClassDef):
+            module_names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    module_names.add(t.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            module_names.add(node.target.id)
+
+    problems, moved = [], []
+    for s in symbols:
+        n = module_funcs.get(s)
+        if n is None:
+            problems.append(f"{s}: not a module-level function")
+        else:
+            moved.append(n)
+    if problems:
+        fail(problems)
+        return 0
+    # A blueprint move must carry at least one actual route (helpers may ride along, but a
+    # blueprint with zero @app.route views is a nonsense split).
+    if not any(any(decorator_is_app_route(d) for d in n.decorator_list) for n in moved):
+        fail([f"none of {', '.join(symbols)} is an @app.route view -- not a blueprint move"])
+        return 0
+
+    moved_names = {n.name for n in moved}
+    moved_lines = set()
+    for n in moved:
+        lo, hi = span(n)
+        moved_lines.update(range(lo, hi + 1))
+
+    strays = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in moved_names and node.lineno not in moved_lines:
+            strays.setdefault(node.id, []).append(node.lineno)
+    if strays:
+        fail([f"{s} is still referenced at line(s) {sorted(set(v))} outside the moved routes"
+              for s, v in strays.items()])
+        return 0
+
+    import_line_for = {}
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            line = "\n".join(lines[node.lineno - 1:node.end_lineno])
+            for a in node.names:
+                bound = a.asname or a.name
+                if isinstance(node, ast.Import):
+                    bound = bound.split(".")[0]
+                import_line_for[bound] = line
+
+    shared_deps = {}
+    needed_import_lines, seen = [], set()
+    flask_used = set()
+    for n in moved:
+        local_bound, read = set(), set()
+        # Walk the BODY only, not decorator_list -- `@app.route` is rewritten to
+        # `@<bp>.route`, so `app` from the decorator must not count as a body dependency.
+        for stmt in n.body:
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Name):
+                    (local_bound if isinstance(sub.ctx, ast.Store) else read).add(sub.id)
+                elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    local_bound.add(sub.name)
+                elif isinstance(sub, ast.arg):
+                    local_bound.add(sub.arg)
+        # Real incident, 2026-09-13: a return/param type annotation (`-> Path`, `x: dict`)
+        # is NOT part of n.body -- it lives on n.returns / arg.annotation -- so a name used
+        # ONLY in an annotation was invisible here, carried no import, and crashed at
+        # def-time (`NameError: name 'Path' is not defined`) the moment app.py imported the
+        # new module. Annotations can't assign (Store), so every Name found here is a read.
+        annotation_nodes = [n.returns] if n.returns else []
+        for a in n.args.args + n.args.posonlyargs + n.args.kwonlyargs + ([n.args.vararg] if n.args.vararg else []) + ([n.args.kwarg] if n.args.kwarg else []):
+            if a.annotation:
+                annotation_nodes.append(a.annotation)
+        for ann in annotation_nodes:
+            for sub in ast.walk(ann):
+                if isinstance(sub, ast.Name):
+                    read.add(sub.id)
+        for a in n.args.args + n.args.posonlyargs + n.args.kwonlyargs:
+            local_bound.add(a.arg)
+        if n.args.vararg:
+            local_bound.add(n.args.vararg.arg)
+        if n.args.kwarg:
+            local_bound.add(n.args.kwarg.arg)
+        shared_deps[n.name] = sorted(
+            x for x in read
+            if x in module_names and x not in moved_names
+            and x not in local_bound and x not in BUILTIN_NAMES and x != "app")
+        for x in sorted(read):
+            if x in FLASK_NAMES:
+                flask_used.add(x)
+            elif x in import_line_for and x not in local_bound and x not in BUILTIN_NAMES:
+                il = import_line_for[x]
+                if il not in seen:
+                    seen.add(il)
+                    needed_import_lines.append(il)
+
+    all_deps = sorted({d for ds in shared_deps.values() for d in ds})
+    flask_import = "from flask import Blueprint"
+    if flask_used:
+        flask_import += ", " + ", ".join(sorted(flask_used))
+
+    header = [flask_import]
+    if needed_import_lines:
+        header.append("")
+        header.extend(needed_import_lines)
+    header += [
+        "",
+        f"# The app.py helpers these views call ({', '.join(all_deps) or 'none'}) are",
+        "# imported lazily inside each view: app.py imports THIS module to register the",
+        "# blueprint, so a top-level `from app import ...` is a circular import that only",
+        "# fails when app.py is the entrypoint (how the dashboard runs). By the time a view",
+        "# runs, app.py is fully initialised and the import is just a dict lookup. (Same",
+        "# pattern as routes/concepts.py, routes/second_brain.py, routes/reports.py.)",
+        "",
+        f'{bp_var} = Blueprint("{bp_slug}", __name__)',
+        "",
+        "",
+    ]
+
+    fn_texts = []
+    for n in moved:
+        lo, hi = span(n)
+        body = lines[lo - 1:hi]
+        out = []
+        for bl in body:
+            stripped = bl.lstrip()
+            if is_route_decorator_line(stripped):
+                indent = bl[:len(bl) - len(stripped)]
+                bl = indent + "@" + bp_var + stripped[len("@app"):]
+            out.append(bl)
+        def_idx = next(i for i, x in enumerate(out)
+                       if x.lstrip().startswith(("def ", "async def ")))
+        insert_at = def_idx + 1
+        fb = n.body[0] if n.body else None
+        if (isinstance(fb, ast.Expr) and isinstance(getattr(fb, "value", None), ast.Constant)
+                and isinstance(fb.value.value, str)):
+            insert_at = (fb.end_lineno - lo) + 1
+        deps = shared_deps[n.name]
+        if deps:
+            out = out[:insert_at] + [f"    from app import {', '.join(deps)}"] + out[insert_at:]
+        fn_texts.append("\n".join(out))
+
+    new_content = "\n".join(header) + "\n\n\n".join(fn_texts) + "\n"
+
+    spans = sorted((span(n) for n in moved), reverse=True)
+    red = lines[:]
+    for lo, hi in spans:
+        end = hi
+        while end < len(red) and red[end].strip() == "":
+            end += 1
+        del red[lo - 1:end]
+    reduced = "\n".join(red)
+    while "\n\n\n\n" in reduced:
+        reduced = reduced.replace("\n\n\n\n", "\n\n\n")
+
+    print(json.dumps({
+        "ok": True,
+        "newFileContent": new_content,
+        "reducedSource": reduced,
+        "sharedDeps": shared_deps,
+        "movedCount": len(moved),
+    }))
+    return 0
+```
+
+Problem:
+The function `main` is 182 lines long and performs at least eight distinct, tightly coupled responsibilities: argument validation, AST parsing, symbol validation, stray reference detection, import analysis, blueprint header construction, function body transformation, and JSON output generation. These phases are interleaved with branching logic and state mutations, making the function a single monolithic transformation pipeline. The length is not merely voluminous—it reflects real cognitive complexity, as each phase has unique invariants and edge cases. A human reviewer must mentally track state across multiple concerns, which is error-prone and hard to test.
+
+Solution:
+Extract the following into separate, single-responsibility functions: `validate_arguments`, `extract_module_symbols`, `validate_moved_symbols`, `detect_stray_references`, `analyze_imports_and_deps`, `construct_blueprint_header`, `transform_function_bodies`, and `generate_output`. Each should take a consistent state object and return a mutated state or a result. The main function becomes a coordinator that orchestrates these steps in order, passing state between them. No function should mutate global state or perform multiple unrelated tasks.
+
+Benefits:
+Decomposing this function improves testability, as each unit can be unit-tested in isolation. It also improves readability, since each function has a clear purpose and boundary. Reviewers can focus on one concern at a time, reducing cognitive load. Maintenance becomes easier: changes to one phase (e.g., import analysis) won’t risk breaking unrelated logic (e.g., decorator rewriting).
+
+VERDICT CONSTRAINT:
+Genuine
