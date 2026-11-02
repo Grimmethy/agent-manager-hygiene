@@ -214,3 +214,174 @@ VERDICT CONSTRAINT (mandatory for this task):
 - Refusals, hedging, or a third outcome (including "Uncertain", "I cannot determine", or any other qualifier) are NOT acceptable. Pick the one verdict that best fits the evidence in the snippet and commit to it.
 
 VERDICT: GENUINE
+
+### AC-2 · Decompose Long Validation Orchestrator
+Strength: Strong
+Files: src/file-decompose-to-hub.js
+Symbol: validatePlan
+Snippet:
+```
+// hardProblems block the whole plan (hub filed blocked, no children). Shared deps do not
+// block -- they are threaded into the move + wiring prompts.
+function validatePlan(repoRoot, request) {
+  const hardProblems = [];
+  const moveMeta = [];
+  const allMovedSymbols = new Set();
+  for (const m of request.moves) for (const s of (m.symbols || [])) allMovedSymbols.add(s);
+
+  // A plain CommonJS source (src/*.js) -- neither an HTML <script> nor a .py. Run the
+  // whole plan through decompose-node-module.js once: it chains the N moves and only
+  // succeeds if EVERY move is a self-contained set of top-level function declarations
+  // (references only each other + require()d names + JS globals). ok -> every move gets
+  // nodeModuleApplyOk (the .js analogue of deterministicApplyOk); not-ok -> one hard
+  // problem with the exact reason. The move `kind` (script-extract vs module-extract) is
+  // irrelevant here -- .js wiring is require()/module.exports either way.
+  //
+  // 2026-09-14, screaminggoatclubmt: "Harden [this]" -- caught live: this branch used to
+  // match ANY .js source by extension alone, with zero regard for whether it's actually a
+  // Node CommonJS module. python/dashboard/static/js/*.js files are loaded via a plain
+  // browser `<script src>` tag (see index.html) -- no bundler, no Node runtime, `require`
+  // is not a defined identifier there at all. The produced split used real
+  // require()/module.exports wiring anyway, which would have thrown "require is not
+  // defined" the instant the browser loaded it, breaking the Models/Deep-Dive/Discovery/
+  // Tokenfold tabs -- caught before merge only because this session verifies every branch
+  // for real before recommending one. looksLikeNodeCommonJsModule (require()/module.exports
+  // ANYWHERE in the source) gates this branch now; every real Node module in this repo has
+  // at least one of those (confirmed: 0 occurrences across every static/js/*.js file,
+  // 20+ each across a sample of real src/*.js modules). A file that fails this gate falls
+  // through to the generic per-move loop below, which already handles `script-extract`
+  // moves in a browser-safe way (staticCheckScriptExtractMove, verbatim extraction, no
+  // require()/module.exports wiring at all) -- built and proven for plain .js sources
+  // back on 2026-09-08 (review-task.js), just never reachable for THIS class of file
+  // because this earlier, broader check always intercepted it first.
+  if (/\.(js|mjs|cjs)$/.test(request.sourceFile || '')) {
+    let sourceText = null;
+    try { sourceText = fs.readFileSync(path.join(repoRoot, request.sourceFile), 'utf8'); } catch { /* unreadable -> advisory only */ }
+    if (sourceText != null && looksLikeNodeCommonJsModule(sourceText, request.sourceFile)) {
+      const built = buildNodeModuleOnePassChanges(sourceText, request.sourceFile, request.moves.map((m) => ({ newFile: m.newFile, symbols: m.symbols || [] })), repoRoot);
+      if (built.ok) {
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [], nodeModuleApplyOk: true });
+      } else {
+        hardProblems.push(`${request.sourceFile}: ${built.reason}`);
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+      }
+      return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+    }
+    // Unreadable, OR readable but not a CommonJS module -- fall through to the generic
+    // per-move loop below rather than returning here.
+  }
+
+  // A .py source whose plan is ALL flask-blueprint moves: run the whole plan through
+  // decompose-flask-blueprint.js once (AST extract + py_compile). ok -> every move gets
+  // blueprintApplyOk and fileHub short-circuits to a single deterministic one-pass task
+  // (no hub, no per-move 27B agentic pass -- which on a large app.py runs out of turn
+  // budget before finishing: the 2026-09-09 blueprint hub). not-ok -> one hard problem.
+  // A MIXED .py plan (some blueprint, some not) still falls through to the per-move path.
+  if (process.env.AGENT_MANAGER_DECOMPOSE_BLUEPRINT !== 'false'
+      && /\.py$/.test(request.sourceFile || '') && request.moves.length
+      && request.moves.every((m) => m.kind === 'flask-blueprint' && m.blueprint)) {
+    let sourceText = null;
+    try { sourceText = fs.readFileSync(path.join(repoRoot, request.sourceFile), 'utf8'); } catch { /* unreadable -> advisory only */ }
+    if (sourceText != null) {
+      const built = buildBlueprintOnePassChanges(sourceText, request.sourceFile,
+        request.moves.map((m) => ({ newFile: m.newFile, blueprint: m.blueprint, symbols: m.symbols || [] })));
+      if (built.ok) {
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [], blueprintApplyOk: true });
+      } else {
+        hardProblems.push(`${request.sourceFile}: ${built.reason}`);
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+      }
+    } else {
+      for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+    }
+    return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+  }
+
+  // A .py source whose plan is ALL python-module-extract moves (2026-09-26): the plain,
+  // non-route sibling of the flask-blueprint branch above -- for helper functions with no
+  // @app.route to anchor a Blueprint on (traced live: computeRoutelessSections in
+  // file-decompose-plan-pass.js was excluding these from every candidate set entirely, so
+  // app.py's plan pass returned null on every tick with 193/194 symbols routeless and
+  // nothing ever filed). Same AST-extract + py_compile discipline, no wiring step -- a
+  // plain module has nothing to register. A MIXED .py plan still falls through below.
+  if (process.env.AGENT_MANAGER_DECOMPOSE_PY_MODULE !== 'false'
+      && /\.py$/.test(request.sourceFile || '') && request.moves.length
+      && request.moves.every((m) => m.kind === 'python-module-extract')) {
+    let sourceText = null;
+    try { sourceText = fs.readFileSync(path.join(repoRoot, request.sourceFile), 'utf8'); } catch { /* unreadable -> advisory only */ }
+    if (sourceText != null) {
+      const built = buildPythonModuleOnePassChanges(sourceText, request.sourceFile,
+        request.moves.map((m) => ({ newFile: m.newFile, symbols: m.symbols || [] })));
+      if (built.ok) {
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [], pythonModuleApplyOk: true });
+      } else {
+        hardProblems.push(`${request.sourceFile}: ${built.reason}`);
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+      }
+    } else {
+      for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+    }
+    return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+  }
+
+  for (const move of request.moves) {
+    const symbols = move.symbols || [];
+    const meta = { sharedDeps: [], neededImports: [] };
+    if (symbols.length === 0) {
+      hardProblems.push(`${move.newFile}: move has no symbols`);
+      moveMeta.push(meta);
+      continue;
+    }
+    if (move.kind === 'script-extract') {
+      const seCheck = staticCheckScriptExtractMove(repoRoot, request.sourceFile, symbols);
+      if (seCheck && seCheck.resolvable) {
+        if (!seCheck.ok) {
+          hardProblems.push(`${move.newFile}: ${seCheck.missing.join(', ')} could not be located as top-level function declarations in ${request.sourceFile}`);
+        } else {
+          // Every symbol resolves cleanly -- this move can skip the model entirely at
+          // apply time (see local-draft.js's tryDeterministicScriptExtractEdit).
+          meta.deterministicApplyOk = true;
+        }
+      }
+      moveMeta.push(meta);
+      continue;
+    }
+    const check = staticCheckMove(repoRoot, request.sourceFile, symbols);
+    if (check) {
+      if (check.missing && check.missing.length) {
+        hardProblems.push(`${move.newFile}: ${check.missing.join(', ')} not defined at module scope in ${request.sourceFile}`);
+      }
+      const strays = Object.entries(check.externalRefs || {});
+      if (strays.length) {
+        hardProblems.push(`${move.newFile}: ${strays.map(([s, lines]) => `${s} is still referenced elsewhere in ${request.sourceFile} (line(s) ${lines.slice(0, 6).join(', ')})`).join('; ')} -- not a self-contained move`);
+      }
+      // `app` is expected for a flask-blueprint move (every @app.route becomes
+      // @<bp>.route); anything else that resolves to an app.py module-level name and is
+      // not itself being moved becomes a cross-module import.
+      meta.sharedDeps = (check.sharedDeps || []).filter((d) => {
+        if (d === 'app' && move.kind === 'flask-blueprint') return false;
+        return !allMovedSymbols.has(d);
+      });
+      meta.neededImports = check.neededImports || [];
+    }
+    moveMeta.push(meta);
+  }
+  return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+}
+```
+
+Problem:
+The function `validatePlan` is 145 lines long and combines three distinct validation responsibilities — Node CommonJS module checks, Flask blueprint validation, Python module extraction, and generic move validation — into a single monolithic block. Each branch has its own logic, error handling, and return structure, yet they all share mutable state (`hardProblems`, `moveMeta`, `allMovedSymbols`) and are executed sequentially with no isolation. This violates the Single Responsibility Principle and makes the function hard to test, extend, debug, and read — any change to one validation type risks breaking or confusing behavior in another.
+
+Solution:
+Extract each validation branch into its own named, independently testable function: `validateNodeCommonJsModule`, `validateFlaskBlueprint`, `validatePythonModule`, and `validateGenericMoves`. The main `validatePlan` function becomes a thin orchestrator that initializes shared state, calls each sub-function in sequence, and aggregates results. Each sub-function should accept the same inputs and return a consistent result structure (ok, hardProblems, moveMeta) to ensure predictable composition.
+
+Benefits:
+Once decomposed, each validation type can be unit-tested in isolation with mocked dependencies. Adding a new validation type becomes trivial — just write a new `validateXXX` function and add it to the main orchestrator’s call list. The code becomes more readable, maintainable, and less error-prone during future changes or debugging.
+
+VERDICT CONSTRAINT (mandatory for this task):
+- The function snippet IS provided above in this prompt; you do not need to request it or assume it is missing.
+- You MUST render exactly one verdict: GENUINE or FALSE POSITIVE.
+- Refusals, hedging, or a third outcome (including "Uncertain", "I cannot determine", or any other qualifier) are NOT acceptable. Pick the one verdict that best fits the evidence in the snippet and commit to it.
+
+VERDICT: GENUINE
