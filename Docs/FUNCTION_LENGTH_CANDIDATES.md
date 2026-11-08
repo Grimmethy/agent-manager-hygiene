@@ -1,0 +1,1863 @@
+# Function Length Decomposition Candidates
+
+### AC-1 · Decompose fileHub into Atomic Responsibilities
+Strength: Strong
+Files: src/file-decompose-to-hub.js
+Symbol: fileHub
+Snippet:
+```
+}
+
+function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
+  // Always validate now (was stacked-only) -- Tier 1's planIsFullyMechanicalHtml needs
+  // every move's `deterministicApplyOk`, and a non-resolvable symbol should block a
+  // per-move-branch hub just as it blocks a stacked one. validatePlan is non-destructive:
+  // an unavailable Python checker returns null -> no false hard-problem.
+  const validation = validatePlan(repoRoot, request);
+  if (!validation.ok) {
+    return fileBlockedHub({ pipelineDir, requestFile, request, now, hardProblems: validation.hardProblems });
+  }
+
+  // Tier 1 ([[hub-task-integration]] / spec Docs/hub-task-independent-merge.md): a fully-
+  // mechanical HTML plan (every move a script-extract, every symbol deterministicApplyOk)
+  // has no judgement left. File ONE deterministic task instead of a stacked hub of N move
+  // children + a wiring child + a multi-day merge window -- local-draft.js's
+  // tryDeterministicOnePassDecompose runs the whole split with no model call, against
+  // CURRENT main, in one tick. Fall through to the hub if it doesn't qualify.
+  if (planIsFullyMechanicalHtml(request, validation)) {
+    return fileOnePassTask({ pipelineDir, requestFile, request, now, kind: 'html' });
+  }
+
+  // Same, for a plain CommonJS source (src/*.js): every move a self-contained function
+  // cluster (decompose-node-module.js) -> ONE deterministic task, no hub. This is what
+  // finally lets a src/*.js file be decomposed by the pipeline at all -- until now the
+  // only shapes with a deterministic path were HTML <script> and flask-blueprint.
+  if (planIsFullyMechanicalNodeModule(request, validation)) {
+    return fileOnePassTask({ pipelineDir, requestFile, request, now, kind: 'node-module' });
+  }
+
+  // Same, for an all-flask-blueprint .py plan: one deterministic task (AST extract +
+  // register_blueprint splice + py_compile), no hub, no per-move 27B agentic pass.
+  if (planIsFullyMechanicalBlueprint(request, validation)) {
+    return fileOnePassTask({ pipelineDir, requestFile, request, now, kind: 'flask-blueprint' });
+  }
+
+  // Same, for an all-python-module-extract .py plan: one deterministic task (AST extract +
+  // py_compile, no register_blueprint wiring since there's nothing to register). This is
+  // what finally lets a routeless-helper-heavy file like app.py's current shape be
+  // decomposed at all -- until now the only deterministic .py path required an @app.route.
+  if (planIsFullyMechanicalPythonModule(request, validation)) {
+    return fileOnePassTask({ pipelineDir, requestFile, request, now, kind: 'python-module' });
+  }
+
+  // Hot-file exclusion applies ONLY here, past every Tier-1 short-circuit above (2026-09-14
+  // fix -- screaminggoatclubmt: "we need these things broken down into manageable chunks
+  // as we build them", found live when the proactive sweep held app.py's flask-blueprint
+  // decomposes for a full week even though every one of them landed as a single Tier-1
+  // one-pass commit, never the multi-day Tier-2 hub this guard exists to protect). Do NOT
+  // stamp hubFiledAt/hubId -- leaving the request unresolved means sweep() above just
+  // retries this same cheap (no model call) check on its next tick, and materialises the
+  // real hub the moment the file cools down.
+  if (fileHasRecentCommits(repoRoot, request.sourceFile)) {
+    return { deferred: true, reason: `${request.sourceFile} has commits in the last ${HOT_FILE_DAYS} days -- Tier-2 hub deferred until it cools down` };
+  }
+
+  const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
+  const coordDir = path.join(pipelineDir, 'queue', 'coordinating');
+  fs.mkdirSync(adhocDir, { recursive: true });
+  fs.mkdirSync(coordDir, { recursive: true });
+  const nowIso = new Date(now).toISOString();
+  const planSlug = slugify(request.id);
+  const moves = request.moves;
+  const stacked = stackedEnabled();
+  const branch = `agent/decompose-${planSlug}`;
+
+  // Deterministic wiring (wire-decomposed-blueprints.js): for flask-blueprint moves the
+  // coordinator splices the `register_blueprint` block itself once every move child is
+  // done -- no LLM wiring child. Anything else (script-extract, plain require) still gets
+  // an LLM wiring child, scoped to just those moves. Kill switch: DECOMPOSE_DET_WIRING.
+  const bpMoves = moves.filter((m) => m.kind === 'flask-blueprint');
+  const otherMoves = moves.filter((m) => m.kind !== 'flask-blueprint');
+  const useDetWiring = stacked && bpMoves.length > 0
+    && process.env.AGENT_MANAGER_DECOMPOSE_DET_WIRING !== 'false';
+  const fileWiringChild = !useDetWiring || otherMoves.length > 0;
+  const wiringChildMoves = useDetWiring ? otherMoves : moves;
+  const wiringChildCount = fileWiringChild ? 1 : 0;
+
+  const children = [];
+  const moveIds = [];
+  let prevId = null;
+  moves.forEach((move, i) => {
+    const id = `adhoc-decompose-${planSlug}-${String(i + 1).padStart(2, '0')}-${slugify(path.basename(move.newFile))}`.slice(0, 120);
+    moveIds.push(id);
+    // Deterministic apply (2026-09-07, "Ghost in the Machine" concept): a script-extract
+    // move validatePlan() already confirmed resolves every symbol cleanly skips the model
+    // entirely at draft time -- see local-draft.js's tryDeterministicScriptExtractEdit.
+    // symbols/sourceFile are stashed here (not just baked into the prose rawText) so that
+    // check has real structured data to act on without re-parsing English.
+    const deterministic = move.kind === 'script-extract' && validation.moveMeta[i] && validation.moveMeta[i].deterministicApplyOk;
+    const record = {
+      id,
+      domain: 'adhoc',
+      source: 'manual',
+      title: `Decompose ${request.sourceFile} → ${move.newFile}`,
+      createdAt: nowIso,
+      promptContext: {
+        rawText: moveRawText(request, move, i, moves.length, validation.moveMeta[i]),
+        decomposedFrom: `file-decompose-hub-${planSlug}`,
+        moveIndex: i,
+        newFile: move.newFile,
+        ...(deterministic ? { deterministicApply: 'script-extract', sourceFile: request.sourceFile, symbols: move.symbols } : {}),
+      },
+    };
+    if (stacked) {
+      record.atomic = true;
+      record.noDecompose = true;
+      record.stacked = { branch, seq: i + 1, total: moves.length + wiringChildCount };
+      if (prevId) record.dependsOn = [prevId];
+    }
+    // premiumPriority propagation (2026-09-08, Grimmethy: "any time a hub process that is
+    // set to premium priority generates a new child, that child should be set to premium
+    // priority as well. I've had to manually set premium on the last 2 children of
+    // decompose") -- same propagation apply-adhoc-diff.js's queueSubTasks already does for
+    // a plain RESOLUTION: decompose split; this hub-based path had no equivalent at all.
+    if (request.premiumPriority) record.premiumPriority = true;
+    fs.writeFileSync(path.join(adhocDir, `${id}.json`), `${JSON.stringify(record, null, 2)}\n`);
+    children.push({ id, title: record.title, status: 'pending' });
+    prevId = id;
+  });
+
+  // Final wiring task. In stacked mode it depends only on the last move (the chain is
+  // sequential); in legacy mode it waits on every move being merged. Skipped entirely when
+  // every move is a flask-blueprint the coordinator wires deterministically.
+  if (fileWiringChild) {
+    const wireId = `adhoc-decompose-${planSlug}-99-wiring`.slice(0, 120);
+    const wiringMetas = wiringChildMoves.map((m) => validation.moveMeta[moves.indexOf(m)]);
+    const wiringRecord = {
+      id: wireId,
+      domain: 'adhoc',
+      source: 'manual',
+      title: `Decompose ${request.sourceFile} — wire up ${wiringChildMoves.length} new file(s)`,
+      createdAt: nowIso,
+      dependsOn: stacked ? [prevId] : moveIds,
+      promptContext: { rawText: wiringRawText(request, wiringChildMoves, wiringMetas), decomposedFrom: `file-decompose-hub-${planSlug}` },
+    };
+    if (stacked) {
+      wiringRecord.atomic = true;
+      wiringRecord.noDecompose = true;
+      wiringRecord.stacked = { branch, seq: moves.length + 1, total: moves.length + wiringChildCount };
+    }
+    if (request.premiumPriority) wiringRecord.premiumPriority = true;
+    fs.writeFileSync(path.join(adhocDir, `${wireId}.json`), `${JSON.stringify(wiringRecord, null, 2)}\n`);
+    children.push({ id: wireId, title: `wire up ${wiringChildMoves.length} new file(s)`, status: 'pending' });
+  }
+
+  const hubId = `file-decompose-hub-${planSlug}`;
+  const hub = {
+    id: hubId,
+    domain: 'adhoc',
+    source: 'manual',
+    status: 'coordinating',
+    adhocResolution: 'decompose',
+    title: `Decompose ${request.sourceFile} (${moves.length} module(s))`,
+    createdAt: nowIso,
+    promptContext: { rawText: `Coordinator for the ${request.id} decomposition of ${request.sourceFile}.`, decomposedFrom: hubId },
+    subTasks: children,
+    progress: { done: 0, total: children.length },
+    planValidation: { ok: true, sharedDeps: validation.moveMeta.map((m) => m.sharedDeps || []), checkedAt: nowIso },
+    // decomposeHub: coordinator-sweep.js treats a non-stacked one specially -- it does NOT
+    // complete until every move child is actually MERGED to main (not merely `done` on its
+    // own agent/<id> branch), reconciling each via the commit trailer. sourceFile is kept
+    // here (not just for stacked) so a later per-move integration gate has the target.
+    decomposeHub: true,
+    sourceFile: request.sourceFile,
+    ...(request.premiumPriority ? { premiumPriority: true } : {}),
+    // parentHub (2026-09-08): propagated from the request the same way premiumPriority is,
+    // above -- set by decompose-loop-autoroute.js when this hub rescues a stuck child of an
+    // existing hub, so the dashboard's Hub Tasks tab can render the real family tree.
+    ...(request.parentHub ? { parentHub: request.parentHub } : {}),
+    history: [{ stage: 'created', at: nowIso, detail: `file-decompose-to-hub: filed ${moves.length} move task(s)${useDetWiring ? ` + deterministic wiring for ${bpMoves.length} blueprint(s)` : ''}${fileWiringChild ? ` + 1 LLM wiring task${useDetWiring ? ` for ${otherMoves.length} non-blueprint move(s)` : ''}` : ''}${stacked ? ` (stacked on ${branch})` : ''}` }],
+  };
+  if (stacked) {
+    hub.mode = 'stacked';
+    hub.branch = branch;
+    hub.sourceFile = request.sourceFile;
+    hub.integrationGate = { status: 'pending' };
+  }
+  if (useDetWiring) {
+    hub.wiringPending = true;
+    hub.wiringMoves = bpMoves.map((m) => ({ newFile: m.newFile, blueprint: m.blueprint, kind: m.kind }));
+  }
+  fs.writeFileSync(path.join(coordDir, `${hubId}.json`), `${JSON.stringify(hub, null, 2)}\n`);
+
+  request.hubFiledAt = nowIso;
+  request.hubId = hubId;
+  request.hubChildIds = children.map((c) => c.id);
+  if (stacked) request.branch = branch;
+  fs.writeFileSync(requestFile, `${JSON.stringify(request, null, 2)}\n`);
+  return { hubId, childCount: children.length, stacked, branch: stacked ? branch : undefined };
+}
+```
+
+Problem:
+The function `fileHub` is 189 lines long and orchestrates six distinct responsibilities: short-circuit validation for deterministic tasks, hot-file exclusion, deterministic wiring logic, child task generation, hub construction with persistence, and stacked mode logic. These responsibilities are tightly coupled, making the function hard to test, debug, or modify without risking unintended side effects. The logic is not logically grouped, and state mutations occur across unrelated concerns, increasing cognitive load and error risk.
+
+Solution:
+Extract six named functions: `validateAndShortCircuit`, `generateChildren`, `constructHub`, `writeRequestFile`, and `returnHubResult`. Each handles one logical concern. `validateAndShortCircuit` handles early returns for deterministic tasks and hot files. `generateChildren` creates move and wiring tasks based on mode and move types. `constructHub` builds the hub object, writes it to disk, and mutates the request. `writeRequestFile` persists the updated request. `returnHubResult` returns the structured result. These functions are self-contained, testable, and isolated from each other.
+
+Benefits:
+Decomposing the function improves readability by isolating concerns, enables unit testing of each piece independently, and reduces the risk of side effects when modifying any part. It also makes future enhancements or bug fixes more localized and less error-prone, since each function has a single responsibility and clear boundaries.
+
+VERDICT CONSTRAINT (mandatory for this task):
+- The function snippet IS provided above in this prompt; you do not need to request it or assume it is missing.
+- You MUST render exactly one verdict: GENUINE or FALSE POSITIVE.
+- Refusals, hedging, or a third outcome (including "Uncertain", "I cannot determine", or any other qualifier) are NOT acceptable. Pick the one verdict that best fits the evidence in the snippet and commit to it.
+
+VERDICT: GENUINE
+
+### AC-2 · Decompose Long Validation Orchestrator
+Strength: Strong
+Files: src/file-decompose-to-hub.js
+Symbol: validatePlan
+Snippet:
+```
+// hardProblems block the whole plan (hub filed blocked, no children). Shared deps do not
+// block -- they are threaded into the move + wiring prompts.
+function validatePlan(repoRoot, request) {
+  const hardProblems = [];
+  const moveMeta = [];
+  const allMovedSymbols = new Set();
+  for (const m of request.moves) for (const s of (m.symbols || [])) allMovedSymbols.add(s);
+
+  // A plain CommonJS source (src/*.js) -- neither an HTML <script> nor a .py. Run the
+  // whole plan through decompose-node-module.js once: it chains the N moves and only
+  // succeeds if EVERY move is a self-contained set of top-level function declarations
+  // (references only each other + require()d names + JS globals). ok -> every move gets
+  // nodeModuleApplyOk (the .js analogue of deterministicApplyOk); not-ok -> one hard
+  // problem with the exact reason. The move `kind` (script-extract vs module-extract) is
+  // irrelevant here -- .js wiring is require()/module.exports either way.
+  //
+  // 2026-09-14, screaminggoatclubmt: "Harden [this]" -- caught live: this branch used to
+  // match ANY .js source by extension alone, with zero regard for whether it's actually a
+  // Node CommonJS module. python/dashboard/static/js/*.js files are loaded via a plain
+  // browser `<script src>` tag (see index.html) -- no bundler, no Node runtime, `require`
+  // is not a defined identifier there at all. The produced split used real
+  // require()/module.exports wiring anyway, which would have thrown "require is not
+  // defined" the instant the browser loaded it, breaking the Models/Deep-Dive/Discovery/
+  // Tokenfold tabs -- caught before merge only because this session verifies every branch
+  // for real before recommending one. looksLikeNodeCommonJsModule (require()/module.exports
+  // ANYWHERE in the source) gates this branch now; every real Node module in this repo has
+  // at least one of those (confirmed: 0 occurrences across every static/js/*.js file,
+  // 20+ each across a sample of real src/*.js modules). A file that fails this gate falls
+  // through to the generic per-move loop below, which already handles `script-extract`
+  // moves in a browser-safe way (staticCheckScriptExtractMove, verbatim extraction, no
+  // require()/module.exports wiring at all) -- built and proven for plain .js sources
+  // back on 2026-09-08 (review-task.js), just never reachable for THIS class of file
+  // because this earlier, broader check always intercepted it first.
+  if (/\.(js|mjs|cjs)$/.test(request.sourceFile || '')) {
+    let sourceText = null;
+    try { sourceText = fs.readFileSync(path.join(repoRoot, request.sourceFile), 'utf8'); } catch { /* unreadable -> advisory only */ }
+    if (sourceText != null && looksLikeNodeCommonJsModule(sourceText, request.sourceFile)) {
+      const built = buildNodeModuleOnePassChanges(sourceText, request.sourceFile, request.moves.map((m) => ({ newFile: m.newFile, symbols: m.symbols || [] })), repoRoot);
+      if (built.ok) {
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [], nodeModuleApplyOk: true });
+      } else {
+        hardProblems.push(`${request.sourceFile}: ${built.reason}`);
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+      }
+      return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+    }
+    // Unreadable, OR readable but not a CommonJS module -- fall through to the generic
+    // per-move loop below rather than returning here.
+  }
+
+  // A .py source whose plan is ALL flask-blueprint moves: run the whole plan through
+  // decompose-flask-blueprint.js once (AST extract + py_compile). ok -> every move gets
+  // blueprintApplyOk and fileHub short-circuits to a single deterministic one-pass task
+  // (no hub, no per-move 27B agentic pass -- which on a large app.py runs out of turn
+  // budget before finishing: the 2026-09-09 blueprint hub). not-ok -> one hard problem.
+  // A MIXED .py plan (some blueprint, some not) still falls through to the per-move path.
+  if (process.env.AGENT_MANAGER_DECOMPOSE_BLUEPRINT !== 'false'
+      && /\.py$/.test(request.sourceFile || '') && request.moves.length
+      && request.moves.every((m) => m.kind === 'flask-blueprint' && m.blueprint)) {
+    let sourceText = null;
+    try { sourceText = fs.readFileSync(path.join(repoRoot, request.sourceFile), 'utf8'); } catch { /* unreadable -> advisory only */ }
+    if (sourceText != null) {
+      const built = buildBlueprintOnePassChanges(sourceText, request.sourceFile,
+        request.moves.map((m) => ({ newFile: m.newFile, blueprint: m.blueprint, symbols: m.symbols || [] })));
+      if (built.ok) {
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [], blueprintApplyOk: true });
+      } else {
+        hardProblems.push(`${request.sourceFile}: ${built.reason}`);
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+      }
+    } else {
+      for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+    }
+    return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+  }
+
+  // A .py source whose plan is ALL python-module-extract moves (2026-09-26): the plain,
+  // non-route sibling of the flask-blueprint branch above -- for helper functions with no
+  // @app.route to anchor a Blueprint on (traced live: computeRoutelessSections in
+  // file-decompose-plan-pass.js was excluding these from every candidate set entirely, so
+  // app.py's plan pass returned null on every tick with 193/194 symbols routeless and
+  // nothing ever filed). Same AST-extract + py_compile discipline, no wiring step -- a
+  // plain module has nothing to register. A MIXED .py plan still falls through below.
+  if (process.env.AGENT_MANAGER_DECOMPOSE_PY_MODULE !== 'false'
+      && /\.py$/.test(request.sourceFile || '') && request.moves.length
+      && request.moves.every((m) => m.kind === 'python-module-extract')) {
+    let sourceText = null;
+    try { sourceText = fs.readFileSync(path.join(repoRoot, request.sourceFile), 'utf8'); } catch { /* unreadable -> advisory only */ }
+    if (sourceText != null) {
+      const built = buildPythonModuleOnePassChanges(sourceText, request.sourceFile,
+        request.moves.map((m) => ({ newFile: m.newFile, symbols: m.symbols || [] })));
+      if (built.ok) {
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [], pythonModuleApplyOk: true });
+      } else {
+        hardProblems.push(`${request.sourceFile}: ${built.reason}`);
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+      }
+    } else {
+      for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+    }
+    return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+  }
+
+  for (const move of request.moves) {
+    const symbols = move.symbols || [];
+    const meta = { sharedDeps: [], neededImports: [] };
+    if (symbols.length === 0) {
+      hardProblems.push(`${move.newFile}: move has no symbols`);
+      moveMeta.push(meta);
+      continue;
+    }
+    if (move.kind === 'script-extract') {
+      const seCheck = staticCheckScriptExtractMove(repoRoot, request.sourceFile, symbols);
+      if (seCheck && seCheck.resolvable) {
+        if (!seCheck.ok) {
+          hardProblems.push(`${move.newFile}: ${seCheck.missing.join(', ')} could not be located as top-level function declarations in ${request.sourceFile}`);
+        } else {
+          // Every symbol resolves cleanly -- this move can skip the model entirely at
+          // apply time (see local-draft.js's tryDeterministicScriptExtractEdit).
+          meta.deterministicApplyOk = true;
+        }
+      }
+      moveMeta.push(meta);
+      continue;
+    }
+    const check = staticCheckMove(repoRoot, request.sourceFile, symbols);
+    if (check) {
+      if (check.missing && check.missing.length) {
+        hardProblems.push(`${move.newFile}: ${check.missing.join(', ')} not defined at module scope in ${request.sourceFile}`);
+      }
+      const strays = Object.entries(check.externalRefs || {});
+      if (strays.length) {
+        hardProblems.push(`${move.newFile}: ${strays.map(([s, lines]) => `${s} is still referenced elsewhere in ${request.sourceFile} (line(s) ${lines.slice(0, 6).join(', ')})`).join('; ')} -- not a self-contained move`);
+      }
+      // `app` is expected for a flask-blueprint move (every @app.route becomes
+      // @<bp>.route); anything else that resolves to an app.py module-level name and is
+      // not itself being moved becomes a cross-module import.
+      meta.sharedDeps = (check.sharedDeps || []).filter((d) => {
+        if (d === 'app' && move.kind === 'flask-blueprint') return false;
+        return !allMovedSymbols.has(d);
+      });
+      meta.neededImports = check.neededImports || [];
+    }
+    moveMeta.push(meta);
+  }
+  return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+}
+```
+
+Problem:
+The function `validatePlan` is 145 lines long and combines three distinct validation responsibilities — Node CommonJS module checks, Flask blueprint validation, Python module extraction, and generic move validation — into a single monolithic block. Each branch has its own logic, error handling, and return structure, yet they all share mutable state (`hardProblems`, `moveMeta`, `allMovedSymbols`) and are executed sequentially with no isolation. This violates the Single Responsibility Principle and makes the function hard to test, extend, debug, and read — any change to one validation type risks breaking or confusing behavior in another.
+
+Solution:
+Extract each validation branch into its own named, independently testable function: `validateNodeCommonJsModule`, `validateFlaskBlueprint`, `validatePythonModule`, and `validateGenericMoves`. The main `validatePlan` function becomes a thin orchestrator that initializes shared state, calls each sub-function in sequence, and aggregates results. Each sub-function should accept the same inputs and return a consistent result structure (ok, hardProblems, moveMeta) to ensure predictable composition.
+
+Benefits:
+Once decomposed, each validation type can be unit-tested in isolation with mocked dependencies. Adding a new validation type becomes trivial — just write a new `validateXXX` function and add it to the main orchestrator’s call list. The code becomes more readable, maintainable, and less error-prone during future changes or debugging.
+
+VERDICT CONSTRAINT (mandatory for this task):
+- The function snippet IS provided above in this prompt; you do not need to request it or assume it is missing.
+- You MUST render exactly one verdict: GENUINE or FALSE POSITIVE.
+- Refusals, hedging, or a third outcome (including "Uncertain", "I cannot determine", or any other qualifier) are NOT acceptable. Pick the one verdict that best fits the evidence in the snippet and commit to it.
+
+VERDICT: GENUINE
+
+### AC-3 · Decompose Multi-Phase Runtime Probe Execution
+Strength: Strong
+Files: src/decompose-node-module.js
+Symbol: firstRuntimeError
+Snippet:
+```
+}
+
+function firstRuntimeError(changes, sourceFile, repoRoot) {
+  const os = require('os');
+  const fs = require('fs');
+  const { execFileSync } = require('child_process');
+  const dirCandidates = [path.dirname(sourceFile)];
+  for (const ch of changes) {
+    dirCandidates.push(path.dirname(ch.file));
+    const body = ch.mode === 'create' ? ch.content : ch.replace;
+    if (typeof body === 'string') dirCandidates.push(...relativeRequireTargetDirs(body, path.dirname(ch.file)));
+  }
+  const ancestorRel = commonAncestorDir(dirCandidates);
+  const ancestorAbs = path.join(repoRoot, ancestorRel);
+  let dir;
+  try {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nm-runtime-'));
+    fs.cpSync(ancestorAbs, dir, { recursive: true });
+  } catch (e) {
+    try { if (dir) fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    return null; // can't stage a runnable copy -- fall back to the static + parse guards
+  }
+  try {
+    for (const ch of changes) {
+      const body = ch.mode === 'create' ? ch.content : ch.replace;
+      if (typeof body !== 'string') continue;
+      // Preserve ch.file's real position relative to the copied ancestor -- a basename-
+      // only write flattens a newFile that sits in a subdirectory (e.g.
+      // sdk/lib/candidate-lifecycle.js under sdk/candidate-fulfillment.js), so a
+      // correctly-relative-pathed require() from the reduced source can never resolve it
+      // here even though it would in the real repo.
+      const relPath = path.relative(ancestorRel, ch.file);
+      const dest = path.join(dir, relPath);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, body);
+    }
+    const probe = [
+      'const path=require("path");',
+      `const m=require(${JSON.stringify(path.join(dir, path.relative(ancestorRel, sourceFile)))});`,
+      // 2026-09-14, screaminggoatclubmt: "fix the runtime probe bug too" -- found live
+      // against task-sources.js's own real exports: nextDeepDiveTask/nextProjectSearchTask
+      // (task-source POLLERS, not simple helpers) spawn REAL python3 subprocesses against
+      // REAL external repo clones as a side effect of merely being called with no args --
+      // this isn't a naming-convention edge case, it's this pipeline's own dominant
+      // `next<X>Task()` shape across every task-source module. The risky-name denylist
+      // never anticipated it (none of write/apply/save/... match "next"), so the probe ran
+      // real external I/O during what's supposed to be a side-effect-free dry-run check,
+      // then blew the timeout mid-spawn -- misreported by the generic fallback below as
+      // "module failed to load" instead of what actually happened (a timeout while it was
+      // doing real work it should never have been allowed to start).
+      // 2026-09-14, screaminggoatclubmt: "dig into the new bug too" -- found live against
+      // local-draft.js's own real exports: callImplementModel is an `async function`.
+      // Calling `v()` on it NEVER throws synchronously, even when its own parameter
+      // destructuring (`{ recordModelCall, implPrompt, ... }` with no argument supplied)
+      // would throw -- an async function always returns a Promise, so that failure
+      // becomes a REJECTED promise instead, which the `try{v()}catch` here can never see.
+      // The rejection then surfaces later as an unhandled promise rejection, which
+      // crashes the WHOLE probe process by default in modern Node -- not name-pattern-
+      // specific like the next*/onboard/clone fix above, since ANY async export with a
+      // required parameter hits this, regardless of its name. Extending the denylist
+      // forever is whack-a-mole; a global safety net fixes the whole class at once.
+      'let sawRTE=null;',
+      'process.on("unhandledRejection",(e)=>{ if(e && e.name==="ReferenceError" && !sawRTE) sawRTE=e; });',
+      'process.on("uncaughtException",()=>{});', // same belt-and-suspenders spirit as the risky-name denylist: never let a call we made crash this probe outright
+      'const risky=/^(write|apply|save|generate|run|queue|file|commit|push|delete|sync|remove|move|reset|migrate|send|post|exec|spawn|kill|install|build|next|onboard|clone)/i;',
+      'for(const [k,v] of Object.entries(m||{})){',
+      '  if(typeof v!=="function"||risky.test(k)||v.length>4) continue;',
+      '  try{',
+      '    const r=v();',
+      '    if(r && typeof r.then==="function") r.catch((e)=>{ if(e && e.name==="ReferenceError" && !sawRTE) sawRTE=e; });',
+      '  }catch(e){',
+      '    if(e && e.name==="ReferenceError"){ process.stderr.write("RTE "+k+": "+e.message); process.exit(3); }',
+      '  }',
+      '}',
+      // Give any pending promise rejection a chance to settle before deciding the
+      // verdict -- without this, a same-tick unhandledRejection listener can still fire
+      // AFTER the process would otherwise exit 0, silently losing a genuine async RTE.
+      'setTimeout(()=>{',
+      '  if(sawRTE){ process.stderr.write("RTE (async): "+sawRTE.message); process.exit(3); }',
+      '  process.exit(0);',
+      '},50);',
+    ].join('\n');
+    try {
+      // Timeout dropped 20s -> 8s: belt-and-suspenders alongside the risky-name fix above
+      // -- bounds the worst case for any FUTURE side-effecting export shape this denylist
+      // still doesn't anticipate, so a stray real subprocess fails fast instead of running
+      // wild for 20s.
+      execFileSync('node', ['-e', probe], {
+        cwd: dir, timeout: 8_000, stdio: ['ignore', 'ignore', 'pipe'],
+        env: { ...process.env, AGENT_MANAGER_REPO_ROOT: repoRoot },
+      });
+      return null;
+    } catch (e) {
+      const err = String((e && e.stderr) || (e && e.message) || e);
+      if (e && e.status === 3) return err.replace(/^RTE\s*/, '').split('\n')[0].slice(0, 200);
+      // A SIGTERM (e.signal) with no output is the timeout firing mid-call -- distinct
+      // from "the module could not even be require()d" (the ONLY case this branch used to
+      // describe), and worth saying so plainly rather than the misleading generic message.
+      if (e && e.signal && !err.trim()) {
+        return `${sourceFile}: an exported function ran long enough to hit the ${8_000}ms probe timeout (likely real side effects the risky-name filter didn't anticipate) -- rather than a missing dependency`;
+      }
+      const line = err.split('\n').find((l) => /Error:|ReferenceError|is not defined/.test(l)) || 'module failed to load';
+      return `${sourceFile}: ${line.trim().slice(0, 200)}`;
+    }
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+}
+```
+
+Problem:
+The function `firstRuntimeError` orchestrates six distinct, stateful phases — directory discovery, environment staging, file mirroring, probe construction, execution with timeout, and cleanup — each with its own failure modes and responsibilities. These are not merely “lines” of code but logically separate operations that are interleaved with error handling and state management, making the function hard to test, debug, extend, or reason about.
+
+Solution:
+Extract the six phases into six named functions: `gatherDirCandidates`, `resolveAncestorDir`, `stageRepoCopy`, `writeFilesToStage`, `buildRuntimeProbeScript`, and `runProbeAndWait`. Also extract the nested probe logic into `probeRuntimeExports`, which returns a promise or error with categorized failure modes. Each function should handle only one concern and return early on failure, with cleanup handled by a finally block or explicit `cleanupStage`.
+
+Benefits:
+Decomposing the function improves testability (each phase can be unit-tested in isolation), debuggability (failure modes are localized), extensibility (adding a new probe step doesn’t require touching the whole function), and readability (each function has a single responsibility). The error handling becomes explicit and composable, not interleaved with setup or execution logic.
+
+### AC-4 · Decompose Long Main Function into Logical Phases
+Strength: Strong
+Files: scripts/decompose-python-module-extract.py
+Symbol: main
+Snippet:
+```
+
+
+def main(argv):
+    if len(argv) < 3:
+        fail(["usage: decompose-python-module-extract.py <source.py> <sym>..."])
+        return 2
+    path, symbols = argv[1], argv[2:]
+    try:
+        src = open(path, "r", encoding="utf-8").read()
+        tree = ast.parse(src, filename=path)
+    except (OSError, SyntaxError, ValueError) as exc:
+        fail([f"{type(exc).__name__}: {exc}"])
+        return 2
+    lines = src.split("\n")
+
+    module_funcs, module_names = {}, set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            module_funcs.setdefault(node.name, node)
+            module_names.add(node.name)
+        elif isinstance(node, ast.ClassDef):
+            module_names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    module_names.add(t.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            module_names.add(node.target.id)
+
+    problems, moved = [], []
+    for s in symbols:
+        n = module_funcs.get(s)
+        if n is None:
+            problems.append(f"{s}: not a module-level function")
+        else:
+            moved.append(n)
+    if problems:
+        fail(problems)
+        return 0
+    # Mutual exclusivity with flask-blueprint moves: a route view has a real URL and
+    # belongs in a Blueprint, not a plain helper module.
+    routed = [n.name for n in moved if any(decorator_is_app_route(d) for d in n.decorator_list)]
+    if routed:
+        fail([f"{', '.join(routed)}: @app.route view(s) belong in a flask-blueprint move, not python-module-extract"])
+        return 0
+
+    moved_names = {n.name for n in moved}
+    moved_lines = set()
+    for n in moved:
+        lo, hi = span(n)
+        moved_lines.update(range(lo, hi + 1))
+
+    strays = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in moved_names and node.lineno not in moved_lines:
+            strays.setdefault(node.id, []).append(node.lineno)
+    if strays:
+        fail([f"{s} is still referenced at line(s) {sorted(set(v))} outside the moved symbols"
+              for s, v in strays.items()])
+        return 0
+
+    import_line_for = {}
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            line = "\n".join(lines[node.lineno - 1:node.end_lineno])
+            for a in node.names:
+                bound = a.asname or a.name
+                if isinstance(node, ast.Import):
+                    bound = bound.split(".")[0]
+                import_line_for[bound] = line
+
+    shared_deps = {}
+    needed_import_lines, seen = [], set()
+    for n in moved:
+        local_bound, read = set(), set()
+        for stmt in n.body:
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Name):
+                    (local_bound if isinstance(sub.ctx, ast.Store) else read).add(sub.id)
+                elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    local_bound.add(sub.name)
+                elif isinstance(sub, ast.arg):
+                    local_bound.add(sub.arg)
+        # Same annotation gap decompose-blueprint-extract.py hardened for (2026-09-13): a
+        # type annotation lives on n.returns / arg.annotation, not n.body -- a name used
+        # only there was invisible here and crashed at def-time with a NameError.
+        annotation_nodes = [n.returns] if n.returns else []
+        for a in n.args.args + n.args.posonlyargs + n.args.kwonlyargs + ([n.args.vararg] if n.args.vararg else []) + ([n.args.kwarg] if n.args.kwarg else []):
+            if a.annotation:
+                annotation_nodes.append(a.annotation)
+        for ann in annotation_nodes:
+            for sub in ast.walk(ann):
+                if isinstance(sub, ast.Name):
+                    read.add(sub.id)
+        for a in n.args.args + n.args.posonlyargs + n.args.kwonlyargs:
+            local_bound.add(a.arg)
+        if n.args.vararg:
+            local_bound.add(n.args.vararg.arg)
+        if n.args.kwarg:
+            local_bound.add(n.args.kwarg.arg)
+        shared_deps[n.name] = sorted(
+            x for x in read
+            if x in module_names and x not in moved_names
+            and x not in local_bound and x not in BUILTIN_NAMES and x != "app")
+        for x in sorted(read):
+            if x in import_line_for and x not in local_bound and x not in BUILTIN_NAMES:
+                il = import_line_for[x]
+                if il not in seen:
+                    seen.add(il)
+                    needed_import_lines.append(il)
+
+    all_deps = sorted({d for ds in shared_deps.values() for d in ds})
+
+    header = []
+    if needed_import_lines:
+        header.extend(needed_import_lines)
+        header.append("")
+    if all_deps:
+        header += [
+            f"# The module-level names these functions read ({', '.join(all_deps)}) are",
+            "# imported lazily inside each function: the source module imports THIS module,",
+            "# so a top-level back-import would be circular. By call time the source module",
+            "# is fully initialised and the import is just a dict lookup.",
+            "",
+        ]
+    header.append("")
+
+    fn_texts = []
+    for n in moved:
+        lo, hi = span(n)
+        body = lines[lo - 1:hi]
+        def_idx = next(i for i, x in enumerate(body)
+                       if x.lstrip().startswith(("def ", "async def ")))
+        insert_at = def_idx + 1
+        fb = n.body[0] if n.body else None
+        if (isinstance(fb, ast.Expr) and isinstance(getattr(fb, "value", None), ast.Constant)
+                and isinstance(fb.value.value, str)):
+            insert_at = (fb.end_lineno - lo) + 1
+        deps = shared_deps[n.name]
+        out = body
+        if deps:
+            module_name = path.rsplit("/", 1)[-1][:-3] if path.endswith(".py") else path
+            out = body[:insert_at] + [f"    from {module_name} import {', '.join(deps)}"] + body[insert_at:]
+        fn_texts.append("\n".join(out))
+
+    new_content = "\n".join(header) + "\n\n\n".join(fn_texts) + "\n"
+
+    spans = sorted((span(n) for n in moved), reverse=True)
+    red = lines[:]
+    for lo, hi in spans:
+        end = hi
+        while end < len(red) and red[end].strip() == "":
+            end += 1
+        del red[lo - 1:end]
+    reduced = "\n".join(red)
+    while "\n\n\n\n" in reduced:
+        reduced = reduced.replace("\n\n\n\n", "\n\n\n")
+
+    print(json.dumps({
+        "ok": True,
+        "newFileContent": new_content,
+        "reducedSource": reduced,
+        "sharedDeps": shared_deps,
+        "movedCount": len(moved),
+    }))
+    return 0
+```
+
+Problem:
+The `main` function orchestrates six distinct responsibilities: argument parsing, AST symbol extraction, symbol validation, dependency analysis, header construction, and source modification. These are not sequential or atomic — they involve branching logic, state mutation, and multiple error paths. The function’s length (over 100 lines) reflects not just code volume but cognitive complexity: a single change can ripple across unrelated concerns, making debugging and testing difficult. The scanner’s 100-line threshold is appropriate here because the function is a state machine with side effects, not just a linear script.
+
+Solution:
+Extract the six responsibilities into separate, named functions: `parse_args_and_validate`, `extract_module_symbols`, `validate_moved_symbols`, `analyze_dependencies`, `build_header_and_insert_code`, and `reduce_source_and_output`. Each function should handle one concern with clear inputs/outputs and early returns for errors. The main function becomes a thin orchestrator that calls these in order, passing context between them.
+
+Benefits:
+Decomposing the function improves readability by isolating concerns, enables unit testing for each phase independently, and reduces cognitive load during code reviews. New contributors can understand one piece at a time, and changes to one responsibility won’t risk breaking unrelated logic. The codebase becomes more maintainable and resilient to future changes.
+
+VERDICT CONSTRAINT:
+Genuine
+
+### AC-5 · Decompose God Function into Orchestrator + Atomic Subtasks
+Strength: Strong
+Files: src/arch.js
+Symbol: nextArchImportTask
+Snippet:
+```
+const ARCH_IMPORT_RETRY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+function nextArchImportTask({ getConfig, taskIdExistsInQueue }) {
+  const { repoRoot, deepDiveAnalysisDir, deepDiveCoveragePath, importCoveragePath, defaultDomain } = getConfig();
+  // Same convention nextDeepDiveTask()/nextProjectSearchTask() already use.
+  const projectTag = path.basename(repoRoot);
+
+  let entries;
+  try {
+    entries = fs.readdirSync(deepDiveAnalysisDir, { withFileTypes: true });
+  } catch {
+    return null; // no analysis dir yet -- nothing to promote
+  }
+
+  // Scoping fix (2026-07-27): an analysis doc only contributes candidates when
+  // deep-dive-coverage.json says that external project was onboarded FOR this consumer
+  // project. A doc with no recorded relevantToProject predates this fix and is excluded.
+  let deepDiveCoverage;
+  try {
+    deepDiveCoverage = JSON.parse(readIfExists(deepDiveCoveragePath) || '{"projects":{}}');
+  } catch {
+    deepDiveCoverage = { projects: {} };
+  }
+  const relevantSlugs = new Set(
+    Object.entries(deepDiveCoverage.projects || {})
+      .filter(([, proj]) => proj.relevantToProject === projectTag)
+      .map(([slug]) => slug),
+  );
+
+  let coverage;
+  try {
+    coverage = JSON.parse(readIfExists(importCoveragePath) || '{"items":{}}');
+  } catch {
+    coverage = { items: {} };
+  }
+  if (!coverage.items) coverage.items = {};
+
+  let coverageChanged = false;
+  const candidates = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
+    const projectSlug = entry.name.replace(/\.md$/, '');
+    if (!relevantSlugs.has(projectSlug)) continue;
+    const text = readIfExists(path.join(deepDiveAnalysisDir, entry.name));
+    if (!text) continue;
+
+    // Split on H2 ("## ") item headings -- drop index 0, the "# <project> -- Deep Dive" H1.
+    const blocks = text.split(/(?=^## )/m).slice(1);
+    for (const block of blocks) {
+      const idMatch = block.match(/^\*\*ID:\*\*\s*(\S+)/m);
+      if (!idMatch) continue;
+      const itemId = idMatch[1];
+
+      if (!(itemId in coverage.items)) {
+        coverage.items[itemId] = { promotedAt: null, candidateId: null, projectSlug };
+        coverageChanged = true;
+      }
+      const itemCoverage = coverage.items[itemId];
+      if (itemCoverage.promotedAt) continue; // a REAL candidate was produced -- genuinely done
+      if (itemCoverage.lastAttemptedAt && Date.now() - Date.parse(itemCoverage.lastAttemptedAt) < ARCH_IMPORT_RETRY_COOLDOWN_MS) continue;
+
+      const ratingMatch = block.match(/^\*\*Rating:\*\*\s*(\S+)/m);
+      const rating = ratingMatch ? ratingMatch[1] : '';
+      if (rating !== 'Use' && rating !== 'Adapt') continue;
+
+      const titleMatch = block.match(/^##\s*(.+)$/m);
+      const filesMatch = block.match(/^\*\*Files:\*\*\s*(.+)$/m);
+      const rationaleAnchor = filesMatch ? filesMatch[0] : idMatch[0];
+      const rationale = block.slice(block.indexOf(rationaleAnchor) + rationaleAnchor.length).trim();
+
+      candidates.push({
+        itemId,
+        projectSlug,
+        title: titleMatch ? titleMatch[1].trim() : itemId,
+        rating,
+        files: filesMatch ? filesMatch[1].trim() : '',
+        rationale,
+      });
+    }
+  }
+
+  if (coverageChanged) {
+    fs.mkdirSync(path.dirname(importCoveragePath), { recursive: true });
+    fs.writeFileSync(importCoveragePath, JSON.stringify(coverage, null, 2));
+  }
+
+  // Sort by itemId string only for a stable, reproducible pick across repeated calls, not
+  // a claim of real chronological ordering across projects.
+  candidates.sort((a, b) => a.itemId.localeCompare(b.itemId));
+
+  for (const c of candidates) {
+    const taskId = 'arch-import-' + c.itemId;
+    if (taskIdExistsInQueue(taskId)) continue;
+
+    return {
+      id: taskId,
+      domain: defaultDomain,
+      source: 'arch_import',
+      title: `Arch import: ${c.title} (from ${c.projectSlug})`,
+      promptContext: {
+        itemId: c.itemId,
+        sourceProject: c.projectSlug,
+        itemTitle: c.title,
+        rating: c.rating,
+        itemFiles: c.files,
+        itemRationale: c.rationale,
+      },
+    };
+  }
+
+  return null;
+}
+```
+
+Problem:
+This function bundles five distinct responsibilities — config parsing, project relevance filtering, Markdown metadata extraction, coverage state management, candidate sorting, and task metadata generation — into a single monolithic flow. Each responsibility mutates state or depends on external data in ways that make unit testing impossible without mocking the entire function. The interleaving of error-handling branches (e.g., `coverageChanged`, `deepDiveCoverage`) and state mutations (`candidates`, `deepDiveCoverage`) creates cognitive overhead and increases the risk of subtle bugs when modifying one part without understanding the others.
+
+Solution:
+Extract five atomic functions:  
+1. `getProjectRelevanceMap(config)` — returns relevant project slugs based on `deepDiveCoverage`.  
+2. `parseAnalysisEntries(deepDiveDir, relevantSlugs)` — parses and filters analysis entries by relevance and metadata.  
+3. `filterCandidatesByRatingAndCooldown(candidates, coverage, cooldownMs)` — filters candidates by rating and cooldown.  
+4. `generateTaskMetadata(candidates, config)` — generates final task metadata or null.  
+5. `orchestrateNextArchImportTask(config, deepDiveDir, cooldownMs)` — coordinates the above, managing state and error paths.
+
+Benefits:
+Decomposing this function makes each unit testable in isolation, reduces cognitive load for future maintainers, and allows incremental refactoring without risking cascading failures. The orchestrator can be mocked or stubbed easily, while each subtask can be reviewed and tested independently, improving both code quality and team velocity.
+
+VERDICT CONSTRAINT:
+Genuine
+
+### AC-6 · Decompose Main Transformation Logic
+Strength: Strong
+Files: scripts/decompose-blueprint-extract.py
+Symbol: main
+Snippet:
+```
+
+
+def main(argv):
+    if len(argv) < 5:
+        fail(["usage: decompose-blueprint-extract.py <source.py> <bp_var> <bp_slug> <sym>..."])
+        return 2
+    path, bp_var, bp_slug, symbols = argv[1], argv[2], argv[3], argv[4:]
+    try:
+        src = open(path, "r", encoding="utf-8").read()
+        tree = ast.parse(src, filename=path)
+    except (OSError, SyntaxError, ValueError) as exc:
+        fail([f"{type(exc).__name__}: {exc}"])
+        return 2
+    lines = src.split("\n")
+
+    module_funcs, module_names = {}, set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            module_funcs.setdefault(node.name, node)
+            module_names.add(node.name)
+        elif isinstance(node, ast.ClassDef):
+            module_names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    module_names.add(t.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            module_names.add(node.target.id)
+
+    problems, moved = [], []
+    for s in symbols:
+        n = module_funcs.get(s)
+        if n is None:
+            problems.append(f"{s}: not a module-level function")
+        else:
+            moved.append(n)
+    if problems:
+        fail(problems)
+        return 0
+    # A blueprint move must carry at least one actual route (helpers may ride along, but a
+    # blueprint with zero @app.route views is a nonsense split).
+    if not any(any(decorator_is_app_route(d) for d in n.decorator_list) for n in moved):
+        fail([f"none of {', '.join(symbols)} is an @app.route view -- not a blueprint move"])
+        return 0
+
+    moved_names = {n.name for n in moved}
+    moved_lines = set()
+    for n in moved:
+        lo, hi = span(n)
+        moved_lines.update(range(lo, hi + 1))
+
+    strays = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in moved_names and node.lineno not in moved_lines:
+            strays.setdefault(node.id, []).append(node.lineno)
+    if strays:
+        fail([f"{s} is still referenced at line(s) {sorted(set(v))} outside the moved routes"
+              for s, v in strays.items()])
+        return 0
+
+    import_line_for = {}
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            line = "\n".join(lines[node.lineno - 1:node.end_lineno])
+            for a in node.names:
+                bound = a.asname or a.name
+                if isinstance(node, ast.Import):
+                    bound = bound.split(".")[0]
+                import_line_for[bound] = line
+
+    shared_deps = {}
+    needed_import_lines, seen = [], set()
+    flask_used = set()
+    for n in moved:
+        local_bound, read = set(), set()
+        # Walk the BODY only, not decorator_list -- `@app.route` is rewritten to
+        # `@<bp>.route`, so `app` from the decorator must not count as a body dependency.
+        for stmt in n.body:
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Name):
+                    (local_bound if isinstance(sub.ctx, ast.Store) else read).add(sub.id)
+                elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    local_bound.add(sub.name)
+                elif isinstance(sub, ast.arg):
+                    local_bound.add(sub.arg)
+        # Real incident, 2026-09-13: a return/param type annotation (`-> Path`, `x: dict`)
+        # is NOT part of n.body -- it lives on n.returns / arg.annotation -- so a name used
+        # ONLY in an annotation was invisible here, carried no import, and crashed at
+        # def-time (`NameError: name 'Path' is not defined`) the moment app.py imported the
+        # new module. Annotations can't assign (Store), so every Name found here is a read.
+        annotation_nodes = [n.returns] if n.returns else []
+        for a in n.args.args + n.args.posonlyargs + n.args.kwonlyargs + ([n.args.vararg] if n.args.vararg else []) + ([n.args.kwarg] if n.args.kwarg else []):
+            if a.annotation:
+                annotation_nodes.append(a.annotation)
+        for ann in annotation_nodes:
+            for sub in ast.walk(ann):
+                if isinstance(sub, ast.Name):
+                    read.add(sub.id)
+        for a in n.args.args + n.args.posonlyargs + n.args.kwonlyargs:
+            local_bound.add(a.arg)
+        if n.args.vararg:
+            local_bound.add(n.args.vararg.arg)
+        if n.args.kwarg:
+            local_bound.add(n.args.kwarg.arg)
+        shared_deps[n.name] = sorted(
+            x for x in read
+            if x in module_names and x not in moved_names
+            and x not in local_bound and x not in BUILTIN_NAMES and x != "app")
+        for x in sorted(read):
+            if x in FLASK_NAMES:
+                flask_used.add(x)
+            elif x in import_line_for and x not in local_bound and x not in BUILTIN_NAMES:
+                il = import_line_for[x]
+                if il not in seen:
+                    seen.add(il)
+                    needed_import_lines.append(il)
+
+    all_deps = sorted({d for ds in shared_deps.values() for d in ds})
+    flask_import = "from flask import Blueprint"
+    if flask_used:
+        flask_import += ", " + ", ".join(sorted(flask_used))
+
+    header = [flask_import]
+    if needed_import_lines:
+        header.append("")
+        header.extend(needed_import_lines)
+    header += [
+        "",
+        f"# The app.py helpers these views call ({', '.join(all_deps) or 'none'}) are",
+        "# imported lazily inside each view: app.py imports THIS module to register the",
+        "# blueprint, so a top-level `from app import ...` is a circular import that only",
+        "# fails when app.py is the entrypoint (how the dashboard runs). By the time a view",
+        "# runs, app.py is fully initialised and the import is just a dict lookup. (Same",
+        "# pattern as routes/concepts.py, routes/second_brain.py, routes/reports.py.)",
+        "",
+        f'{bp_var} = Blueprint("{bp_slug}", __name__)',
+        "",
+        "",
+    ]
+
+    fn_texts = []
+    for n in moved:
+        lo, hi = span(n)
+        body = lines[lo - 1:hi]
+        out = []
+        for bl in body:
+            stripped = bl.lstrip()
+            if is_route_decorator_line(stripped):
+                indent = bl[:len(bl) - len(stripped)]
+                bl = indent + "@" + bp_var + stripped[len("@app"):]
+            out.append(bl)
+        def_idx = next(i for i, x in enumerate(out)
+                       if x.lstrip().startswith(("def ", "async def ")))
+        insert_at = def_idx + 1
+        fb = n.body[0] if n.body else None
+        if (isinstance(fb, ast.Expr) and isinstance(getattr(fb, "value", None), ast.Constant)
+                and isinstance(fb.value.value, str)):
+            insert_at = (fb.end_lineno - lo) + 1
+        deps = shared_deps[n.name]
+        if deps:
+            out = out[:insert_at] + [f"    from app import {', '.join(deps)}"] + out[insert_at:]
+        fn_texts.append("\n".join(out))
+
+    new_content = "\n".join(header) + "\n\n\n".join(fn_texts) + "\n"
+
+    spans = sorted((span(n) for n in moved), reverse=True)
+    red = lines[:]
+    for lo, hi in spans:
+        end = hi
+        while end < len(red) and red[end].strip() == "":
+            end += 1
+        del red[lo - 1:end]
+    reduced = "\n".join(red)
+    while "\n\n\n\n" in reduced:
+        reduced = reduced.replace("\n\n\n\n", "\n\n\n")
+
+    print(json.dumps({
+        "ok": True,
+        "newFileContent": new_content,
+        "reducedSource": reduced,
+        "sharedDeps": shared_deps,
+        "movedCount": len(moved),
+    }))
+    return 0
+```
+
+Problem:
+The function `main` is 182 lines long and performs at least eight distinct, tightly coupled responsibilities: argument validation, AST parsing, symbol validation, stray reference detection, import analysis, blueprint header construction, function body transformation, and JSON output generation. These phases are interleaved with branching logic and state mutations, making the function a single monolithic transformation pipeline. The length is not merely voluminous—it reflects real cognitive complexity, as each phase has unique invariants and edge cases. A human reviewer must mentally track state across multiple concerns, which is error-prone and hard to test.
+
+Solution:
+Extract the following into separate, single-responsibility functions: `validate_arguments`, `extract_module_symbols`, `validate_moved_symbols`, `detect_stray_references`, `analyze_imports_and_deps`, `construct_blueprint_header`, `transform_function_bodies`, and `generate_output`. Each should take a consistent state object and return a mutated state or a result. The main function becomes a coordinator that orchestrates these steps in order, passing state between them. No function should mutate global state or perform multiple unrelated tasks.
+
+Benefits:
+Decomposing this function improves testability, as each unit can be unit-tested in isolation. It also improves readability, since each function has a clear purpose and boundary. Reviewers can focus on one concern at a time, reducing cognitive load. Maintenance becomes easier: changes to one phase (e.g., import analysis) won’t risk breaking unrelated logic (e.g., decorator rewriting).
+
+VERDICT CONSTRAINT:
+Genuine
+
+### AC-7 · Decompose Monolithic Task Registration
+Strength: Strong
+Files: src/arch.js
+Symbol: register
+Snippet:
+```
+}
+
+function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
+  // arch_review -- consumer of nextCandidateFulfillmentTask against arch_discovery's doc.
+  // reasoningTier 'high': arch_review's low-tier implement pass has produced 0-char output
+  // on its final retry live. candidatesPath is a lazy getter (getConfig() isn't callable
+  // at module-load time) -- where a {"mode":"split"} implement response writes its
+  // sub-candidates back.
+  // No emptyApproval (2026-08-28): a fulfillment source consumes an already-Strong-rated
+  // candidate -- an empty draft there means "I couldn't produce this fix" (model gave up,
+  // couldn't locate the code, or the code moved), not "there was nothing to do". With
+  // emptyApproval those silently auto-closed with no branch and no human (see retired
+  // AC-25, whose target had moved to this plugin). Without it, an empty draft is rejected
+  // -> retried -> eventually blocked for a human. emptyApproval stays on the arch_discovery
+  // / arch_import GENERATORS below, where "found zero real issues" is a valid common outcome.
+  registerTaskSource('arch_review', {
+    hygieneFamily: hygieneFamily('arch', { candidateDoc: true }),
+    priority: taskPriority('arch_review', 70),
+    next: () => nextCandidateFulfillmentTask(getConfig().archReviewCandidatesPath, 'arch_review'),
+    candidateFulfillment: true,
+    candidatesPath: () => getConfig().archReviewCandidatesPath,
+    candidateDocTitle: '# Architecture Review Candidates',
+    reasoningTier: 'high',
+  });
+  updateTaskSource('arch_review', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
+
+  // arch_import_review -- the OTHER consumer of nextCandidateFulfillmentTask, against
+  // arch_import's own candidates doc. Priority 71: every stage's own consumer outranks its
+  // own generator. Shares arch_review's plan/implement prompt pair.
+  //
+  // 2026-09-04 (AC-8 incident): stamp promptContext.premiseEvidence at task-build time,
+  // deterministically, against content the candidate already fetched -- cheap, synchronous,
+  // no fresh grep. `groundingFields` threads it to the reviewer (review-time backstop for a
+  // plain diff); `premiseCheck` is the harder gate, consulted by agent-manager core's
+  // finalizeCandidateFulfillment right before a {"mode":"split"} response is honored, so a
+  // false premise never fans out into child candidates the way AC-8 did.
+  registerTaskSource('arch_import_review', {
+    hygieneFamily: hygieneFamily('arch', { candidateDoc: true }),
+    priority: taskPriority('arch_import_review', 71),
+    next: () => {
+      const task = nextCandidateFulfillmentTask(getConfig().archImportCandidatesPath, 'arch_import_review');
+      if (task) task.promptContext.premiseEvidence = computePremiseEvidence(task);
+      return task;
+    },
+    candidateFulfillment: true, // no emptyApproval -- see arch_review above
+    candidatesPath: () => getConfig().archImportCandidatesPath,
+    candidateDocTitle: '# Architecture Import Candidates',
+    reasoningTier: 'high',
+    groundingFields: ['premiseEvidence'],
+    reviewGuidance: ARCH_IMPORT_REVIEW_PREMISE_GUIDANCE,
+    premiseCheck: runPremiseCheck,
+  });
+  updateTaskSource('arch_import_review', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
+
+  // arch_discovery -- generator. Custom apply: its implement pass outputs raw markdown
+  // candidate write-ups, not Group B JSON, so without this apply-task.js's writeArtifact()
+  // falls through to the generic JSON parser and every approved task fails apply.
+  registerTaskSource('arch_discovery', {
+    groundedPromptFiles: true,
+    hygieneFamily: hygieneFamily('arch'),
+    priority: taskPriority('arch_discovery', 80),
+    next: () => nextArchDiscoveryTask({ getConfig, taskIdExistsInQueue }),
+    apply: ({ implementResponse }) => {
+      const { archReviewCandidatesPath } = getConfig();
+      return applyArchDiscoveryCandidates({ implementResponse, candidatesPath: archReviewCandidatesPath });
+    },
+    emptyApproval: true,
+    // 2026-09-17 (agent-manager's empty-approval-decision.js, needs-clarification
+    // bd-1788787323412): explicit opt-in marking that this source's real implement
+    // response is the shared "### AC-NNN" candidate-doc format (applyArchDiscoveryCandidates
+    // just above parses exactly this), so a non-empty response that still parses to zero
+    // candidates can be treated the same as an effectively-empty one -- deterministic
+    // approve/block, no wasted majority vote on a draft whose apply outcome is already
+    // knowable. Deliberately a SEPARATE flag from emptyApproval, not inferred from it --
+    // deep_dive/project_search are also emptyApproval but do NOT use this format.
+    candidateDocFormat: true,
+    directToMain: true, // low-risk additive candidate-doc append -- commit straight to main, no throwaway branch
+    reviewGuidance: ARCH_DISCOVERY_REVIEW_GUIDANCE,
+    reportClass: 'benefit', // a surfaced, human-reviewed architecture candidate is a real outcome (system-report.js)
+    // concept-candidate-grounding-gate-3e9bec: deterministic Check 0 on the write-up's
+    // Files: line -- a path that resolves nowhere in this repo is a fabrication a blind
+    // redraft only re-invents. arch_discovery had no post-implement check before this.
+    postImplementCheck: runArchDiscoveryGroundingCheck,
+  });
+  updateTaskSource('arch_discovery', { buildPlanPrompt: archDiscoveryPlanPrompt, buildImplementPrompt: archDiscoveryImplementPrompt });
+
+  // arch_import -- generator. Same raw-markdown apply, plus the import-coverage.json stamp.
+  registerTaskSource('arch_import', {
+    preValidateCitedPaths: true,
+    hygieneFamily: hygieneFamily('arch'),
+    priority: taskPriority('arch_import', 81),
+    next: () => nextArchImportTask({ getConfig, taskIdExistsInQueue }),
+    apply: ({ implementResponse, task }) => {
+      const { archImportCandidatesPath, importCoveragePath } = getConfig();
+      return applyArchImportCandidate({ implementResponse, candidatesPath: archImportCandidatesPath, importCoveragePath, task });
+    },
+    emptyApproval: true,
+    candidateDocFormat: true, // see arch_discovery's own comment on this flag
+    directToMain: true, // see arch_discovery
+    reviewGuidance: ARCH_IMPORT_REVIEW_GUIDANCE,
+    reportClass: 'benefit', // see arch_discovery
+    // ADR-0022 Stage A4: arch_import's plan pass only proposes QUERY: terms; agent-manager's
+    // local-draft.js greps its own repo for them between plan and implement and hands the
+    // hits to the implement pass as grounding. On a genuine zero-hit search, skip the
+    // implement call entirely (the model fabricates file paths instead of following the
+    // "output nothing" instruction) -- an empty draft here auto-approves via emptyApproval.
+    harnessSearch: 'archImport',
+    skipImplementWhenNoHarnessHits: true,
+    // 2026-09-05: 3 of 7 blocked arch_import tasks shared the exact shape
+    // arch-import-premise-check.js already catches for its sibling arch_import_review --
+    // a fabricated premise/file/line-number contradicting the real harness-fetched content
+    // -- but that gate only runs at arch_import_review's split point, never here at
+    // arch_import's own initial write-up. See arch-import-grounding-check.js's own header.
+    postImplementCheck: runArchImportGroundingCheck,
+  });
+  updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });
+}
+```
+
+Problem:  
+The `register` function is a composite of four semantically distinct task source registrations — `arch_review`, `arch_import_review`, `arch_discovery`, and `arch_import` — each with unique configurations, logic, and side effects. This violates the Single Responsibility Principle, making the function hard to test, debug, extend, or read. The scanner’s 115-line threshold is a valid signal: the function is doing too much, mixing setup, configuration, and domain logic.
+
+Solution:  
+Extract each task source registration into its own named function: `registerArchReview`, `registerArchImportReview`, `registerArchDiscovery`, and `registerArchImport`. Each function encapsulates its own configuration and behavior, preserving all logic while isolating responsibilities. This allows independent testing, modification, and extension.
+
+Benefits:  
+Decomposing the function reduces cognitive load, improves testability by enabling unit tests for each task source, and makes future changes safer and more predictable. Even if total lines increase slightly, maintainability and scalability improve dramatically — a necessary trade-off for long-term code health.
+
+### AC-26 · Decompose Monolithic Function Length Review Logic
+Strength: Strong
+Files: src/function-length-review.js
+Symbol: register
+Snippet:
+```
+}
+
+function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
+  registerTaskSource('function_length_review', {
+    requireCodeShapeInCandidate: true,
+    hygieneFamily: hygieneFamily('function_length'),
+    priority: taskPriority('function_length_review', 80),
+    next: () => {
+      const { repoRoot, pipelineDir, defaultDomain } = getConfig();
+      return nextFunctionLengthReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue });
+    },
+    inventory: ({ taskState }) => {
+      const { repoRoot, pipelineDir } = getConfig();
+      return functionLengthInventory({ repoRoot, pipelineDir, taskState });
+    },
+    apply: ({ implementResponse, task }) => {
+      const { pipelineDir } = getConfig();
+      const candidatesPath = functionLengthCandidatesPath(getConfig);
+      // See apply-group-a.js's applyArchDiscoveryCandidates for why this real,
+      // review-time-fresh snippet is threaded through deterministically.
+      const res = applyArchDiscoveryCandidates({
+        implementResponse,
+        candidatesPath,
+        docTitle: '# Function Length Decomposition Candidates',
+        // Opt-in dedupe (agent-manager candidate-docs.js): a re-drafted/requeued finding whose file + function is already
+        // in the doc (master, an unmerged agent/* branch, or this tree) is skipped instead of appended again (2026-09-26, AC-187 vs AC-51).
+        dedupe: true,
+        snippet: task && task.promptContext && task.promptContext.snippet,
+        // The scanner's own function name keys the dedupe ahead of any title parsing. An older agent-manager core
+        // that predates the `symbol` parameter simply ignores it.
+        symbol: functionSymbolFromDetail(task && task.promptContext && task.promptContext.detail),
+      });
+      // A "false positive" verdict wrote no candidate -- remember the flagged construct
+      // so the scanner never re-emits it (suppression-store.js).
+      recordFalsePositiveIfVerdict({ applyResult: res, implementResponse, task, pipelineDir });
+      // A verdict that produced no candidate and is not an explicit false positive:
+      // track it, and after a few such tries stop the scanner re-emitting this construct.
+      recordInconclusiveReview({ applyResult: res, implementResponse, task, pipelineDir });
+      return res;
+    },
+    // 2026-08-31: thread the flagged function window into review grounding -- see
+    // observability_review's own comment. Without this the reviewer never sees the snippet
+    // the drafter was told to ground its verdict in, and rejects correct calls as
+    // unverified speculation.
+    groundingFields: ['snippet'],
+    // 2026-08-23: review-task.js/local-draft.js now read these two flags directly off
+    // the registry entry instead of a hardcoded array a plugin author would otherwise
+    // have to go edit inside those files -- the actual prerequisite this family's
+    // extraction needed. advisoryProse: a short prose false-positive verdict is the
+    // EXPECTED deliverable here, not a refusal. See review-task.js's own ADVISORY_PROSE_
+    // SOURCES-turned-flag comment for the full history.
+    advisoryProse: true,
+    // 2026-09-02: advisoryProse alone was not enough -- the review vote still fell back to
+    // the GENERIC "does it contain real, complete code" completeness question and rejected
+    // every correct output ("a meta-plan describing an extraction refactor rather than the
+    // actual code changes", "meta-commentary rather than the actual code implementation")
+    // -- 5 real function_length_review tasks blocked+exhausted that way. This source's
+    // deliverable is a PROSE verdict or a candidate BLOCK, never code; spell that out for
+    // the reviewer exactly as observability_review already does.
+    reviewGuidance: 'This is a function-length triage verdict for a function in OUR OWN project, NOT a code change. A valid draft is EXACTLY ONE of: (a) "GENUINE" + a correctly-formatted `### AC-NNN` candidate block (Strength: Strong / Files / Problem / Solution / Benefits) sketching which logical pieces to extract, scoped to exactly this one function; or (b) "FALSE POSITIVE" / "UNCERTAIN" + one short paragraph (2-4 sentences) explaining why, grounded in the function snippet shown. There is deliberately NO diff, no code, and no "steps" here -- do NOT reject the draft for lacking them, and do NOT reject a Solution paragraph for "describing an extraction refactor rather than the actual code" (describing the decomposition IS the deliverable). REJECT only if: the draft refuses to reach a verdict ("a human should look", "cannot determine"); a GENUINE verdict\'s candidate block is malformed or missing a required section; a GENUINE verdict\'s Solution proposes something broader than this one function; or a FALSE POSITIVE verdict\'s stated reason actually contradicts the snippet shown (e.g. claims the function is short when the snippet clearly runs past the threshold).',
+    reviewCompletenessQuestion: 'Does the draft reach a decisive GENUINE-or-FALSE-POSITIVE verdict (not "uncertain"/"needs a human") and, if GENUINE, is it followed by a well-formed `### AC-NNN` candidate block whose Solution is a decomposition scoped to exactly this one function?',
+    // 2026-09-05: catches a Solution paragraph that invents a helper name/signature/call
+    // relationship contradicting the real flagged-function snippet -- see
+    // function-length-grounding-check.js's own header for the incident (8 of 9 blocked
+    // tasks shared this exact shape). Routes into the same blockedStage:'review' path a
+    // real review rejection takes, before a doomed draft burns a full vote round.
+    postImplementCheck: runGroundingCheck,
+    // 2026-08-31: the apply is a low-risk additive candidate-doc append, not real code --
+    // commit straight to main, no throwaway agent/<id> branch to hand-merge. Matches the
+    // sibling candidate-generating review sources (observability_review, performance_review,
+    // arch_discovery); function_length_review was the only one still missing it, which meant
+    // every function_length_fix hand-off needed a human to merge the review branch before
+    // function_length_fix (which reads FUNCTION_LENGTH_CANDIDATES.md from the working copy)
+    // could even see the candidate.
+    directToMain: true,
+  });
+  updateTaskSource('function_length_review', { buildPlanPrompt: functionLengthReviewPlanPrompt, buildImplementPrompt: functionLengthReviewImplementPrompt });
+
+  registerTaskSource('function_length_fix', {
+    hygieneFamily: hygieneFamily('function_length', { candidateDoc: true }),
+    priority: taskPriority('function_length_fix', 72),
+    next: () => {
+      return nextCandidateFulfillmentTask(functionLengthCandidatesPath(getConfig), 'function_length_fix');
+    },
+    // No emptyApproval (2026-08-28): a Strong candidate legitimately resolving to "no real
+    // decomposition after all" is rare, and it was letting the common case -- an empty
+    // draft because the model gave up or the code moved -- silently auto-close with no
+    // branch and no human (agent-manager's retired AC-25). An empty fulfillment draft is
+    // now rejected -> retried -> blocked for a human to look at. A genuine false-positive
+    // still surfaces that way, just visibly.
+    // candidateFulfillment: opts into local-draft.js's find-verification retry for free.
+    candidateFulfillment: true,
+    // A function_length_fix candidate is already the review stage's decomposed, Strong-
+    // rated extraction target -- re-splitting it just files more decomposition candidates
+    // that get re-split forever instead of ever landing a diff. Confirmed live 2026-09-01:
+    // AC-15 -> AC-15a/b, AC-16 -> AC-16a/b, AC-17 -> AC-17a/b, AC-18 -- four branches
+    // pushed, each touching only the candidates doc, zero real code, each parent marked
+    // done/succeeded for producing nothing. The generic splitDepth>=1 recursion cap
+    // (local-draft.js's finalizeCandidateFulfillment) bounds this to one wasted split, but
+    // never fully stops it -- same class of incident that got pipeline_forensics_fix this
+    // exact flag the same day (task-sources.js). This pass must produce a real diff or
+    // output empty (-> blocked for a human).
+    noCandidateSplit: true,
+    // candidatesPath/candidateDocTitle: still used to file THIS fix's own candidate (from
+    // function_length_review) -- unrelated to the disabled re-split path above. Same
+    // env-var-or-default resolution as this source's own `next` above, duplicated rather
+    // than shared per this file's own stated convention for tiny same-file helpers.
+    candidatesPath: () => functionLengthCandidatesPath(getConfig),
+    candidateDocTitle: '# Function Length Decomposition Candidates',
+  });
+  updateTaskSource('function_length_fix', { buildPlanPrompt: functionLengthFixPlanPrompt, buildImplementPrompt: functionLengthFixImplementPrompt });
+}
+```
+
+Problem:
+This function is 110 lines long and orchestrates multiple distinct responsibilities: task registration, inventory retrieval, candidate application logic, grounding, advisory prose handling, review completeness enforcement, post-implement checks, and task source updates. Each of these responsibilities could be isolated into its own function, improving testability, readability, and maintainability.
+
+Solution:
+Extract the initial `registerTaskSource` logic into `registerTaskSourceWithConfig`, isolate the `inventory` handler into `buildFunctionLengthInventory`, encapsulate candidate processing and deduplication into `applyFunctionLengthCandidates`, extract configuration flags into `configureFunctionLengthReview`, and isolate `updateTaskSource` calls into `updateFunctionLengthTaskSources`. Each function would handle one logical concern, with clear inputs and outputs.
+
+Benefits:
+Decomposing this function reduces cognitive load for developers, enables unit testing of individual responsibilities (e.g., testing deduplication logic without running full registration), and makes future modifications safer — changes to one concern won’t require navigating a 110-line monolith. This also improves code review by isolating changes to specific logical units.
+
+### AC-188 · Decompose Long Lexical Scanner
+Strength: Strong
+Files: src/decompose-node-module.js
+Symbol: locallyBoundNames
+Snippet:
+```
+// dependency lived in a default param, got treated as a local, slipped the check, and the
+// merged split threw ReferenceError at call time).
+function locallyBoundNames(code) {
+  const clean = stripStringsAndComments(code);
+  const names = new Set();
+  let m;
+
+  // const/let/var -- simple `= ` (name before the first `=`) and destructuring patterns
+  // (one level of nesting handled explicitly, since regex can't balance braces).
+  const declRe = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?==|;|\bin\b|\bof\b|$)/g;
+  while ((m = declRe.exec(clean))) names.add(m[1]);
+  const declPatRe = /\b(?:const|let|var)\s*(\{(?:[^{}]|\{[^{}]*\})*\}|\[(?:[^[\]]|\[[^[\]]*\])*\])\s*=/g;
+  while ((m = declPatRe.exec(clean))) for (const n of bindingNamesFromPattern(m[1])) names.add(n);
+
+  // function name(<params>) and (<params>) =>
+  const paramGroups = [];
+  const fnRe = /\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)?\s*\(([\s\S]*?)\)\s*\{/g;
+  while ((m = fnRe.exec(clean))) { if (m[1]) names.add(m[1]); paramGroups.push(m[2]); }
+  const arrowRe = /\(([\s\S]*?)\)\s*=>/g;
+  while ((m = arrowRe.exec(clean))) paramGroups.push(m[1]);
+  for (const g of paramGroups) for (const part of splitTopLevel(g)) for (const n of bindingNamesFromPattern(part)) names.add(n);
+
+  // single-identifier arrow: `x => ...`
+  const singleArrowRe = /(?:^|[^\w$)."'`])\s*([A-Za-z_$][\w$]*)\s*=>/g;
+  while ((m = singleArrowRe.exec(clean))) names.add(m[1]);
+
+  // for (const X of ...) / for (X = ...) / catch (e)
+  const forRe = /\bfor\s*\(\s*(?:const|let|var)?\s*([{[][\s\S]*?[}\]]|[A-Za-z_$][\w$]*)/g;
+  while ((m = forRe.exec(clean))) for (const n of bindingNamesFromPattern(m[1])) names.add(n);
+  const catchRe = /\bcatch\s*\(\s*([A-Za-z_$][\w$]*)/g;
+  while ((m = catchRe.exec(clean))) names.add(m[1]);
+
+  return names;
+}
+
+// Identifiers *read* in a slice of code -- word tokens not preceded by a single `.`
+// (member access) and not an object-literal key. A `...` prefix is spread/rest, NOT
+// member access, so `...listArchivedMonthDirs(x)` DOES read `listArchivedMonthDirs`
+// (2026-09-09: a require-bound name reached only via spread was dropped from the carried
+// requires -> ReferenceError at call time, past both the parse and no-arg runtime guard).
+// Over-reports (locals, params) -- callers filter those out.
+function referencedIdentifiers(code) {
+  const clean = stripStringsAndComments(code);
+  const out = new Set();
+  const re = /(\.\.\.|\.)?\b([A-Za-z_$][\w$]*)\b(\s*:(?![:=]))?/g;
+  let m;
+  while ((m = re.exec(clean))) {
+    if (m[1] === '.') continue; // member access -- not a free read
+    if (m[3]) continue;         // object-literal key
+    out.add(m[2]);
+  }
+  return out;
+}
+
+// One top-level statement starting at line index `i` (column 0). Accumulates continuation
+// lines until the statement terminates with `;` at end-of-line (capped), so a multi-line
+// `const {\n a,\n b\n} = require('x');` is one unit. Returns { text, endExclusive }.
+function readTopLevelStatement(lines, i) {
+  let j = i;
+  let buf = lines[i];
+  while (!/;\s*$/.test(buf.trimEnd()) && j < lines.length - 1 && j - i < 40) {
+    // A new column-0 statement keyword on the next line means the current one had no
+    // trailing `;` -- stop here rather than swallowing it.
+    if (/^(?:const|let|var|function|class|async\s|module\.exports|if\b|for\b|while\b|return\b)/.test(lines[j + 1] || '')) break;
+    j += 1;
+    buf += `\n${lines[j]}`;
+  }
+  return { text: buf, endExclusive: j + 1 };
+}
+
+// The module prelude: the CONTIGUOUS run of `'use strict'`, comments, and top-level
+// `require(...)` / `import` statements at the very top of the file -- STOPPING at the first
+// real code (a `function`, a `class`, a non-require `const/let/var`, or executable code).
+// A `require()` that appears LATER in the file (a lazy/local-ish import after real code) is
+// deliberately NOT part of the prelude -- putting the back-require after it would splice it
+// into the middle of the module (the 2026-09-09 staleness-audit.js / apply-group-a.js
+// corruption). Returns { prelude, body }.
+function splitRequirePrelude(src) {
+  const lines = src.split('\n');
+  let i = 0;
+  let preludeEnd = 0; // exclusive
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^\s*$/.test(line)) { i++; continue; }
+    if (/^\s*['"]use strict['"];?\s*$/.test(line)) { preludeEnd = i + 1; i++; continue; }
+    if (/^\s*\/\//.test(line)) { i++; continue; }
+    if (/^\s*\/\*/.test(line)) {
+      while (i < lines.length && !/\*\//.test(lines[i])) i++;
+      i += 1;
+      continue;
+    }
+    if (/^import\b/.test(line)) { preludeEnd = i + 1; i++; continue; }
+    if (/^(?:const|let|var|require)\b/.test(line)) {
+      const stmt = readTopLevelStatement(lines, i);
+      if (/\brequire\s*\(/.test(stmt.text)) { preludeEnd = stmt.endExclusive; i = stmt.endExclusive; continue; }
+      break; // a non-require declaration == real code
+    }
+    break; // function / class / executable == real code
+  }
+  return { prelude: lines.slice(0, preludeEnd).join('\n'), body: lines.slice(preludeEnd).join('\n') };
+}
+
+// EVERY top-level `require(...)` / `import` statement in the whole file, not just the
+// prelude ones -- a module-scope `const { x } = require('./y')` that sits AFTER real code
+// still binds `x` module-wide, so the self-containment check and the new module both need
+// to know about it.
+function allTopLevelRequireStatements(src) {
+  const lines = src.split('\n');
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^import\b/.test(line)) { out.push(line); i++; continue; }
+    if (/^(?:const|let|var|require)\b/.test(line)) {
+      // Don't require `require(` on the FIRST line -- a multi-line destructured require
+      // (`const {\n  a,\n  b,\n} = require('./x')`) has the call several lines down. Read
+      // the whole logical statement, then test that for `require(`.
+      const stmt = readTopLevelStatement(lines, i);
+      if (/\brequire\s*\(/.test(stripStringsAndComments(stmt.text))) {
+        out.push(stmt.text); i = stmt.endExclusive; continue;
+      }
+    }
+    i++;
+  }
+```
+
+Problem:
+The function `locallyBoundNames` is 122 lines long and performs five distinct lexical analysis tasks: parsing variable declarations, extracting parameter names from functions and arrows, handling single-identifier arrows, and processing `for`/`catch` bindings. Each task has its own regex, loop logic, and side-effect (adding to a Set), making the function a composite of responsibilities. This violates the Single Responsibility Principle and makes testing, debugging, and extension difficult — especially since each pattern could change independently.
+
+Solution:
+Extract each lexical analysis concern into its own function: `addBindingNamesFromDeclarations`, `addBindingNamesFromParameters`, `addBindingNamesFromSingleArrows`, and `addBindingNamesFromForAndCatch`. Each function handles one pattern type, uses its own regex, and operates on the shared `names` Set. The top-level function simply orchestrates these calls, keeping the interface unchanged but improving internal structure.
+
+Benefits:
+Decomposing the function enables unit tests per responsibility, localized changes (e.g. adding new binding patterns), and clearer code reviews. It also makes the function easier to understand at a glance — the “what” is now separated from the “how” — without altering any behavior.
+
+VERDICT CONSTRAINT:
+Genuine
+
+### AC-189 · classifyCatchConfidence is a composite of 10+ distinct logic paths
+Strength: Strong
+Files: src/observability-scan.js
+Symbol: classifyCatchConfidence
+Snippet:
+```
+// catch/except header. closeIndex: index of the closing `}` (JS) / last char of the block
+// (Python). Returns 'high' | 'low'. Pure string work, no AST.
+function classifyCatchConfidence({ stripped, text, headerIndex, closeIndex, isPython }) {
+  if (!CONFIDENCE_TIER_ON) return 'high';
+
+  // Genuinely silent -> HIGH.
+  if (stripped.length === 0) return 'high';
+  if (isPython && PY_EMPTY_EXCEPT_RE.test(stripped)) return 'high';
+
+  // Deliberate control flow in the body -> LOW.
+  if (RETURN_RE.test(stripped)) return 'low';
+  if (LOOP_CTRL_RE.test(stripped)) return 'low';
+
+  // Terminal clause of a try/…/finally whose finally is non-empty -> LOW (JS best-effort;
+  // a Python miss just stays HIGH).
+  if (!isPython && typeof closeIndex === 'number') {
+    const after = text.slice(closeIndex + 1, closeIndex + 400);
+    const fin = after.match(/^\s*finally\s*\{/);
+    if (fin) {
+      const finBody = extractBraceBody(text, closeIndex + 1 + fin[0].length - 1);
+      if (finBody !== null && stripComments(finBody).trim().length > 0) return 'low';
+    }
+  }
+
+  // Best-effort signal in the 12 lines above the header (a comment, or a `safe*`/`try_*`
+  // enclosing name). Loose on purpose -- a wrong LOW only reroutes to the digest, never
+  // drops the finding.
+  const upTo = text.slice(0, headerIndex);
+  const preWindow = upTo.split('\n').slice(-13).join('\n');
+  if (BEST_EFFORT_COMMENT_RE.test(preWindow) || BEST_EFFORT_NAME_RE.test(preWindow)) return 'low';
+
+  // Body has content but no control flow at all (bare assignment / lone call) -> genuinely
+  // silent, HIGH.
+  if (!CTRL_FLOW_RE.test(stripped)) return 'high';
+
+  return 'high';
+}
+const LOOP_CONTEXT_WINDOW_LINES = 40;
+const HEALTH_SIGNAL_RE = /heartbeat|health.?check|liveness|readiness/i;
+
+// Strips comments AND string/docstring literals from a body so a body that's "empty
+// except for a comment (or a lone docstring) explaining why it's intentionally empty"
+// doesn't read as suspicious content. Covers both languages: // and /* */ (JS), # (Python/
+// shell-ish), and triple-quoted Python strings.
+function stripComments(body) {
+  return body
+    .replace(/'''[\s\S]*?'''|"""[\s\S]*?"""/g, '')
+    .replace(/\/\/.*$/gm, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/#.*$/gm, '')
+    .trim();
+}
+
+// error-handling.md's Guidance #2/#3/self-diagnostics: a caught error that is neither
+// rethrown nor surfaced (logged, recorded as a metric, etc.) has silently vanished.
+// Skips a body containing any of these tokens -- presence of ANY of them is read as
+// "this error was surfaced somehow," even if imperfectly. Covers JS and Python idioms.
+const SURFACES_ERROR_RE = /throw|console\.|log(ger|ging)?\.|\.error\(|Error\(|raise\b|panic\(|record|notify|alert|metric|traceback|warn|capture_exception|sys\.exc_info|reject\(|Promise\.reject|next\(err|captureException|Sentry|reportError|toast\(|showError\(|\.exception\(|\.critical\(|\.fatal\(|print\(|(?:cb|callback|done)\(\s*err/i;
+
+
+// React/Vue-style client code surfaces a caught error by writing it to component state that the UI renders --
+// `catch (e) { setErrorMsg(e.message); setStatus('error'); }` -- not by logging. SURFACES_ERROR_RE cannot see that, so every such
+// handler was flagged (PF-Client-Portal 2026-09-19: Landing.tsx:209 and two of the six digest findings were exactly this, all
+// dismissed as false positives after a paid review call each). A state setter counts as surfacing when, and only when:
+//   - its name says it holds an error/message (setErr, setErrorMsg, setBulkMsg, setFailure, setToast, ...), or
+//   - it is handed the caught error itself (setX(e.message), setX(String(err))), or
+//   - it is handed an error-status string (setStatus('error'), setPhase("failed")),
+// and it is not just CLEARING state (setErr(null), setErrors({}), setMsg('')) -- clearing an error in a catch is a reset, not a report.
+// Deliberately NOT accepted: setData(null) / setResult(null) / setMe(null) -- state reset on failure with no message; those stay
+// flagged (LOW confidence, digest-batched) because the user is told nothing.
+const SETTER_CALL_RE = /\bset[A-Za-z0-9_$]*\s*\(/g;
+const ERRORISH_SETTER_NAME_RE = /^set\w*?(?:[Ee]rr|[Mm]sg|[Mm]essage|[Ff]ail|[Nn]otice|[Ww]arn|[Tt]oast|[Aa]lert|[Bb]anner)/;
+const ERROR_STATUS_LITERAL_RE = /['"`](?:error|errored|failed|failure|fail)['"`]/i;
+const CLEARING_ARGS_RE = /^\s*(?:null|undefined|''|""|``|false|0|\[\s*\]|\{\s*\})?\s*$/;
+
+// Text between the parens of a call whose "(" is at openIdx, or null when unbalanced.
+function callArgs(text, openIdx) {
+  let depth = 0;
+  for (let i = openIdx; i < text.length; i++) {
+    const c = text[i];
+    if (c === '(') depth++;
+    else if (c === ')' && --depth === 0) return text.slice(openIdx + 1, i);
+  }
+  return null;
+}
+
+// stripped: the comment-stripped catch body. caught: the caught identifier ('e', 'err', ...) or null for `catch {`. JS/TS only.
+function surfacesViaStateSetter(stripped, caught) {
+  const identRe = caught ? new RegExp(`(?<![\\w$.])${caught.replace(/\$/g, '\\$')}(?![\\w$])`) : null;
+  SETTER_CALL_RE.lastIndex = 0;
+  let m;
+  while ((m = SETTER_CALL_RE.exec(stripped))) {
+    const name = m[0].replace(/\s*\($/, '');
+    const args = callArgs(stripped, m.index + m[0].length - 1);
+    if (args === null) continue;
+    if (CLEARING_ARGS_RE.test(args)) continue;
+    if (ERRORISH_SETTER_NAME_RE.test(name)) return true;
+    if (ERROR_STATUS_LITERAL_RE.test(args)) return true;
+    if (identRe && identRe.test(args)) return true;
+  }
+  return false;
+}
+
+// A catch body that hands the caught error to a helper defined in the SAME file, where that helper's own body surfaces it, is a
+// report, not a swallow: `const fail = e => { say(''); alert(e.message); }` ... `catch (e) { fail(e); }`. VideoForge 2026-10-14: ten such
+// blocks were flagged and each dismissed as a false positive after a paid review call. Deliberately narrow:
+//   - the call must be handed the caught identifier itself (fail(e)), not merely exist,
+//   - the helper must be found in this file (an import or a method like this.fail(e) cannot be verified, so it stays flagged),
+//   - its body must pass SURFACES_ERROR_RE or write the error into the DOM -- ONE level only, no chasing helper-of-helper.
+const DOM_SURFACE_RE = /\.(?:textContent|innerText|innerHTML)\s*(?:\+)?=|setCustomValidity\s*\(/;
+const NOT_A_HELPER = new Set(['if', 'for', 'while', 'switch', 'catch', 'function', 'return', 'typeof', 'new', 'await', 'async']);
+
+// Body text of the function named `name` declared in `text` (declaration, `const f = (..) =>`, or `f = function(..)`), or null.
+function localFunctionBody(text, name) {
+  const n = name.replace(/\$/g, '\\$');
+  const declRe = new RegExp(`(?<![\\w$.])function\\s*\\*?\\s*${n}\\s*\\(`);
+  const assignRe = new RegExp(`(?<![\\w$.])(?:const|let|var)\\s+${n}\\s*=\\s*(?:async\\s*)?(?:function\\s*[\\w$]*\\s*\\(|(\\([^)]*\\)|[\\w$]+)\\s*=>)`);
+  let m = declRe.exec(text);
+  if (m) return bodyAfterParams(text, m.index + m[0].length - 1);
+  m = assignRe.exec(text);
+  if (!m) return null;
+  if (m[1] !== undefined) {                                   // arrow: braced body, or an expression running to the end of the line
+    let i = m.index + m[0].length;
+    while (/\s/.test(text[i] || '')) i++;
+    if (text[i] === '{') return extractBraceBody(text, i);
+    const eol = text.indexOf('\n', i);
+    return text.slice(i, eol === -1 ? text.length : eol);
+  }
+  return bodyAfterParams(text, m.index + m[0].length - 1);   // `function (` expression: m ends at its "("
+}
+function bodyAfterParams(text, openParenIdx) {
+  const args = callArgs(text, openParenIdx);
+  if (args === null) return null;
+  let i = openParenIdx + args.length + 2;
+  while (/\s/.test(text[i] || '')) i++;
+  return text[i] === '{' ? extractBraceBody(text, i) : null;
+}
+
+function surfacesViaLocalHelper(stripped, caught, fileText) {
+  if (!caught) return false;
+  const identRe = new RegExp(`(?<![\\w$.])${caught.replace(/\$/g, '\\$')}(?![\\w$])`);
+  const callRe = /(?<![\w$.])([A-Za-z_$][\w$]*)\s*\(/g;
+  let m;
+  while ((m = callRe.exec(stripped))) {
+    if (NOT_A_HELPER.has(m[1])) continue;
+    const args = callArgs(stripped, m.index + m[0].length - 1);
+    if (args === null || !identRe.test(args)) continue;
+    const body = localFunctionBody(fileText, m[1]);
+    if (body === null) continue;
+    const helper = stripComments(body);
+    if (SURFACES_ERROR_RE.test(helper) || DOM_SURFACE_RE.test(helper)) return true;
+  }
+  return false;
+}
+
+// The identifier a `catch (e)` / `catch (err: unknown)` header binds, or null (`catch {`).
+function caughtIdentifier(headerParens) {
+  const m = /^\(\s*([A-Za-z_$][\w$]*)/.exec(headerParens || '');
+  return m ? m[1] : null;
+}
+
+// A Python `except` body that is ONLY `pass` or `...` is the silent-swallow equivalent of
+// an empty JS catch block.
+const PY_EMPTY_EXCEPT_RE = /^(?:pass|\.\.\.)$/;
+
+
+// The RAW body (before stripComments) is non-empty but strips to nothing -> it is
+// exclusively comment(s): a documented, deliberate no-op, not a silent swallow. (JS only;
+// a Python `except:` body cannot be comment-only without a SyntaxError.)
+function isCommentOnlyBody(rawBody, strippedBody) {
+  return rawBody.trim().length > 0 && strippedBody.length === 0;
+}
+
+// A whitespace-collapsed fingerprint of the caught-error handler body -- stable across
+// reindentation and line drift, so observability-review.js can re-locate a persisted flag
+// against a re-scan of the current file even after commits moved its line number. Empty
+// bodies fingerprint as '' (matched by exact-line fallback instead).
+function bodyFingerprint(strippedBody) {
+  return String(strippedBody || '').replace(/\s+/g, ' ').trim();
+}
+
+function findSilentCatchBlocks(text, relPath) {
+  // Test / fixture / mock files deliberately swallow errors to exercise failure paths;
+  // flagging them is noise. Matches performance-scan.js's use of the same helper.
+  if (isTestFile(relPath)) return [];
+  if (relPath.endsWith('.py')) return findSilentExceptBlocks(text, relPath);
+  const findings = [];
+  const catchRe = /\bcatch\s*(\([^)]*\))?\s*\{/g;
+  let m;
+  while ((m = catchRe.exec(text))) {
+    const openIndex = m.index + m[0].length - 1;
+    const body = extractBraceBody(text, openIndex);
+    if (body === null) continue;
+    const stripped = stripComments(body);
+    // A body that is exclusively comment(s) is a documented, deliberate no-op.
+    if (isCommentOnlyBody(body, stripped)) continue;
+    // `catch { return <literal>; }` / bare `return;` etc. used to be skipped entirely
+    // here as "a deliberate on-failure-default convention, not a vanished error" -- but
+    // that convention is exactly the shape of a real, repeatedly-confirmed bug class
+    // (2026-09-15: countRecentCompletions's `catch { return 0; }` masked a genuine
+    // unreadable-directory error as "0 completions," identical to the healthy-quiet-
+    // pipeline case; its sibling countPending had the same shape before AC-57 fixed it).
+// ... [truncated for review: this function continues for 122 more line(s) not shown]
+```
+
+Problem:
+The function `classifyCatchConfidence` is 322 lines long not due to verbosity but because it bundles 10+ unrelated responsibilities — from detecting empty catch blocks, analyzing finally clauses, to identifying DOM surfaces or state setters — without any logical separation. This forces reviewers to mentally track multiple independent logic branches, making the function brittle to change and hard to test. Modifying one logic (e.g., updating `SURFACES_ERROR_RE`) requires navigating 322 lines, increasing regression risk.
+
+Solution:
+Extract each responsibility into its own small, named function: `classifyByEmptyness`, `classifyByFinallyBlock`, `classifyByContextSignals`, `classifyByStateSetters`, etc. Each should take only the necessary inputs and return a confidence tier or `null`. The main function becomes a simple chain of these, with early returns for `null` or `high` values. No new logic is added — only decomposition.
+
+Benefits:
+Decomposition reduces cognitive load during review, enables unit tests for each logic path in isolation, and makes future modifications safer and faster. The function’s length drops from 322 to ~50 lines of glue logic, while preserving all original behavior.
+
+VERDICT CONSTRAINT:
+- The function snippet IS provided above in this prompt; you do not need to request it or assume it is missing.
+- You MUST render exactly one verdict: GENUINE or FALSE POSITIVE.
+- Refusals, hedging, or a third outcome (including "Uncertain", "I cannot determine", or any other qualifier) are NOT acceptable. Pick the one verdict that best fits the evidence in the snippet and commit to it.
+
+Genuine
+
+### AC-190 · Decompose Observability Task Registration
+Strength: Strong
+Files: src/observability-review.js
+Symbol: register
+Snippet:
+```
+}
+
+function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority }) {
+  registerTaskSource('observability_review', {
+    hygieneFamily: hygieneFamily('observability'),
+    priority: taskPriority('observability_review', 80),
+    next: () => {
+      const { repoRoot, pipelineDir, defaultDomain, observabilityCoveragePath } = getConfig();
+      return nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue, coveragePath: observabilityCoveragePath });
+    },
+    inventory: ({ taskState }) => {
+      const { repoRoot, pipelineDir } = getConfig();
+      return observabilityInventory({ repoRoot, pipelineDir, taskState });
+    },
+    apply: ({ implementResponse, task }) => {
+      const { observabilityFixCandidatesPath, pipelineDir } = getConfig();
+      // task.promptContext.snippet is the real, review-time-fresh code text this
+      // finding is about (see nextObservabilityReviewTask below) -- passed through
+      // deterministically so it survives into the candidate doc as data, not just
+      // however faithfully the model's own prose happened to paraphrase it.
+      const res = applyArchDiscoveryCandidates({
+        implementResponse,
+        candidatesPath: observabilityFixCandidatesPath,
+        docTitle: '# Observability Fix Candidates',
+        snippet: task && task.promptContext && task.promptContext.snippet,
+        // Opt-in dedupe (agent-manager candidate-docs.js): a re-drafted/requeued finding whose file + function is already
+        // in the doc (master, an unmerged agent/* branch, or this tree) is skipped instead of appended again (2026-09-26, AC-187 vs AC-51).
+        dedupe: true,
+      });
+      // A "false positive" verdict wrote no candidate -- remember the flagged construct
+      // so the scanner never re-emits it (suppression-store.js).
+      recordFalsePositiveIfVerdict({ applyResult: res, implementResponse, task, pipelineDir });
+      // A verdict that produced no candidate and is not an explicit false positive:
+      // track it, and after a few such tries stop the scanner re-emitting this construct.
+      recordInconclusiveReview({ applyResult: res, implementResponse, task, pipelineDir });
+      // Structured outcome for task-disposition.js (core): splits `dismissed` (a correct
+      // false-positive triage) out of the `noop` grab-bag. Mutating `task` here is
+      // persisted by apply-task.js after apply() returns.
+      if (STAMP_REVIEW_DISPOSITION && task) {
+        task.reviewDisposition = classifyReviewOutcome({ applyResult: res, implementResponse });
+      }
+      return res;
+    },
+    // 2026-08-31: the reviewer must see the SAME code window the drafter was given.
+    // nextObservabilityReviewTask puts the flagged code into promptContext.snippet and the
+    // implement prompt tells the model to "ground your verdict in the snippet you were
+    // given" -- but get-grounding-source.js only threads a fixed set of promptContext
+    // fields into review-task.js's grounding block, and `snippet` wasn't one of them. So
+    // the reviewer saw only PLAN + IMPLEMENT + "file exists", was told to treat every
+    // claim as UNVERIFIED, and rejected correct verdicts ("there is no try/except in this
+    // 5-line handler") as "an unverified assertion based on a snippet not provided in the
+    // prompt" -> 2 retries -> blocked. Declaring it here makes get-grounding-source.js's
+    // generic source.groundingFields consumer include it. 2026-09-02: also thread
+    // `enclosingCode` -- the wider block+context window nextObservabilityReviewTask now
+    // builds -- so the reviewer judges the verdict against the same real code the drafter saw.
+    groundingFields: ['snippet', 'enclosingCode'],
+    advisoryProse: true,
+    // The verdict is binary (GENUINE / FALSE POSITIVE) and the drafter had the flagged
+    // block + enclosing function as real source -- so an "I can't verify / a human should
+    // look" answer IS rejectable, but a decisive, code-grounded false-positive verdict
+    // that happens to read cautiously is NOT hedging. Spell that out so the generic
+    // hedging rule (review-task.js) doesn't reject correct dismissals.
+    reviewGuidance: 'This is an observability_review triage verdict, not a code change. A valid draft is EXACTLY ONE of: (a) "GENUINE" + a correctly-formatted `### AC-NNN` candidate block (Strength/Files/Problem/Solution/Benefits), or (b) "FALSE POSITIVE" + one short paragraph citing the specific lines in the grounding source. The drafter was given the flagged block AND its surrounding code read straight from the file. REJECT the draft if it answers "uncertain", "cannot verify", "a human should open the file", or otherwise refuses to reach a verdict from the code it was shown. But do NOT reject a decisive verdict merely for sounding careful: "not a silent swallow because the except binds `e` and the function\'s documented contract returns None on failure" is a real, complete verdict grounded in the code -- approve it. Reject a FALSE POSITIVE verdict only when its stated reason actually contradicts the grounding source (e.g. it claims the body logs the error but the shown lines are a bare `pass`), and reject a GENUINE verdict whose candidate is malformed or proposes a primitive the project does not have.',
+    reviewCompletenessQuestion: 'Does the draft reach a decisive GENUINE-or-FALSE-POSITIVE verdict (not "uncertain"/"needs a human"), and is that verdict consistent with the flagged block + surrounding code in the grounding source?',
+    directToMain: true, // the apply is a low-risk candidate-doc append, not real code -- straight to main
+    // ADR-0022 Stage A3: how a completed review counts toward system-report.js's
+    // junk/filtering/benefit accounting. A review that correctly dismissed a false
+    // positive is real triage work ('filtering'); one that confirmed a genuine issue
+    // is a 'benefit'. Read off the registry there instead of a hardcoded source check.
+    reportClass: (task) => {
+      const text = (task.implementResponse || '').toLowerCase();
+      if (text.includes('false positive') || text.includes('false-positive')) return 'filtering';
+      if (text.includes('genuine')) return 'benefit';
+      return 'unclear';
+    },
+  });
+  updateTaskSource('observability_review', { buildPlanPrompt: observabilityReviewPlanPrompt, buildImplementPrompt: observabilityReviewImplementPrompt });
+
+  registerTaskSource('observability_review_digest', {
+    hygieneFamily: hygieneFamily('observability'),
+    priority: taskPriority('observability_review_digest', 78),
+    next: () => {
+      const { repoRoot, pipelineDir, defaultDomain, observabilityCoveragePath } = getConfig();
+      return nextObservabilityReviewDigestTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue, coveragePath: observabilityCoveragePath });
+    },
+    apply: ({ implementResponse, task }) => {
+      const { observabilityFixCandidatesPath, pipelineDir } = getConfig();
+      const items = (task && task.promptContext && task.promptContext.items) || [];
+      const verdicts = parseDigestVerdicts(implementResponse, items.length);
+      let filed = 0;
+      let dismissed = 0;
+      for (const item of items) {
+        const v = verdicts.get(item.n);
+        if (!v) continue; // unparsed -- leave it; the finding recurs next cycle
+        if (v.verdict === 'genuine') {
+          const one = [
+            `### AC-000 · silent-catch-block at ${item.file}:${item.line}`,
+            'Strength: Moderate',
+            `Files: ${item.file}`,
+            '', 'Problem:',
+            `A caught error is discarded with no operator visibility. ${item.detail} ${v.reason}`.trim(),
+            '', 'Solution:',
+            'Log the caught error (message + context) before the existing fallback/return; do not change control flow.',
+            '', 'Benefits:',
+            'An operator can tell a silent recovery from a real failure in the logs.',
+          ].join('\n');
+          const r = applyArchDiscoveryCandidates({
+            implementResponse: one, candidatesPath: observabilityFixCandidatesPath,
+            docTitle: '# Observability Fix Candidates', snippet: item.snippet,
+          });
+          if (r && !r.skipped) filed += 1;
+        } else {
+          const r = recordSuppression(pipelineDir, {
+            rule: item.rule, file: item.file, snippet: item.snippet,
+            taskId: task && task.id, cause: 'false-positive',
+          });
+          if (r && r.recorded) dismissed += 1;
+        }
+      }
+      const aggregate = filed > 0 ? 'genuine' : (dismissed > 0 ? 'dismissed' : 'inconclusive');
+      if (STAMP_REVIEW_DISPOSITION && task) task.reviewDisposition = aggregate;
+      if (filed > 0) {
+        return { skipped: false, reason: `observability digest: filed ${filed} candidate(s), dismissed ${dismissed}` };
+      }
+      return { skipped: true, reason: `observability digest: ${dismissed} finding(s) dismissed as FALSE POSITIVE, ${items.length - dismissed} unresolved` };
+    },
+    groundingFields: ['items'],
+    advisoryProse: true,
+    reviewGuidance: 'This is a BATCH observability triage. A valid draft is a list of exactly N lines, one per numbered block, each "<n>. GENUINE|FALSE POSITIVE — <short reason>". Approve if every block has a decisive verdict with a reason that is consistent with the block shown in the grounding `items`. Reject only if lines are missing, verdicts are absent/"uncertain", or a reason plainly contradicts its block.',
+    reviewCompletenessQuestion: 'Does the draft give a decisive GENUINE/FALSE-POSITIVE verdict for every numbered block, each consistent with that block\'s code in the grounding?',
+    directToMain: true,
+    reportClass: (task) => {
+      const text = (task.implementResponse || '').toLowerCase();
+      if (text.includes('genuine')) return 'benefit';
+      if (text.includes('false positive') || text.includes('false-positive')) return 'filtering';
+      return 'unclear';
+    },
+  });
+  updateTaskSource('observability_review_digest', { buildPlanPrompt: observabilityReviewDigestPlanPrompt, buildImplementPrompt: observabilityReviewDigestImplementPrompt });
+
+  registerTaskSource('observability_fix', {
+    hygieneFamily: hygieneFamily('observability', { candidateDoc: true }),
+    priority: taskPriority('observability_fix', 72),
+    next: () => {
+      const { observabilityFixCandidatesPath } = getConfig();
+      return nextCandidateFulfillmentTask(observabilityFixCandidatesPath, 'observability_fix');
+    },
+    // No emptyApproval (2026-08-28): an empty fulfillment draft means "couldn't produce
+    // this fix", not "nothing to do" -- with it, those silently auto-closed with no branch
+    // and no human. Without it, an empty draft is rejected -> retried -> blocked for a
+    // human. See agent-manager's retired AC-25.
+    candidateFulfillment: true,
+    // 2026-09-18 (brain-dump bd-1789602379616): every observability_fix candidate is, by
+    // construction, sourced from one of observability_review's own deterministic scanner
+    // rules -- so when a draft answers with the documented "FALSE POSITIVE" refusal (the
+    // finding no longer applies), re-running THAT rule set against the cited file's
+    // current content answers "is this refusal correct" deterministically, no model call.
+    // See agent-manager/src/premise-recheck-decision.js's own header for the full
+    // mechanism and why this needed an explicit opt-in field rather than being derived
+    // from the "_fix" source's own name (pipeline_forensics_fix/change_review_fix don't
+    // follow a "_fix" -> "_review" naming pattern). The rules themselves are already
+    // registered below via deterministic-recheck.js's own register() call.
+    premiseRecheckSource: 'observability_review',
+    candidatesPath: () => getConfig().observabilityFixCandidatesPath,
+    candidateDocTitle: '# Observability Fix Candidates',
+  });
+  updateTaskSource('observability_fix', { buildPlanPrompt: observabilityFixPlanPrompt, buildImplementPrompt: observabilityFixImplementPrompt });
+}
+```
+
+Problem:  
+The `register` function orchestrates three semantically distinct task sources — `observability_review`, `observability_review_digest`, and `observability_fix` — each with unique logic for `next`, `inventory`, `apply`, `groundingFields`, `reviewGuidance`, and `reportClass`. These are not variations of a single pattern but independent triage workflows with different failure modes and reporting behaviors. The function’s length reflects structural complexity, not just line count: it contains three major logical blocks that resist refactoring without introducing coupling or losing clarity. The scanner’s 100-line threshold is appropriate here because the function’s architecture is composite, not linear.
+
+Solution:  
+Extract each task source into its own dedicated registration function:  
+- `registerObservabilityReview({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority })`  
+- `registerObservabilityReviewDigest({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority })`  
+- `registerObservabilityFix({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority })`  
+
+Introduce a shared helper `registerTaskSourceWithConfig({ type, config, ... })` to handle common setup, but allow type-specific overrides for `groundingFields`, `reviewGuidance`, and `reportClass`. This preserves testability and reduces duplication while keeping each task’s logic isolated.
+
+Benefits:  
+Each extracted function becomes independently testable and maintainable, reducing the cognitive load on developers. Changes to one task’s logic won’t risk breaking others. Reviewers can focus on one triage workflow at a time, improving code review quality. The shared config pattern enables consistent configuration while allowing per-type customization, making the system more scalable and less brittle.
