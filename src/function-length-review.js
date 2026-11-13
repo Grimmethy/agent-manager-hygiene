@@ -219,9 +219,9 @@ function nextFunctionLengthReviewTask({ repoRoot, pipelineDir, defaultDomain, ta
   const flagsPath = path.join(pipelineDir, 'queue', 'function-length-flags.json');
 
   let coverage;
-  try { coverage = JSON.parse(readIfExists(coveragePath) || '{}'); } catch { coverage = {}; }
+  try { coverage = JSON.parse(readIfExists(coveragePath) || '{}'); } catch (err) { console.error('failed to parse', coveragePath, 'as JSON; defaulting to {}', err); coverage = {}; }
   let flags;
-  try { flags = JSON.parse(readIfExists(flagsPath) || '[]'); } catch { flags = []; }
+  try { flags = JSON.parse(readIfExists(flagsPath) || '[]'); } catch (err) { console.error('failed to parse', flagsPath, 'as JSON; defaulting to []', err); flags = []; }
 
   const now = Date.now();
   const lastScannedAt = coverage.lastScannedAt ? Date.parse(coverage.lastScannedAt) : NaN;

@@ -259,3 +259,348 @@ Log the error with context using `console.error` before returning `null`. The fi
 
 Benefits:
 This ensures that any failure to read the directory is recorded in logs, making it visible to operators or monitoring systems. While the function still returns `null` (as per contract), the root cause is now traceable — preventing silent failures from masking real infrastructure or configuration issues. The fix uses only `console.error`, which matches the project’s logging capability.
+
+### AC-12 · Silent Error Swallowed in Flag Inventory Load
+Strength: Strong
+Files: src/observability-review.js
+Snippet:
+```
+function observabilityInventory({ repoRoot, pipelineDir, taskState }) {
+  const projectTag = path.basename(repoRoot);
+  let flags;
+  try { flags = JSON.parse(readIfExists(path.join(pipelineDir, 'queue', 'observability-flags.json')) || '[]'); } catch { flags = []; }
+  return buildFlagInventory({
+    flags, projectTag, repoRoot, taskState,
+    idFor: (f) => `observability-${slugifyForId(projectTag)}-${slugifyForId(f.rule)}-${slugifyForId(f.file || 'repo')}-${f.line || 0}`,
+```
+
+Problem:
+The `catch` block at `src/observability-review.js` silently swallows any error thrown by `JSON.parse` when parsing `observability-flags.json`, without logging or rethrowing. This is a genuine observability hygiene issue because the project has no metrics system and no logging framework beyond `console.error`, yet the failure is entirely invisible to humans. The caller `buildFlagInventory` will proceed with an empty `flags` array, which may lead to misleading dashboard state — e.g., showing “no flags” when flags actually failed to load due to malformed or missing JSON.
+
+Solution:
+Replace the bare `catch { flags = []; }` with a `catch (error)` block that logs the error via `console.error` with context (file, rule, line) so it’s visible to humans, while still returning an empty array — which is the fallback behavior — but now with observability.
+
+Benefits:
+Once fixed, any failure to parse `observability-flags.json` will be visible in console logs, enabling humans to detect and debug the issue without relying on telemetry or metrics — which the project does not have. The dashboard will still show “no flags” in the case of failure, but the root cause will be traceable to a human operator, preventing silent data loss or misreported state.
+
+### AC-13 · Fix Silent Error in performanceInventory for Observability
+Strength: Strong
+Files: src/performance-review.js
+Snippet:
+```
+function performanceInventory({ repoRoot, pipelineDir, taskState }) {
+  const projectTag = path.basename(repoRoot);
+  let flags;
+  try { flags = JSON.parse(readIfExists(path.join(pipelineDir, 'queue', 'performance-flags.json')) || '[]'); } catch { flags = []; }
+  return buildFlagInventory({
+    flags, projectTag, repoRoot, taskState,
+    idFor: (f) => `performance-${slugifyForId(projectTag)}-${slugifyForId(f.rule)}-${slugifyForId(f.file || 'repo')}-${f.line || 0}`,
+```
+
+Problem:  
+The `performanceInventory` function silently catches and swallows errors when parsing `performance-flags.json`, returning an empty array instead of surfacing the failure. This prevents dashboard UI (Hygiene tab) from rendering any flags — even if the file is malformed — and leaves no trace for human operators or observability systems. Since the project lacks metrics or telemetry, logging the error with context (repo, pipeline, file) is the only viable observability primitive to surface this silent failure.
+
+Solution:  
+Replace the silent `catch` block with a logged error that includes the repo tag and file path, then return the empty array fallback. This preserves the read-only contract (returning a valid `buildFlagInventory` object) while making the failure visible to humans via console.error.
+
+Benefits:  
+Operators can now detect when `performance-flags.json` is corrupted or misconfigured without relying on dashboard UI alone. The failure mode is no longer invisible, enabling proactive debugging and reducing risk of undetected data loss.
+
+### AC-14 · Silent Error Swallowing in Python Static Check
+Strength: Strong
+Files: src/file-decompose-plan-pass.js
+Snippet:
+```
+    const names = syms.map((s) => s.name);
+    if (names.length === 0) continue;
+    let check;
+    try { check = staticCheckMove(repoRoot, sourceFile, names); } catch { check = null; }
+    if (!check) continue; // can't check (no python3, file unreadable) -- no filter this run
+    for (const s of Object.keys(check.externalRefs || {})) fanOut.add(s);
+  }
+```
+
+Problem:
+The `try...catch` block around `staticCheckMove` silently discards any error — including Python3 unavailability or unreadable files — and returns `null`, which causes `fanOut` to remain empty. The comment explicitly states “no filter this run,” meaning the intent is to return partial results, not fail hard. However, without logging or rethrowing, downstream logic may misinterpret an empty `fanOut` as “no external refs found,” when in fact a real failure occurred. This is an observability hygiene gap: the failure is invisible to operators and cannot be traced or debugged without external tools.
+
+Solution:
+Log the caught exception with context (`sourceFile`, `label`, `names`) using `console.error` to surface the failure for human operators, while preserving the return type of `Set` and avoiding rethrowing — because the caller expects to handle partial results. The fix does not alter behavior but ensures the error is visible without breaking the flow.
+
+Benefits:
+Operators can now detect and investigate failures during static analysis, such as missing Python3 or unreadable files, without relying on external monitoring. The fix preserves correctness while improving observability — critical in a project with no metrics system.
+
+### AC-15 · Fix Silent JSON Parse Errors by Logging and Rethrowing
+Strength: Strong
+Files: src/function-length-review.js
+Snippet:
+```
+  const flagsPath = path.join(pipelineDir, 'queue', 'function-length-flags.json');
+
+  let coverage;
+  try { coverage = JSON.parse(readIfExists(coveragePath) || '{}'); } catch { coverage = {}; }
+  let flags;
+  try { flags = JSON.parse(readIfExists(flagsPath) || '[]'); } catch { flags = []; }
+
+```
+
+Problem:  
+The `try/catch` blocks around `JSON.parse` assignments silently swallow errors by assigning empty defaults (`{}` or `[]`) without logging or rethrowing. This means if `readIfExists` returns malformed JSON (due to filesystem corruption, encoding issues, or race conditions), the error is invisible to operators and monitoring systems. Downstream logic — such as scanning, flagging, or task scheduling — may proceed with invalid or missing state, leading to incorrect function-length reviews or corrupted queue state. Since the project has no metrics or logging framework beyond stdlib, the only viable fix is to log the error with context (file path and message) using `console.error` and rethrow to surface it to the caller.
+
+Solution:  
+Replace the silent `catch` blocks with explicit error logging using `console.error` that includes the file path and error message, then rethrow the error to propagate it to the caller. This ensures the error is traceable and actionable, without introducing any new dependencies or telemetry.
+
+Benefits:  
+Once fixed, errors during JSON parsing will be logged with sufficient context to diagnose root causes (e.g., corrupted files, race conditions) and surface to callers for appropriate handling — such as failing the task or alerting operators — preventing silent data corruption or incorrect reviews. The fix uses only available primitives (`console.error`, `throw`) and matches the project’s capabilities.
+
+### AC-16 · Silent JSON Parse Failures in Coverage Initialization
+Strength: Strong
+Files: src/arch.js
+Snippet:
+```
+  let coverage;
+  try {
+    coverage = JSON.parse(readIfExists(importCoveragePath) || '{"items":{}}');
+  } catch {
+    coverage = { items: {} };
+  }
+  if (!coverage.items) coverage.items = {};
+```
+
+Problem:
+The `catch` block around line 381 (and identical at 375) silently swallows any error from `JSON.parse`, including malformed JSON or I/O failures, without logging or rethrowing. This means if `readIfExists(importCoveragePath)` returns a non-JSON string or corrupted data, the system defaults to `{ items: {} }` without surfacing the failure — leading to potential data loss or incorrect coverage state that operators cannot detect or debug.
+
+Solution:
+Replace the silent `catch` block with one that logs the error using `console.error` with context (file path and error message), then falls back to `{ items: {} }`. This preserves the fallback behavior while surfacing the failure to the operator — enabling detection and remediation without requiring telemetry or metrics infrastructure.
+
+Benefits:
+Once fixed, operators can detect and respond to malformed or corrupted coverage files, preventing silent data degradation. The fix is minimal, leverages only available logging primitives, and does not require metrics or third-party systems — satisfying the project’s constraints while eliminating the silent failure risk.
+
+### AC-17 · Silent Error Swallowing in Coverage Parsing
+Strength: Strong
+Files: src/arch.js
+Snippet:
+```
+  let coverage;
+  try {
+    coverage = JSON.parse(fs.existsSync(importCoveragePath) ? fs.readFileSync(importCoveragePath, 'utf8') : '{"items":{}}');
+  } catch {
+    coverage = { items: {} };
+  }
+  if (!coverage.items) coverage.items = {};
+```
+
+Problem:  
+The `try...catch` block around lines 476–478 catches any error during JSON parsing of `importCoveragePath` but does not log or rethrow it — silently replacing it with a default `{ items: {} }`. Since the project has no metrics system, this error cannot be surfaced via telemetry. The only available primitives are `console.error` (Node) and `logging.error` (Python), which are not used here. This means a failure to read or parse the coverage file — possibly due to a missing file, malformed JSON, or permission issues — goes unnoticed by the caller, leading to silent data loss or incorrect state (coverage not updated) with no debugging signal.
+
+Solution:  
+Replace the empty `catch` block with one that logs the error using `console.error` and rethrows it with a descriptive message, preserving the original behavior (if `result.skipped` is true, the coverage is not updated) but surfacing the error to the caller. This allows the caller to act on the failure (e.g., retry, log, or fail the task) without introducing metrics or telemetry.
+
+Benefits:  
+Once fixed, any failure to parse the import coverage file will be visible to the caller via console.error, enabling debugging and preventing silent data loss or incorrect state. The fix uses only available primitives — no metrics, no third-party logging — and preserves the original logic for skipped candidates.
+
+### AC-18 · Silent Error Swallowing in Task Initialization
+Strength: Strong
+Files: src/performance-review.js
+Snippet:
+```
+  const projectTag = path.basename(repoRoot);
+
+  let coverage;
+  try { coverage = JSON.parse(readIfExists(coveragePath) || '{}'); } catch { coverage = {}; }
+
+  const flagsPath = path.join(pipelineDir, 'queue', 'performance-flags.json');
+  let flags;
+```
+
+Problem:
+The `nextPerformanceReviewTask` function silently swallows errors during JSON parsing of optional files (`coveragePath` and `flagsPath`) by catching exceptions without logging or surfacing them. This breaks observability — if the files are malformed, missing, or corrupted, the error is not logged or communicated to the caller, meaning downstream logic may operate on invalid or missing state without any trace. Since the function’s contract is to return a task object (not throw), silent failure is a hidden bug that could lead to incorrect task execution or data loss — and the scanner correctly flags this as a “silent-catch-block” because the `catch` blocks do not log or rethrow, and the error is not propagated.
+
+Solution:
+Log the error with context using `console.error` (since no logging framework exists) and fall back to defaults (`coverage = {}`, `flags = []`) — but do not rethrow, because rethrowing would break the function’s contract to return a task object. The fix preserves the function’s behavior while surfacing the error for observability, using only available primitives.
+
+Benefits:
+Once fixed, errors during file parsing are logged with context (file path and error message), making it easier to debug silent failures. The function continues to return a task object with known failure state (via defaults), ensuring correctness and observability without breaking contracts or introducing new dependencies.
+
+### AC-19 · Silent Error Swallowing in Coverage and Flags Parsing
+Strength: Strong
+Files: src/performance-review.js
+Snippet:
+```
+
+  const flagsPath = path.join(pipelineDir, 'queue', 'performance-flags.json');
+  let flags;
+  try { flags = JSON.parse(readIfExists(flagsPath) || '[]'); } catch { flags = []; }
+
+  const now = Date.now();
+  const lastScannedAt = coverage.lastScannedAt ? Date.parse(coverage.lastScannedAt) : NaN;
+```
+
+Problem:
+The `try...catch` blocks around `JSON.parse(...)` silently assign fallback values (`coverage = {}` or `flags = []`) without logging or rethrowing, which means any parsing failure (e.g., malformed JSON, missing file, or invalid syntax) is completely invisible to the caller. Since this code is part of a performance review task and the project has no metrics system but does have `console.error`, the absence of error logging or propagation violates observability hygiene — downstream pipelines may proceed with invalid state, leading to incorrect assessments or silent failures.
+
+Solution:
+Replace the silent-catch blocks with error logging using `console.error` and rethrowing the error to surface it to the caller. This ensures the failure is observable and actionable — for example, the caller can log, retry, or fail fast. The fix uses only available primitives: `console.error`.
+
+Benefits:
+Once fixed, any parsing failure will be logged with context (file path and error message) and rethrown, ensuring that failures are not silently swallowed. This improves observability, correctness, and traceability of performance review tasks — preventing silent regressions or incorrect assessments in downstream pipelines.
+
+### AC-20 · Silent Error Swallowing in Flag Inventory Initialization
+Strength: Strong
+Files: src/function-length-review.js
+Snippet:
+```
+function functionLengthInventory({ repoRoot, pipelineDir, taskState }) {
+  const projectTag = path.basename(repoRoot);
+  let flags;
+  try { flags = JSON.parse(readIfExists(path.join(pipelineDir, 'queue', 'function-length-flags.json')) || '[]'); } catch { flags = []; }
+  return buildFlagInventory({
+    flags, projectTag, repoRoot, taskState,
+    idFor: (f) => `function-length-${slugifyForId(projectTag)}-${slugifyForId(f.file || 'repo')}-${f.line || 0}`,
+```
+
+Problem:
+The function `functionLengthInventory` attempts to parse a JSON flags file but silently catches and discards any error during `JSON.parse`, including file access failures or malformed JSON. The fallback `flags = []` hides the failure, and since there’s no logging or rethrowing, the caller receives an empty inventory without knowing the cause — potentially leading to incorrect dashboard state or silent data loss when the file is corrupted or inaccessible.
+
+Solution:
+Replace the silent `catch` block with one that logs the error to stderr using `console.error` with context about the file path and error message, then rethrows the original error to surface it to the caller. This preserves the stack trace and allows the caller to handle the failure appropriately — without introducing any metrics or telemetry.
+
+Benefits:
+The fix restores observability: failures in flag file parsing are now logged and propagated, enabling operators to detect and respond to file corruption, permission issues, or misconfiguration — preventing silent data loss or misleading dashboard metrics.
+
+### AC-21 · Fix Empty Catch Block in Dependency Check
+Strength: Strong
+Files: src/observability-scan.js
+Snippet:
+```
+    try {
+      const text = fs.readFileSync(path.join(repoRoot, file), 'utf8');
+      if (re.test(text)) return true;
+    } catch {}
+  }
+  return false;
+}
+```
+
+Problem:
+The `hasOtelDependency` function silently swallows all errors during file reads (e.g., file not found, permission denied, syntax errors) by using an empty `catch` block. This means misconfigurations — such as missing or malformed dependency files — go undetected, and the function returns `false` erroneously, making it impossible for callers to diagnose why OpenTelemetry is not detected.
+
+Solution:
+Replace the empty `catch` block with one that logs the error using `console.error` with the file path and error message, then rethrows the original error. This ensures the error is visible to the caller and provides context for debugging.
+
+Benefits:
+Callers will now be able to detect and respond to file system errors during dependency checks. The fix preserves the original error for stack traces and adds logging context, making misconfigurations actionable — without requiring metrics or telemetry systems that don’t exist.
+
+### AC-22 · Silent Error Swallowing in File Reading
+Strength: Strong
+Files: src/unused-export-scan.js
+Snippet:
+```
+      if (file.endsWith('.d.ts')) continue; // ambient declarations, not definitions
+      let fileText = null; // read lazily, once per file
+      const readText = () => {
+        if (fileText === null) { try { fileText = fs.readFileSync(file, 'utf8'); } catch { fileText = ''; } }
+        return fileText;
+      };
+      const names = extractExports(file);
+```
+
+Problem:
+The `readText` function silently assigns an empty string to `fileText` when `fs.readFileSync` throws an error — and it does not log the error or rethrow it. This means I/O failures (file missing, corrupted, permission denied) are invisible to the caller, causing `names` and `sites` arrays to be empty or malformed. Since the code iterates over files and builds a list of candidates based on exports, silent failures lead to incomplete or incorrect export analysis — especially for `.ts` files that may be critical to the export scanning logic. The error is not surfaced, making debugging impossible and increasing the risk of undetected bugs in the export analysis pipeline.
+
+Solution:
+Modify the `readText` function to log the error with context (file path and error message) using `console.error`, and rethrow the error to surface it to the caller. This preserves lazy loading while ensuring the error is observable. The fix uses only stdlib `console.error` and `throw`, which are available in the project.
+
+Benefits:
+Once fixed, any I/O failure during file reading will be logged to stderr and rethrown, ensuring the caller can detect and respond to the failure. This improves observability, enables debugging, and prevents silent data loss or incorrect export analysis — especially for files that are critical to the export scanning logic. The fix is minimal, safe, and matches the project’s logging capabilities.
+
+### AC-23 · Silent Error Swallowing in unusedExportInventory
+Strength: Strong
+Files: src/unused-export.js
+Snippet:
+```
+// Read-only inventory for the dashboard's Hygiene tab (see flag-inventory.js). Same id formula as nextUnusedExportTask.
+function unusedExportInventory({ pipelineDir, repoRoot, taskState }) {
+  let entries;
+  try { entries = JSON.parse(readIfExists(path.join(pipelineDir, 'queue', 'dead-code-flags.json')) || '[]'); } catch { entries = []; }
+  const flags = (Array.isArray(entries) ? entries : []).map((e) => ({
+    rule: 'unused-export', file: e.definedIn, line: 0, scannedAt: e.scannedAt,
+    detail: isFileEntry(e) ? `whole file -- ${(e.exports || []).length} export(s), no importer` : `${e.symbol} -- ${(e.callSites || []).length} call site(s)`,
+```
+
+Problem:
+The `try/catch` block in `unusedExportInventory` silently catches any error during `JSON.parse` or `readIfExists`, without logging or rethrowing. This means failures like file permission issues, corrupted JSON, or invalid paths are invisible to operators — and the function returns an empty array, potentially misleading dashboard hygiene data. Since the project has no metrics system, emitting a metric is impossible — but logging the error to stderr using `console.error` is sufficient and aligns with the project’s existing logging pattern.
+
+Solution:
+Replace the empty `catch` block with a `catch` that logs the error using `console.error` with context (file path and error message), then assigns an empty array. This preserves the function’s contract to return a list while making failures observable.
+
+Benefits:
+Operators can now detect and debug failures in reading the dead-code-flags.json file — preventing silent data corruption in the hygiene dashboard — without requiring metrics infrastructure or rethrowing exceptions that would break the caller’s flow.
+
+### AC-24 · Silent Prefilter Error Swallowing
+Strength: Strong
+Files: src/unused-export.js
+Snippet:
+```
+    let decision;
+    try {
+      decision = prefilter.decide({ entry, taskId, exists: taskIdExistsInQueue, deadFiles, ledger: ledger || { seen: {}, dismissed: {} }, mode });
+    } catch {
+      decision = { action: taken ? 'skip' : 'create', id: taskId, stamp: null, dirty: false };   // fail open: behave as before
+    }
+    if (decision.dirty && ledger) ledgerDirty = true;
+```
+
+Problem:  
+The `try...catch` block around `prefilter.decide(...)` silently catches any error and assigns a fallback decision without logging or rethrowing. This masks real bugs or misconfigurations in the prefilter logic — for example, if `prefilter.decide` is called with invalid state or a missing dependency — and the error is never surfaced to operators or developers. Since the project has no metrics or telemetry system, the only way to observe such failures is through logging, which is currently absent.
+
+Solution:  
+Log the caught error using `console.error` with context including `taskId`, `entry`, and `mode` so that it can be debugged, while preserving the fallback behavior. The fix adds a contextual log before assigning the fallback decision, ensuring observability without fabricating metrics or rethrowing.
+
+Benefits:  
+Once fixed, any error in `prefilter.decide(...)` will be visible in logs, enabling developers to detect and fix misconfigurations or bugs without relying on silent fallbacks. This improves the system’s robustness and maintainability by surfacing failures that would otherwise remain invisible.
+
+### AC-25 · Silent Error Swallowing in File Scanning Loop
+Strength: Strong
+Files: src/unused-export-scan.js
+Snippet:
+```
+                hits.push({ file: path.relative(repoRoot, fullPath).replace(/\\/g, '/'), line: lineNum });
+              }
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+```
+
+Problem:
+The `catch {}` block inside the `try` that reads each file silently discards any error thrown during `fs.readFileSync` — including permission errors, file corruption, or encoding mismatches — which could mask real file-system issues during the scan. Since this is a hygiene scanner (not a critical system), silently swallowing errors is dangerous because it hides potential problems in the codebase (e.g., a file that should exist but doesn’t, or a file that’s corrupted and thus falsely reported as “unused” or “missing”). The outer `catch {}` is not sufficient to cover this — it’s at the top level of the directory walk, but the inner `catch {}` is inside a loop over files, and if one file fails, the scanner continues, but the error is not logged or reported — which violates the principle of “fail fast” for hygiene tools that must report partial results, not just crash.
+
+Solution:
+Replace the empty `catch {}` block with a logging statement that prints the error with context to identify which file failed, and continue scanning — do not rethrow. This preserves the tool’s design to report partial results while surfacing observable failures to the user. Since the project has no metrics system, logging to `console.error` is the only available primitive.
+
+Benefits:
+Once fixed, the scanner will log any file-read failures with full context (file path and error message), allowing users to identify and address file-system issues without crashing or silently ignoring them. This improves observability and reliability of the hygiene scan, ensuring that partial results are reported and not lost in silence.
+
+### AC-26 · Silent Error Swallowing in File Scanner
+Strength: Strong
+Files: src/unused-export-scan.js
+Snippet:
+```
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  for (const root of searchRoots) {
+```
+
+Problem:
+The `catch {}` block around the file-reading logic (lines 288–294) silently discards any error thrown during `fs.readFileSync` or line parsing — such as permission issues, file corruption, or path resolution failures. Since there’s no logging or rethrow, the caller (e.g., the `walk` function or main loop) has no way to detect that a file was unreadable. This breaks observability: the scanner continues as if the file was processed, potentially leaving gaps in the scan or masking real file-system failures — especially since the surrounding code uses early-exit patterns (`return`) but no error propagation.
+
+Solution:
+Replace the empty `catch {}` with a block that logs the error with context (file path and error message) and rethrows it to surface to the caller. This preserves the early-exit pattern and ensures errors are not silently swallowed. The fix is scoped to the flagged block only — the outer `catch {}` remains untouched unless flagged separately.
+
+Benefits:
+Once fixed, the scanner will surface file-system failures via console.error, enabling humans to detect and debug unreadable files. This prevents silent gaps in the scan and ensures the traversal’s correctness is observable — even without metrics or telemetry — because the error is now logged and rethrown for the caller to handle.
