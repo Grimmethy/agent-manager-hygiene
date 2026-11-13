@@ -1,0 +1,9 @@
+{
+  "name": "t5-dedup-suppression-project",
+  "dependencies": {
+    "bar": "1.0.0"
+  },
+  "devDependencies": {
+    "bar": "2.0.0"
+  }
+}
