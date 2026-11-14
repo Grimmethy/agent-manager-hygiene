@@ -366,7 +366,8 @@ function nextArchImportTask({ getConfig, taskIdExistsInQueue }) {
   let deepDiveCoverage;
   try {
     deepDiveCoverage = JSON.parse(readIfExists(deepDiveCoveragePath) || '{"projects":{}}');
-  } catch {
+  } catch (err) {
+    console.error('nextArchImportTask: failed to parse deep-dive coverage file at', deepDiveCoveragePath, '--', err && err.message ? err.message : err, '; falling back to empty coverage');
     deepDiveCoverage = { projects: {} };
   }
   const relevantSlugs = new Set(
@@ -378,7 +379,8 @@ function nextArchImportTask({ getConfig, taskIdExistsInQueue }) {
   let coverage;
   try {
     coverage = JSON.parse(readIfExists(importCoveragePath) || '{"items":{}}');
-  } catch {
+  } catch (err) {
+    console.error('nextArchImportTask: failed to parse import coverage file at', importCoveragePath, '--', err && err.message ? err.message : err, '; falling back to empty coverage');
     coverage = { items: {} };
   }
   if (!coverage.items) coverage.items = {};
