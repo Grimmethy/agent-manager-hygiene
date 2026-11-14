@@ -22,8 +22,10 @@ const deps = { getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, tas
 require('./src/function-length-review.js').register(deps);
 require('./src/observability-review.js').register(deps);
 require('./src/performance-review.js').register(deps);
-require('./src/todo-aging-review.js').register(deps);
-require('./src/todo-aging-fix.js').register(deps);
+// HOTFIX 2026-11-13: not wired until HUB0010 finishes (needs a registerTaskSource dep and a 'todo_aging' family in hygiene-family.js; loading it crashed every core process that loads this plugin):
+// require('./src/todo-aging-review.js').register(deps);
+// HOTFIX 2026-11-13: not wired until HUB0010 finishes (needs a registerTaskSource dep and a 'todo_aging' family in hygiene-family.js; loading it crashed every core process that loads this plugin):
+// require('./src/todo-aging-fix.js').register(deps);
 // Narrow-verdict variants of the two review sources above (task-atomization phase 2); must register after them.
 require('./src/triage-sources.js').register(deps);
 require('./src/arch.js').register(deps);
