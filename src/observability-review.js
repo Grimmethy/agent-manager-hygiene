@@ -667,6 +667,9 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
           const r = applyArchDiscoveryCandidates({
             implementResponse: one, candidatesPath: observabilityFixCandidatesPath,
             docTitle: '# Observability Fix Candidates', snippet: item.snippet,
+            // dedupe: skip a finding already filed for this file + function (master, open agent/* branches, or this tree).
+            // Same reason as the dedupe option at observability-review.js:581-584 (2026-09-26, AC-187 vs AC-51).
+            dedupe: true,
           });
           if (r && !r.skipped) filed += 1;
         } else {
