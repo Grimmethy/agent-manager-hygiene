@@ -413,3 +413,26 @@ Replace `fs.readFileSync` with `fs.promises.readFile` and convert the loop to us
 
 Benefits:
 After the fix, the scan will complete significantly faster, especially for large file sets, because I/O operations run in parallel rather than sequentially. The event loop remains responsive, preventing timeouts or degraded UX in concurrent or long-running scans. No metrics or logging system is needed — the fix is purely performance-oriented and uses only existing primitives.
+
+### AC-19 · Fix Synchronous File Reads with Limited Parallelism
+Strength: Strong
+Files: src/magic-literal-scan.js
+Snippet:
+```
+  walkDir(projectRoot);
+
+  const findings = [];
+  for (const file of allFiles) {
+    let content;
+    try {
+      content = fs.readFileSync(file, 'utf8');
+```
+
+Problem:  
+The scanner runs a synchronous `fs.readFileSync` inside a loop over `allFiles`, which may contain hundreds or thousands of files. Each read blocks the Node.js event loop until completion, starving other async operations (HTTP, timers, etc.) and causing unbounded latency under load — especially during startup or frequent scans. The issue is not correctness or security, but performance: blocking I/O in a hot path leads to degraded responsiveness and high memory usage if files are large or numerous.
+
+Solution:  
+Replace the synchronous loop with an async function that reads files in parallel using a controlled concurrency limit (5 reads at a time). Use a simple semaphore via a counter and a queue to manage concurrent reads. Cache results in a Map to avoid re-reading the same file. The loop remains structured around `allFiles`, but each file is read asynchronously with backpressure via the semaphore — ensuring no more than 5 concurrent reads and queuing subsequent ones until slots free up.
+
+Benefits:  
+The fix eliminates event loop blocking, reducing latency under load and preventing starvation of async operations. It also avoids redundant reads via memoization, improving efficiency without introducing new dependencies or APIs. Even for small file sets, the fix is safe and preserves correctness — it merely optimizes the performance path without altering behavior.
