@@ -330,6 +330,7 @@ function observabilityFixImplementPrompt(task, planText) {
       ? `NOTE: ${namedButMissing.join(', ')} named by this candidate could not be read (does not exist at that path, or is outside the repo). If your plan calls for creating this file, use mode "create". If your plan assumed this file already exists and you cannot proceed without seeing its real content, output the empty string instead of guessing at content you were never shown.`
       : '',
     '',
+    'Each "find" value MUST occur EXACTLY ONCE in the target file: a find that matches zero places or more than one place is rejected by the applier and the task is requeued. If the text you want to target is not unique, extend "find" with the adjacent lines (or a nearby unique token) until it is unique.',
     'Ground every "find" value in the real file content shown above, character for character -- never in your own memory of the plan or candidate write-up.',
     '',
     capabilityProfileBlock(),
