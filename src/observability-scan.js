@@ -246,6 +246,19 @@ function bodyFingerprint(strippedBody) {
   return String(strippedBody || '').replace(/\s+/g, ' ').trim();
 }
 
+// Silent-catch dismissal (HUB0023 2/3). The pure rules module (HUB0023 1/3) is not in this checkout, so the stand-in
+// classifier below returns 'keep' for every site: nothing is dismissed until a real rule exists. A 'benign' verdict
+// removes the finding and is recorded (history event + per-reason counter); 'keep' leaves the finding untouched.
+const silentCatchDismissalCounts = {};
+const silentCatchDismissalEvents = [];
+function classifySilentCatch({ relPath, siteKey, confidence, isPython }) {
+  return { tier: 'keep', reason: null };
+}
+function recordSilentCatchDismissal(siteKey, reason) {
+  silentCatchDismissalEvents.push({ kind: 'silent-catch-dismissed', siteKey, reason });
+  silentCatchDismissalCounts[reason] = (silentCatchDismissalCounts[reason] || 0) + 1;
+}
+
 function findSilentCatchBlocks(text, relPath) {
   // Test / fixture / mock files deliberately swallow errors to exercise failure paths;
   // flagging them is noise. Matches performance-scan.js's use of the same helper.
@@ -278,6 +291,9 @@ function findSilentCatchBlocks(text, relPath) {
       const confidence = classifyCatchConfidence({
         stripped, text, headerIndex: m.index, closeIndex: openIndex + 1 + body.length, isPython: false,
       });
+      const siteKey = `${relPath}:${m.index}`;
+      const verdict = classifySilentCatch({ relPath, siteKey, confidence, isPython: false });
+      if (verdict.tier === 'benign') { recordSilentCatchDismissal(siteKey, verdict.reason); continue; }
       const baseDetail = stripped.length === 0
         ? 'catch block is empty -- the error is silently discarded with no log/rethrow/metric'
         : 'catch block does not appear to log, rethrow, or otherwise surface the error';
@@ -321,6 +337,9 @@ function findSilentExceptBlocks(text, relPath) {
       const confidence = classifyCatchConfidence({
         stripped, text, headerIndex: m.index, closeIndex: block.endIndex, isPython: true,
       });
+      const siteKey = `${relPath}:${m.index}`;
+      const verdict = classifySilentCatch({ relPath, siteKey, confidence, isPython: true });
+      if (verdict.tier === 'benign') { recordSilentCatchDismissal(siteKey, verdict.reason); continue; }
       const baseDetail = isEmpty
         ? 'except block is empty (only pass/.../a comment) -- the exception is silently discarded with no log/re-raise/metric'
         : 'except block does not appear to log, re-raise, or otherwise surface the exception';

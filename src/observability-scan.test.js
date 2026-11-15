@@ -410,3 +410,11 @@ test('silent-catch-block: state-setter surfacing is JS/TS only -- a Python excep
   const py = 'try:\n    a()\nexcept Exception as e:\n    set_detail(str(e))\n';
   assert.equal(findSilentCatchBlocks(py, 'x.py').length, 1);
 });
+
+test('silent-catch dismissal: a Python except swallow is still reported and not dismissed', () => {
+  const text = 'try:\n  x()\nexcept Exception as e:\n  pass\n';
+  const findings = findSilentCatchBlocks(text, 'pkg/mod.py');
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].rule, 'silent-catch-block');
+  assert.equal(findings[0].dismissed, undefined);
+});
