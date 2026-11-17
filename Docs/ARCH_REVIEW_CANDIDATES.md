@@ -190,3 +190,20 @@ Update the comment block for `readDirtySignals` to accurately reflect the dual-w
 
 Benefits:
 The documentation now accurately reflects the code's behavior, preventing future readers from making incorrect assumptions about single-writer semantics. This reduces the risk of introducing bugs when modifying either writer. If the race is acceptable, the documentation makes this explicit; if not, it prompts investigation into proper coordination.
+
+### AC-18 · extractBraceBody must handle nested braces in strings, template literals, and regex literals
+Strength: Strong
+
+**Strength:** Strong
+**Files:** `src/function-length-scan.js`, `src/function-length-scan.test.js`
+
+**Problem:**
+`extractBraceBody` is the single point of correctness for function-body span detection in `function-length-scan.js`. If it does not track string, template-literal, and regex-literal state while scanning for braces, it will misidentify the closing brace of a function that contains nested braces inside a template literal or regex literal. This produces wrong `lengthLines` values and causes the review stage to receive truncated or oversized snippets. The function has no visible test coverage for these edge cases, and no documented contract specifying which lexical contexts it must respect.
+
+**Solution:**
+Audit `extractBraceBody` (defined in `src/function-length-scan.js` or a dependency) for correct handling of nested braces inside template literals, regex literals, and strings. Add test cases in `src/function-length-scan.test.js` that exercise functions containing nested braces in template literals and regex literals. Document the function's contract (what lexical contexts it handles, what it does not). If the current implementation lacks state tracking for these contexts, fix it.
+
+**Benefits:**
+Eliminates a class of silent correctness bugs in the function-length scan. Provides a verifiable contract for `extractBraceBody` so future changes can be validated. Ensures the review stage receives accurate function body snippets.
+
+---
