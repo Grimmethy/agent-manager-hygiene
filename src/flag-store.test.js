@@ -92,12 +92,13 @@ test('no real change -> changed:false (caller can skip rewriting the file)', () 
 test('a FAILED scan does not wipe the backlog -- only flags whose file is gone are pruned', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'flag-store-test-'));
   fs.writeFileSync(path.join(dir, 'present.js'), '// still here\n');
+  const fileExists = (f) => f === 'present.js';
   const { flags, changed } = reconcileFlags({
     flags: [flag('present.js', 10), flag('deleted.js', 20), flag('x.js', 5, { projectSlug: 'other' })],
     freshFindings: [], // scan threw, caller passes []
     scanOk: false,
     projectTag: 'proj',
-    repoRoot: dir,
+    fileExists,
   });
   assert.equal(changed, true);
   assert.deepEqual(
@@ -110,12 +111,13 @@ test('a FAILED scan does not wipe the backlog -- only flags whose file is gone a
 test('a failed scan on an all-present, single-project backlog changes nothing', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'flag-store-test-'));
   fs.writeFileSync(path.join(dir, 'present.js'), '// still here\n');
+  const fileExists = (f) => f === 'present.js';
   const { changed } = reconcileFlags({
     flags: [flag('present.js', 10)],
     freshFindings: [],
     scanOk: false,
     projectTag: 'proj',
-    repoRoot: dir,
+    fileExists,
   });
   assert.equal(changed, false);
 });
@@ -172,10 +174,11 @@ test('reconcileFlags does not touch confidence when the scan threw (fresh is not
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'flag-store-scanfail-'));
   fs.writeFileSync(path.join(repo, 'a.js'), 'x');
   const old = flag('a.js', 5, { rule: 'silent-catch-block', confidence: 'high' });
+  const fileExists = (f) => f === 'a.js';
   const { flags } = reconcileFlags({
     flags: [old],
     freshFindings: [{ ...flag('a.js', 5), rule: 'silent-catch-block', confidence: 'low' }], // ignored: scanOk false
-    scanOk: false, projectTag: 'proj', repoRoot: repo,
+    scanOk: false, projectTag: 'proj', fileExists,
   });
   assert.equal(flags.length, 1);
   assert.equal(flags[0].confidence, 'high');
