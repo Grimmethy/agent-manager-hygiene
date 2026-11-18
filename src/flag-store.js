@@ -28,9 +28,6 @@
 // fixed here in passing). If the scan THREW, fall back to the old file-exists-only prune
 // (still scoped to this project) so a transient scan error can't wipe the live backlog.
 
-const fs = require('fs');
-const path = require('path');
-
 function flagKey(f) {
   return `${f.rule}::${f.file}::${f.line}`;
 }
@@ -44,7 +41,7 @@ function flagKey(f) {
 //                  review already ruled a false positive (suppression-store.js) is pruned
 //                  from the backlog entirely -- it will never spawn another review task,
 //                  even after a rescan re-detects it or a commit shifts its line.
-function reconcileFlags({ flags, freshFindings, scanOk, projectTag, repoRoot, isSuppressed }) {
+function reconcileFlags({ flags, freshFindings, scanOk, projectTag, fileExists = () => false, isSuppressed }) {
   const before = JSON.stringify(flags);
   const fresh = Array.isArray(freshFindings) ? freshFindings : [];
 
@@ -55,7 +52,7 @@ function reconcileFlags({ flags, freshFindings, scanOk, projectTag, repoRoot, is
   } else {
     kept = flags.filter((f) => f.projectSlug !== projectTag
       || !f.file
-      || fs.existsSync(path.join(repoRoot, f.file)));
+      || fileExists(f.file));
   }
 
   const keptKeys = new Set(kept.map(flagKey));
