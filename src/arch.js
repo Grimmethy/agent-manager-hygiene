@@ -231,14 +231,24 @@ function legacyTaskId(communityId) {
 // A second, structurally independent staleness detector, alongside the content-hash
 // check above: change_review, as it walks every commit landing on the default branch for
 // its own correctness pass, ALSO flags any community whose files that commit touched
-// (change-review.js's flagDirtyCommunities()) into communityDirtySignalsPath. Read-only
-// here -- arch.js never writes this file, only change_review does, so there's exactly
-// one writer and no read-modify-write race between the two plugins' independent per-tick
-// invocations. This exists as deliberate redundancy: the hash check already recomputes
-// content fresh on every call, but that's a SINGLE code path -- a bug in it (or in
-// graph.json itself) would silently blind the whole staleness mechanism with nothing
-// to catch it. This gives a second, unrelated path (git-diff-driven, not content-hash-
-// driven) to the same "this community changed" conclusion.
+// (change-review.js's flagDirtyCommunities()) into communityDirtySignalsPath.
+//
+// Dual-writer: arch.js also writes this file via clearDirtySignal() (subtractive --
+// removes a flag after a task is handed out), while change_review writes additively
+// (adds flags as commits land). Both perform read-modify-write on the same JSON file.
+//
+// Race window: if clearDirtySignal and change_review interleave within a tick, the
+// subtractive write can clear a flag just set by the additive writer, leaving a stale
+// flag state. This is acceptable because: (a) both operations are idempotent (clearing
+// a non-existent flag is a no-op; adding an already-present flag is a no-op), and
+// (b) the worst case is a community staying flagged dirty one tick longer than necessary
+// before change_review's next pass re-flags it -- no data loss, no incorrect behavior.
+//
+// This exists as deliberate redundancy: the hash check already recomputes content fresh
+// on every call, but that's a SINGLE code path -- a bug in it (or in graph.json itself)
+// would silently blind the whole staleness mechanism with nothing to catch it. This
+// gives a second, unrelated path (git-diff-driven, not content-hash-driven) to the same
+// "this community changed" conclusion.
 function readDirtySignals(communityDirtySignalsPath) {
   const text = readIfExists(communityDirtySignalsPath);
   if (!text) return {};
@@ -253,6 +263,10 @@ function readDirtySignals(communityDirtySignalsPath) {
 // Consumed the moment a fresh task is handed back for that community (same "task exists
 // = handled" semantics as the rest of this file) -- not at apply/completion time, so a
 // community doesn't stay flagged dirty for its whole review cycle once already picked up.
+//
+// WRITE SEMANTICS: subtractive -- removes a flag from communityDirtySignalsPath.
+// Performs read-modify-write on the same file as change_review's additive writer.
+// See readDirtySignals()'s comment for the race window and why it's acceptable.
 function clearDirtySignal(communityDirtySignalsPath, communityId) {
   const signals = readDirtySignals(communityDirtySignalsPath);
   const key = String(communityId);
