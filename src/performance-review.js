@@ -195,11 +195,11 @@ function nextPerformanceReviewTask({ repoRoot, pipelineDir, defaultDomain, taskI
   const projectTag = path.basename(repoRoot);
 
   let coverage;
-  try { coverage = JSON.parse(readIfExists(coveragePath) || '{}'); } catch { coverage = {}; }
+  try { coverage = JSON.parse(readIfExists(coveragePath) || '{}'); } catch (err) { console.error(`performance_review: failed to parse coverage file "${coveragePath}": ${err.message}`); coverage = {}; }
 
   const flagsPath = path.join(pipelineDir, 'queue', 'performance-flags.json');
   let flags;
-  try { flags = JSON.parse(readIfExists(flagsPath) || '[]'); } catch { flags = []; }
+  try { flags = JSON.parse(readIfExists(flagsPath) || '[]'); } catch (err) { console.error(`performance_review: failed to parse performance flags file "${flagsPath}": ${err.message}`); flags = []; }
 
   const now = Date.now();
   const lastScannedAt = coverage.lastScannedAt ? Date.parse(coverage.lastScannedAt) : NaN;
