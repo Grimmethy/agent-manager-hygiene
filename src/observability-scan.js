@@ -404,7 +404,9 @@ function hasOtelDependency(repoRoot) {
     try {
       const text = fs.readFileSync(path.join(repoRoot, file), 'utf8');
       if (re.test(text)) return true;
-    } catch {}
+    } catch (e) {
+      console.error(`observability-scan: failed to read ${file} for OTel dependency check: ${e.message}`);
+    }
   }
   return false;
 }
