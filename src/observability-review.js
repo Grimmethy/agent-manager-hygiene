@@ -62,7 +62,7 @@ function makeFileCache(repoRoot) {
     if (content && !minified) {
       try {
         silentCatch = findSilentCatchBlocks(content, relPath).filter((f) => f.rule === 'silent-catch-block');
-      } catch { silentCatch = []; }
+      } catch (err) { console.error("[observability-review] findSilentCatchBlocks failed for " + relPath + ": " + err.message); silentCatch = []; }
     }
     const entry = { content, minified, silentCatch };
     cache.set(relPath, entry);
