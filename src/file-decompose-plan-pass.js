@@ -338,7 +338,10 @@ function computeFanOutSymbols(repoRoot, sourceFile, groups, text) {
     const names = syms.map((s) => s.name);
     if (names.length === 0) continue;
     let check;
-    try { check = staticCheckMove(repoRoot, sourceFile, names); } catch { check = null; }
+    try { check = staticCheckMove(repoRoot, sourceFile, names); } catch (err) {
+      console.error(`[file-decompose] staticCheckMove failed for ${sourceFile}: ${err.message}`);
+      check = null;
+    }
     if (!check) continue; // can't check (no python3, file unreadable) -- no filter this run
     for (const s of Object.keys(check.externalRefs || {})) fanOut.add(s);
   }
