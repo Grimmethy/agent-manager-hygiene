@@ -282,7 +282,9 @@ function countCallSites(symbol, definingFile, searchRoots, repoRoot) {
                 hits.push({ file: path.relative(repoRoot, fullPath).replace(/\\/g, '/'), line: lineNum });
               }
             }
-          } catch {}
+          } catch (err) {
+            process.stderr.write(`[unused-export-scan] failed to read ${path.relative(repoRoot, fullPath).replace(/\\/g, '/')} (${err?.code || 'unknown'}): ${err?.message ?? err}\n`);
+          }
         }
       }
     } catch {}
