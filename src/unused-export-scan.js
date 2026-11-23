@@ -342,7 +342,7 @@ function scan() {
       if (file.endsWith('.d.ts')) continue; // ambient declarations, not definitions
       let fileText = null; // read lazily, once per file
       const readText = () => {
-        if (fileText === null) { try { fileText = fs.readFileSync(file, 'utf8'); } catch { fileText = ''; } }
+        if (fileText === null) { try { fileText = fs.readFileSync(file, 'utf8'); } catch (err) { process.stderr.write(`[unused-export-scan] failed to read ${file}: ${err?.message ?? err}\n`); throw err; } }
         return fileText;
       };
       const names = extractExports(file);
