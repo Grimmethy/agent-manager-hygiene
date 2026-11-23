@@ -219,7 +219,12 @@ function nextFunctionLengthReviewTask({ repoRoot, pipelineDir, defaultDomain, ta
   const flagsPath = path.join(pipelineDir, 'queue', 'function-length-flags.json');
 
   let coverage;
-  try { coverage = JSON.parse(readIfExists(coveragePath) || '{}'); } catch (err) { console.error('failed to parse', coveragePath, 'as JSON; defaulting to {}', err); coverage = {}; }
+  try {
+    coverage = JSON.parse(readIfExists(coveragePath) || '{}');
+  } catch (err) {
+    console.error(`Failed to parse coverage JSON from ${coveragePath}: ${err.message}`);
+    throw err;
+  }
   let flags;
   try { flags = JSON.parse(readIfExists(flagsPath) || '[]'); } catch (err) { console.error('failed to parse', flagsPath, 'as JSON; defaulting to []', err); flags = []; }
 
