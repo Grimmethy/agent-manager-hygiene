@@ -198,7 +198,8 @@ function nextUnusedExportTask({ getConfig, taskIdExistsInQueue }) {
     let decision;
     try {
       decision = prefilter.decide({ entry, taskId, exists: taskIdExistsInQueue, deadFiles, ledger: ledger || { seen: {}, dismissed: {} }, mode });
-    } catch {
+    } catch (err) {
+      console.error('prefilter.decide failed', { error: err.message, taskId, entry, mode });
       decision = { action: taken ? 'skip' : 'create', id: taskId, stamp: null, dirty: false };   // fail open: behave as before
     }
     if (decision.dirty && ledger) ledgerDirty = true;
