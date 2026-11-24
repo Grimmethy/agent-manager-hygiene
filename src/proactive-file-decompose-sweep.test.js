@@ -334,7 +334,7 @@ function writeDecomposeTask(dir, subdir, id, { decomposedFrom, deterministicAppl
   fs.writeFileSync(path.join(dir, 'queue', subdir, `${id}.json`), JSON.stringify({ id, promptContext, history }, null, 2));
 }
 
-test('countOutstandingDecomposeBranches: counts applied-not-merged decompose tasks, split Tier1/Tier2; ignores merged, un-applied, and non-decompose tasks', () => {
+test('countOutstandingDecomposeBranches: counts applied-not-merged decompose tasks, split Tier1/Tier2; ignores merged, un-applied, and non-decompose tasks', async () => {
   const dir = tmpPipeline([]);
   // Tier1: one-pass, applied, not merged -- counts
   writeDecomposeTask(dir, 'done', 'onepass-1', { decomposedFrom: 'file-decompose-a', deterministicApply: 'one-pass-decompose' });
@@ -350,7 +350,7 @@ test('countOutstandingDecomposeBranches: counts applied-not-merged decompose tas
   fs.writeFileSync(path.join(dir, 'queue', 'coordinating', 'file-decompose-hub-b.json'),
     JSON.stringify({ id: 'file-decompose-hub-b', promptContext: { decomposedFrom: 'file-decompose-hub-b' }, history: [] }));
 
-  const counts = countOutstandingDecomposeBranches(dir);
+  const counts = await countOutstandingDecomposeBranches(dir);
   assert.equal(counts.tier1, 1);
   assert.equal(counts.tier2, 1);
 });

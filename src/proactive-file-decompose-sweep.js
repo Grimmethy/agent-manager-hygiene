@@ -242,13 +242,20 @@ function filePlanRepeatedlyFailedIdentically(pipelineDir, targetFile) {
 // only, not the live default) puts every move on ONE shared branch -- this would count
 // each move task as its own outstanding branch, over-counting for that mode. Not fixed
 // here since stacked mode isn't the active path; worth revisiting if that ever changes.
-function countOutstandingDecomposeBranches(pipelineDir) {
+async function countOutstandingDecomposeBranches(pipelineDir) {
   const counts = { tier1: 0, tier2: 0 };
   const dirs = ['pending', 'adhoc', 'drafting', 'review', 'approved', 'coordinating', 'done']
     .map((d) => path.join(pipelineDir, 'queue', d));
-  for (const dir of dirs) {
-    let names;
-    try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')); } catch { continue; }
+  // Read all queue directory listings concurrently. Each read swallows its own error
+  // (missing/unreadable dir => null => skipped), and Promise.all preserves input order so
+  // the per-directory iteration below is identical to the old serial loop.
+  const listings = await Promise.all(dirs.map(async (d) => {
+    try { return (await fs.promises.readdir(d)).filter((n) => n.endsWith('.json')); } catch { return null; }
+  }));
+  for (let i = 0; i < dirs.length; i += 1) {
+    const dir = dirs[i];
+    const names = listings[i];
+    if (!names) continue;
     for (const name of names) {
       const rec = readJson(path.join(dir, name));
       if (!rec) continue;
@@ -285,7 +292,7 @@ async function sweep({ pipelineDir, repoRoot, call, force = false, now = Date.no
   // Outstanding-branches cap (see THROTTLE above) -- force bypasses the time floor but
   // never this: filing more work while you already have unreviewed branches waiting
   // doesn't get anything merged faster, it just grows the backlog.
-  const outstanding = countOutstandingDecomposeBranches(resolvedPipelineDir);
+  const outstanding = await countOutstandingDecomposeBranches(resolvedPipelineDir);
   summary.outstanding = outstanding;
   if (outstanding.tier1 >= TIER1_CAP && outstanding.tier2 >= TIER2_CAP) {
     summary.capped = true;
