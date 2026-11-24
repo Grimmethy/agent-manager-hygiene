@@ -393,27 +393,22 @@ function findUnguardedLoops(text, relPath) {
 
 // Only the naming/reserved-attribute rules are conditional on the project actually
 // depending on an OpenTelemetry SDK -- everything else applies to any codebase.
-async function hasOtelDependency(repoRoot) {
+function hasOtelDependency(repoRoot) {
   const checks = [
     { file: 'package.json', re: /"@opentelemetry\// },
     { file: 'requirements.txt', re: /\bopentelemetry-/ },
     { file: 'pyproject.toml', re: /opentelemetry-/ },
     { file: 'go.mod', re: /go\.opentelemetry\.io/ },
   ];
-  // Parallelize: each check reads its manifest file concurrently rather than
-  // sequentially, so the slowest file (not the sum) determines latency.
-  const results = await Promise.all(
-    checks.map(async ({ file, re }) => {
-      try {
-        const text = await fs.promises.readFile(path.join(repoRoot, file), 'utf8');
-        return { matched: re.test(text), file };
-      } catch (e) {
-        console.error(`observability-scan: failed to read ${file} for OTel dependency check: ${e.message}`);
-        return { matched: false, file };
-      }
-    })
-  );
-  return results.some((r) => r.matched);
+  for (const { file, re } of checks) {
+    try {
+      const text = fs.readFileSync(path.join(repoRoot, file), 'utf8');
+      if (re.test(text)) return true;
+    } catch (e) {
+      console.error(`observability-scan: failed to read ${file} for OTel dependency check: ${e.message}`);
+    }
+  }
+  return false;
 }
 
 // naming.md: lowercase, dot-namespaced, snake_case per segment.
