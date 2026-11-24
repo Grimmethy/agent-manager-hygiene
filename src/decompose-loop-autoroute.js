@@ -122,9 +122,24 @@ async function sweep({ pipelineDir, repoRoot, call, now = Date.now() } = {}) {
   const reqDir = path.join(pipelineDir, 'queue', 'file-decompose-requests');
   const pendingDir = path.join(pipelineDir, 'queue', 'pending');
 
-  for (const dir of SCAN_DIRS) {
-    let names;
-    try { names = fs.readdirSync(path.join(pipelineDir, 'queue', dir)).filter((n) => n.endsWith('.json')); } catch (err) { if (err.code === 'ENOENT') continue; console.error(`[decompose-loop-autoroute] readdir failed for ${path.join(pipelineDir, 'queue', dir)}: ${err.code || 'UNKNOWN'} ${err.message}`); throw err; }
+  // Read every SCAN_DIRS directory in parallel. Results are index-aligned with SCAN_DIRS,
+  // so the per-directory and per-file processing order below is unchanged. A missing
+  // directory yields an empty list (the old `continue`); any other error is logged with the
+  // same message and rethrown.
+  const scanNames = await Promise.all(SCAN_DIRS.map(async (d) => {
+    const dirPath = path.join(pipelineDir, 'queue', d);
+    try {
+      return (await fs.promises.readdir(dirPath)).filter((n) => n.endsWith('.json'));
+    } catch (err) {
+      if (err.code === 'ENOENT') return [];
+      console.error(`[decompose-loop-autoroute] readdir failed for ${dirPath}: ${err.code || 'UNKNOWN'} ${err.message}`);
+      throw err;
+    }
+  }));
+
+  for (let di = 0; di < SCAN_DIRS.length; di += 1) {
+    const dir = SCAN_DIRS[di];
+    const names = scanNames[di];
     for (const name of names) {
       const file = path.join(pipelineDir, 'queue', dir, name);
       const task = readJson(file);
