@@ -287,7 +287,9 @@ function countCallSites(symbol, definingFile, searchRoots, repoRoot) {
           }
         }
       }
-    } catch {}
+    } catch (err) {
+      process.stderr.write(`[unused-export-scan] failed to read directory ${path.relative(repoRoot, dir).replace(/\\/g, '/') || '.'} (${err?.code || 'unknown'}): ${err?.message ?? err}\n`);
+    }
   }
 
   for (const root of searchRoots) {
