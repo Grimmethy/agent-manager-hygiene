@@ -131,18 +131,25 @@ function findLongPythonFunctions(text, relPath, threshold = maxFunctionLines()) 
 // append to a persistent flags file, same shape observability-scan.js's own scanProject
 // returns. JS/TS files go through findLongFunctions (brace-matched), .py files through
 // findLongPythonFunctions (indentation-matched).
-function scanProject(clonePath, projectSlug) {
+async function scanProject(clonePath, projectSlug) {
   const allFiles = listSourceFiles(clonePath, SCAN_EXTENSIONS);
   const scannedAt = new Date().toISOString();
-  const findings = [];
   const threshold = maxFunctionLines();
 
-  for (const file of allFiles) {
-    let text;
-    try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
-    if (isLikelyMinified(text)) continue;
-    const relPath = path.relative(clonePath, file).replace(/\\/g, '/');
-    const finder = file.endsWith('.py') ? findLongPythonFunctions : findLongFunctions;
+  const readResults = await Promise.all(
+    allFiles.map(async (file) => {
+      let text;
+      try { text = await fs.promises.readFile(file, 'utf8'); } catch { return null; }
+      if (isLikelyMinified(text)) return null;
+      const relPath = path.relative(clonePath, file).replace(/\\/g, '/');
+      const finder = file.endsWith('.py') ? findLongPythonFunctions : findLongFunctions;
+      return { text, relPath, finder };
+    })
+  );
+
+  const findings = [];
+  for (const { text, relPath, finder } of readResults) {
+    if (!text) continue;
     findings.push(...finder(text, relPath, threshold));
   }
 
