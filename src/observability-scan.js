@@ -475,7 +475,7 @@ function findMissingReservedAttributes(repoRoot, files) {
 // Scans one project (a clonePath, already onboarded elsewhere -- this script never
 // clones anything itself). Returns findings with projectSlug/scannedAt attached, ready
 // to append to queue/observability-flags.json.
-function scanProject(clonePath, projectSlug) {
+async function scanProject(clonePath, projectSlug) {
   const allFiles = listSourceFiles(clonePath, SCAN_EXTENSIONS);
   // One read+check per file, up front, so every rule below (silent-catch-block,
   // unguarded-loop, OTel naming, reserved-attribute) skips minified/bundled files the
@@ -488,18 +488,26 @@ function scanProject(clonePath, projectSlug) {
   const scannedAt = new Date().toISOString();
   const findings = [];
 
-  for (const file of files) {
-    let text;
-    try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
+  // Parallel read all files to avoid blocking I/O
+  const fileContents = await Promise.all(files.map(async (file) => {
+    try {
+      const text = await fs.promises.readFile(file, 'utf8');
+      return { file, text };
+    } catch {
+      return { file, text: null };
+    }
+  }));
+
+  for (const { file, text } of fileContents) {
+    if (!text) continue;
     const relPath = path.relative(clonePath, file).replace(/\\/g, '/');
     findings.push(...findSilentCatchBlocks(text, relPath));
     findings.push(...findUnguardedLoops(text, relPath));
   }
 
   if (hasOtelDependency(clonePath)) {
-    for (const file of files) {
-      let text;
-      try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
+    for (const { file, text } of fileContents) {
+      if (!text) continue;
       const relPath = path.relative(clonePath, file).replace(/\\/g, '/');
       findings.push(...findOtelNamingViolations(text, relPath));
     }
