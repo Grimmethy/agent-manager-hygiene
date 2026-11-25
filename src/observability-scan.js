@@ -514,7 +514,21 @@ async function scanProject(clonePath, projectSlug) {
     findings.push(...findMissingReservedAttributes(clonePath, files));
   }
 
-  return findings.map((f) => ({ ...f, projectSlug, scannedAt }));
+  // Combine findings: deduplicate by rule + file + line (multiple detectors can flag the same site)
+  const combined = combineFindings(findings);
+  return combined.map((f) => ({ ...f, projectSlug, scannedAt }));
+}
+
+// Combine findings from multiple detectors: same rule + file + line = one finding
+function combineFindings(findings) {
+  const seen = new Map();
+  for (const f of findings) {
+    const key = `${f.rule}:${f.file}:${f.line}`;
+    if (!seen.has(key)) {
+      seen.set(key, f);
+    }
+  }
+  return Array.from(seen.values());
 }
 
 module.exports = {
