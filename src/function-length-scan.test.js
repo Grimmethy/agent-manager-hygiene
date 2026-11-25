@@ -123,13 +123,13 @@ test('findLongPythonFunctions flags a nested def separately from its enclosing d
   assert.ok(findings.some((f) => f.detail.includes('"inner"')));
 });
 
-test('scanProject routes .py files through the indentation-based detector', () => {
+test('scanProject routes .py files through the indentation-based detector', async () => {
   const prev = process.env.AGENT_MANAGER_MAX_FUNCTION_LINES;
   process.env.AGENT_MANAGER_MAX_FUNCTION_LINES = '10';
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'function-length-scan-py-test-'));
   fs.writeFileSync(path.join(dir, 'mod.py'), `def bloated():\n${pyBody(14)}\n    return 0\n`);
   fs.writeFileSync(path.join(dir, 'tiny.py'), `def ok():\n    return 1\n`);
-  const findings = scanProject(dir, 'py-project');
+  const findings = await scanProject(dir, 'py-project');
   if (prev == null) delete process.env.AGENT_MANAGER_MAX_FUNCTION_LINES;
   else process.env.AGENT_MANAGER_MAX_FUNCTION_LINES = prev;
   assert.equal(findings.length, 1);
@@ -138,7 +138,7 @@ test('scanProject routes .py files through the indentation-based detector', () =
   assert.equal(findings[0].projectSlug, 'py-project');
 });
 
-test('scanProject walks real files, skips minified ones, and attaches projectSlug/scannedAt', () => {
+test('scanProject walks real files, skips minified ones, and attaches projectSlug/scannedAt', async () => {
   const prevThreshold = process.env.AGENT_MANAGER_MAX_FUNCTION_LINES;
   process.env.AGENT_MANAGER_MAX_FUNCTION_LINES = '10'; // scanProject always uses maxFunctionLines() -- override so a 12-line fixture body actually trips it
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'function-length-scan-test-'));
@@ -148,7 +148,7 @@ test('scanProject walks real files, skips minified ones, and attaches projectSlu
   fs.writeFileSync(path.join(dir, 'bundle.js'), `function x(){${'a'.repeat(3000)}}`);
   fs.writeFileSync(path.join(dir, 'short.js'), `function short() {\n${makeBody(2)}\n}\n`);
 
-  const findings = scanProject(dir, 'test-project');
+  const findings = await scanProject(dir, 'test-project');
   if (prevThreshold == null) delete process.env.AGENT_MANAGER_MAX_FUNCTION_LINES;
   else process.env.AGENT_MANAGER_MAX_FUNCTION_LINES = prevThreshold;
 
