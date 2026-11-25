@@ -318,12 +318,12 @@ test('findMissingReservedAttributes reports nothing when every reserved attribut
   assert.deepEqual(findMissingReservedAttributes(repoRoot, [file]), []);
 });
 
-test('scanProject combines catch/loop findings and skips OTel-only rules with no OTel dependency', () => {
+test('scanProject combines catch/loop findings and skips OTel-only rules with no OTel dependency', async () => {
   const repoRoot = makeTempRepo();
   writeFixture(repoRoot, 'package.json', JSON.stringify({ dependencies: {} }));
   writeFixture(repoRoot, 'worker.js', 'try {\n  risky();\n} catch {}\nwhile (true) {\n  doWork();\n}\n');
 
-  const findings = scanProject(repoRoot, 'test-project');
+  const findings = await scanProject(repoRoot, 'test-project');
   const rules = findings.map((f) => f.rule);
   assert.ok(rules.includes('silent-catch-block'));
   assert.ok(rules.includes('unguarded-long-running-loop'));
@@ -335,12 +335,12 @@ test('scanProject combines catch/loop findings and skips OTel-only rules with no
   }
 });
 
-test('scanProject runs the OTel-only rules when the project depends on an OpenTelemetry SDK', () => {
+test('scanProject runs the OTel-only rules when the project depends on an OpenTelemetry SDK', async () => {
   const repoRoot = makeTempRepo();
   writeFixture(repoRoot, 'package.json', JSON.stringify({ dependencies: { '@opentelemetry/api': '^1.0.0' } }));
   writeFixture(repoRoot, 'app.js', "span.setAttribute('Bad.Name', 1);\n");
 
-  const findings = scanProject(repoRoot, 'test-project');
+  const findings = await scanProject(repoRoot, 'test-project');
   const rules = findings.map((f) => f.rule);
   assert.ok(rules.includes('otel-naming-convention'));
   assert.ok(rules.includes('missing-reserved-attribute'));
