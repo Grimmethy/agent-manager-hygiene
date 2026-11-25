@@ -148,7 +148,9 @@ async function scanProject(clonePath, projectSlug) {
   );
 
   const findings = [];
-  for (const { text, relPath, finder } of readResults) {
+  for (const result of readResults) {
+    if (!result) continue;
+    const { text, relPath, finder } = result;
     if (!text) continue;
     findings.push(...finder(text, relPath, threshold));
   }
